@@ -182,7 +182,7 @@ def init_mori_op(
     hidden_size,
     params_dtype,
     num_max_dispatch_tokens_per_rank,
-    deepep_mode,
+    use_low_latency,
     instance_id=0,
     fp8_dispatch=False,
     fp4_dispatch=False,
@@ -214,8 +214,7 @@ def init_mori_op(
         mori.shmem.shmem_torch_process_group_init(group_name)
 
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
-    async_mode = deepep_mode.enable_low_latency()
-    if async_mode:
+    if use_low_latency:
         mode = EpMode.LOW_LATENCY
 
     cfg = get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank)[mode]
@@ -307,6 +306,8 @@ class CommStreamPool:
 
 
 class _MoriEPDispatcherImplBase:
+    _use_low_latency: bool = False
+
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -360,7 +361,7 @@ class _MoriEPDispatcherImplBase:
                 self.hidden_size,
                 self.params_dtype,
                 self.num_max_dispatch_tokens_per_rank,
-                self.deepep_mode,
+                self._use_low_latency,
                 self.instance_id,
                 self.fp8_dispatch,
                 self.fp4_dispatch,
@@ -690,6 +691,8 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
 
 
 class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
+    _use_low_latency: bool = True
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.quant_config = {}

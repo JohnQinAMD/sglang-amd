@@ -1050,11 +1050,12 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = state.pop("hidden_states_after_combine")
 
         if get_moe_a2a_backend().is_mori():
-            num_tokens = state.pop("num_tokens")
-            final_hidden_states = final_hidden_states[:num_tokens]
+            _ = state.pop("num_tokens")
 
         if (shared_output := state.pop("shared_output")) is not None:
             x = shared_output
+            if get_moe_a2a_backend().is_mori():
+                final_hidden_states = final_hidden_states[:x.shape[0]]
             if _use_aiter:
                 x.add_(final_hidden_states)
             else:
@@ -1661,6 +1662,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
+        if get_moe_a2a_backend().is_mori():
+            quant_format = ""
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
