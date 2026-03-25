@@ -34,6 +34,9 @@ class TboAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.primary.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+        if get_moe_a2a_backend().is_mori():
+            return
         for item in self.children:
             # TODO for children, maybe can provide *smaller* max_bs to optimize
             item.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
@@ -58,16 +61,18 @@ class TboAttnBackend(AttentionBackend):
             spec_info=spec_info,
         )
 
-        self._init_forward_metadata_cuda_graph_children(
-            fn_name="init_forward_metadata_capture_cuda_graph",
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            capture_num_tokens=num_tokens,
-        )
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+        if not get_moe_a2a_backend().is_mori():
+            self._init_forward_metadata_cuda_graph_children(
+                fn_name="init_forward_metadata_capture_cuda_graph",
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                capture_num_tokens=num_tokens,
+            )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -91,17 +96,19 @@ class TboAttnBackend(AttentionBackend):
             seq_lens_cpu=seq_lens_cpu,
         )
 
-        self._init_forward_metadata_cuda_graph_children(
-            fn_name="init_forward_metadata_replay_cuda_graph",
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            replay_seq_lens_sum=seq_lens_sum,
-            replay_seq_lens_cpu=seq_lens_cpu,
-        )
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+        if not get_moe_a2a_backend().is_mori():
+            self._init_forward_metadata_cuda_graph_children(
+                fn_name="init_forward_metadata_replay_cuda_graph",
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                replay_seq_lens_sum=seq_lens_sum,
+                replay_seq_lens_cpu=seq_lens_cpu,
+            )
 
     def _init_forward_metadata_cuda_graph_children(
         self,

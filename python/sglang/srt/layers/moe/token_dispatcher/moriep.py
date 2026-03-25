@@ -173,7 +173,8 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
 
 # init_mori_op only needs do once in model initial stage
 # use lru_cache to reuse the same mori_op instance to avoid the init overhead for mori
-@lru_cache(maxsize=4)
+# maxsize=None: instance count is bounded (2 modes x num_tbo_children), no leak risk
+@lru_cache(maxsize=None)
 def init_mori_op(
     group,
     router_topk,
@@ -288,12 +289,12 @@ class CommStreamPool:
     _streams = {}  # key -> torch.cuda.Stream
 
     @classmethod
-    def _make_key(cls, group):
-        return (torch.cuda.current_device(), id(group))
+    def _make_key(cls, group, instance_id=0):
+        return (torch.cuda.current_device(), id(group), instance_id)
 
     @classmethod
-    def get_stream_from_pool(cls, group) -> torch.cuda.Stream:
-        key = cls._make_key(group)
+    def get_stream_from_pool(cls, group, instance_id=0) -> torch.cuda.Stream:
+        key = cls._make_key(group, instance_id)
         stream = cls._streams.get(key)
         if stream is None:
             stream = torch.cuda.Stream(priority=0)
@@ -302,8 +303,10 @@ class CommStreamPool:
 
     @classmethod
     def clear_group(cls, group):
-        key = (torch.cuda.current_device(), id(group))
-        cls._streams.pop(key, None)
+        device = torch.cuda.current_device()
+        keys_to_remove = [k for k in cls._streams if k[0] == device and k[1] == id(group)]
+        for k in keys_to_remove:
+            cls._streams.pop(k, None)
 
 
 class _MoriEPDispatcherImplBase:
@@ -445,7 +448,9 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         self.enable_dual_stream = is_tbo_enabled()
         self._comm_stream = None
         if self.enable_dual_stream:
-            self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
+            self._comm_stream = CommStreamPool.get_stream_from_pool(
+                self.group, self.instance_id
+            )
 
     def _capture_event_if_async(self) -> Optional[torch.cuda.Event]:
         assert self.enable_dual_stream, "dual stream must be enabled"

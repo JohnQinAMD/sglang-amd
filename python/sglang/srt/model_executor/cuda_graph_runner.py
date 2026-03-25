@@ -458,7 +458,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
 
     mul_base = 1
     if server_args.enable_two_batch_overlap:
-        mul_base *= 2
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+        if not get_moe_a2a_backend().is_mori():
+            mul_base *= 2
         num_tokens_per_bs = 1  # tbo not test, set num_tokens_per_bs to 1
 
     if require_gathered_buffer(server_args):
@@ -703,8 +705,10 @@ class CudaGraphRunner:
             requested_capture_hidden_mode == CaptureHiddenMode.NULL
             or requested_capture_hidden_mode == self.capture_hidden_mode
         )
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend as _get_a2a_cg
         is_tbo_supported = (
-            forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
+            True if _get_a2a_cg().is_mori()
+            else (forward_batch.can_run_tbo if self.enable_two_batch_overlap else True)
         )
 
         is_ngram_supported = (

@@ -277,8 +277,7 @@ def compute_split_token_index(
         assert token_num_per_seq is not None
         return split_seq_index * token_num_per_seq
     elif forward_mode.is_idle():
-        assert split_seq_index == 0
-        return 0
+        return split_seq_index
     else:
         raise NotImplementedError
 
@@ -319,6 +318,9 @@ class TboCudaGraphRunnerPlugin:
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
         if not is_tbo_enabled():
             return
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+        if get_moe_a2a_backend().is_mori():
+            return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
         )
@@ -348,6 +350,9 @@ class TboCudaGraphRunnerPlugin:
         num_token_non_padded: int,
         spec_info: Optional[SpecInput],
     ):
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+        if get_moe_a2a_backend().is_mori():
+            return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=forward_mode, spec_info=spec_info
         )
@@ -400,7 +405,9 @@ class TboDPAttentionPreparer:
                 token_num_per_seq=token_num_per_seq,
             )
             resolved_deepep_mode = deepep_mode.resolve(local_batch.is_extend_in_batch)
-            local_can_run_tbo = (self.local_tbo_split_seq_index is not None) and not (
+            _split_ok = (self.local_tbo_split_seq_index is not None
+                         and self.local_tbo_split_seq_index > 0)
+            _ll_extend_block = (
                 (
                     local_batch.forward_mode.is_extend()
                     and not local_batch.forward_mode.is_target_verify()
@@ -408,6 +415,12 @@ class TboDPAttentionPreparer:
                 and enable_a2a_moe
                 and (resolved_deepep_mode.is_low_latency())
             )
+            from sglang.srt.layers.moe.utils import get_moe_a2a_backend as _get_a2a
+            _mori_decode_block = (
+                _get_a2a().is_mori()
+                and not local_batch.forward_mode.is_extend()
+            )
+            local_can_run_tbo = _split_ok and not _ll_extend_block and not _mori_decode_block
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
