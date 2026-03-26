@@ -555,10 +555,20 @@ class DeepseekV2WeightLoaderMixin:
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
 
+            # quark_post_load_weights dynamically quantizes BF16 attention
+            # absorb matrices (w_kc, w_vc) to MXFP4. Only enable when:
+            # 1. The model has static MXFP4 weights in checkpoint (kv_cache_config set), AND
+            # 2. forward_mla has a matching MXFP4 bmm kernel path
+            # Currently forward_mla only supports FP8 and BF16 bmm, not MXFP4.
+            # Enabling this with BF16 attention weights causes uint8 tensors to be
+            # passed to torch.bmm, resulting in out-of-bounds memory access during
+            # CUDA graph capture.
+            # TODO: Add MXFP4 bmm path in forward_mla.py, then re-enable this.
             if (
                 _use_aiter_gfx95
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
+                and getattr(self.quant_config, "kv_cache_config", None) is not None
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
