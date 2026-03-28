@@ -1841,12 +1841,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
-                logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
             else:
-                logger.warning(
-                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
-                )
-                self.kv_cache_dtype = self.dtype
+                self.kv_cache_dtype = "fp4_e2m1"
+            logger.warning("FP4 (E2M1) KV Cache might lead to a accuracy drop!")
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
