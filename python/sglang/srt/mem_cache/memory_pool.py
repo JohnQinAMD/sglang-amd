@@ -2084,3 +2084,294 @@ def copy_all_layer_kv_cache_tiled(
     mask = mask_loc[:, None] & mask_byte[None, :]
     vals = tl.load(src_ptr, mask=mask)
     tl.store(tgt_ptr, vals, mask=mask)
+
+
+# ========================================================================
+# TurboQuant INT4 KV Cache Pool for MLA
+# ========================================================================
+
+class MLATokenToKVPoolTQ(MLATokenToKVPool):
+    """MLA KV cache pool with TurboQuant compression (2/3/4-bit).
+
+    Compresses the kv_lora_rank part of the MLA latent, keeps
+    qk_rope_head_dim in FP16. Dequantizes on read.
+
+    Bit-width set via SGLANG_KV_CACHE_TURBOQUANT env var:
+      "1" or "4" → 4-bit (2.94x compression, CosSim > 0.995)
+      "3"        → 3-bit (3.51x compression)
+      "2"        → 2-bit (4.36x compression)
+
+    Integration with aiter backend: transparent — get_key_buffer() returns
+    dequantized FP16, so aiter's mla_decode_fwd works unchanged.
+    """
+
+    def _create_buffers(self):
+        import math, os
+        from sglang.srt.layers.quantization.turboquant_engine import (
+            get_codebook, packed_bytes_per_dim,
+        )
+
+        tq_val = os.environ.get("SGLANG_KV_CACHE_TURBOQUANT", "4")
+        self.tq_bit_width = int(tq_val) if tq_val not in ("1", "true", "True") else 4
+        if self.tq_bit_width not in (2, 3, 4):
+            logger.warning(f"Invalid TQ bit_width {self.tq_bit_width}, defaulting to 4")
+            self.tq_bit_width = 4
+        self.tq_group_size = min(128, self.kv_lora_rank)
+        self.tq_n_groups = math.ceil(self.kv_lora_rank / self.tq_group_size)
+
+        centroids, boundaries = get_codebook(self.tq_bit_width)
+        self.tq_centroids = centroids.to(self.device)
+        self.tq_boundaries = boundaries.to(self.device)
+
+        from sglang.srt.layers.quantization.turboquant_engine import generate_rotation_matrix
+        self.tq_rotations = {}
+        Pi_list = []
+        for g in range(self.tq_n_groups):
+            g_start = g * self.tq_group_size
+            g_end = min(g_start + self.tq_group_size, self.kv_lora_rank)
+            g_dim = g_end - g_start
+            Pi = generate_rotation_matrix(g_dim, seed=42 + g_start).to(self.device)
+            self.tq_rotations[g_start] = Pi
+            Pi_list.append(Pi)
+        self.tq_Pi_all = torch.stack(Pi_list)  # (n_groups, g_dim, g_dim)
+
+        self._tq_gpu_kernel = None
+        try:
+            import os, importlib
+            so_candidates = [
+                os.path.join(os.path.dirname(__file__), "tq_kv_compress.so"),
+                "/opt/turboquant/tq_kv_compress.so",
+                "/shared_aig/john/semianalysis/aiter-amd/csrc/turboquant/tq_kv_compress.so",
+            ]
+            so_path = next((s for s in so_candidates if os.path.exists(s)), None)
+            if so_path:
+                spec = importlib.util.spec_from_file_location("tq_kv_compress", so_path)
+                self._tq_gpu_kernel = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(self._tq_gpu_kernel)
+                logger.info(f"TurboQuant GPU kernel loaded from pre-compiled {so_path}")
+            else:
+                from torch.utils.cpp_extension import load
+                src_candidates = [
+                    "/opt/turboquant/turboquant_kv_compress.hip",
+                    "/shared_aig/john/semianalysis/aiter-amd/csrc/turboquant/turboquant_kv_compress.hip",
+                ]
+                src = next((s for s in src_candidates if os.path.exists(s)), None)
+                if src:
+                    ck_inc = os.path.join(os.path.dirname(src), "../../3rdparty/composable_kernel/include")
+                    if not os.path.exists(ck_inc):
+                        ck_inc = "/opt/ck_include"
+                    self._tq_gpu_kernel = load(
+                        name="tq_kv_compress", sources=[src],
+                        extra_include_paths=[os.path.dirname(src), ck_inc],
+                        extra_cuda_cflags=["-O3", "--offload-arch=gfx950", "-DUSE_ROCM", "-std=c++17"],
+                        verbose=False,
+                    )
+                    logger.info("TurboQuant GPU kernel JIT-compiled")
+        except Exception as e:
+            logger.warning(f"TurboQuant GPU kernel unavailable, using Python fallback: {e}")
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                packed_bytes = packed_bytes_per_dim(self.kv_lora_rank, self.tq_bit_width)
+                norms_bytes = self.tq_n_groups * 2  # FP16
+                rope_bytes = self.qk_rope_head_dim * 2  # FP16
+                self.tq_compressed_bytes = packed_bytes + norms_bytes + rope_bytes
+                self._tq_packed_end = packed_bytes
+                self._tq_norms_end = packed_bytes + norms_bytes
+
+                # Store as uint8 for maximum flexibility
+                self.store_dtype = torch.uint8
+                self.kv_buffer = [
+                    torch.zeros(
+                        (m, 1, self.tq_compressed_bytes),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                self._deq_buffer = torch.zeros(
+                    (m, 1, self.kv_cache_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+
+        # O1: per-layer dirty tracking — skip full decompress when nothing changed
+        self._deq_dirty = [True] * self.layer_num
+
+        logger.info(
+            f"TurboQuant MLA KV Pool: {self.tq_bit_width}-bit, "
+            f"{self.tq_compressed_bytes} bytes/token "
+            f"(vs {self.kv_cache_dim * 2} FP16), "
+            f"{self.kv_cache_dim * 2 / self.tq_compressed_bytes:.2f}x compression"
+        )
+
+    def _tq_compress(self, kv_data: torch.Tensor) -> torch.Tensor:
+        """Compress KV data to packed format (2/3/4-bit)."""
+        import math
+        from sglang.srt.layers.quantization.turboquant_engine import (
+            pack_indices, pad_for_packing,
+        )
+
+        T = kv_data.shape[0]
+        flat = kv_data.reshape(T, self.kv_cache_dim)
+
+        if self._tq_gpu_kernel is not None and self.tq_bit_width == 4:
+            flat_bf16 = flat.to(torch.bfloat16) if flat.dtype != torch.bfloat16 else flat
+            buf = torch.empty(T, self.tq_compressed_bytes, dtype=torch.uint8, device=flat.device)
+            self._tq_gpu_kernel.turboquant_kv_compress_inplace(
+                flat_bf16, self.tq_Pi_all, self.tq_boundaries,
+                buf, self.tq_n_groups, self.tq_group_size,
+            )
+            return buf.unsqueeze(1)
+
+        flat = flat.float()
+        latent = flat[:, :self.kv_lora_rank]
+        rope = flat[:, self.kv_lora_rank:]
+        n_levels = 2 ** self.tq_bit_width
+
+        all_indices = []
+        all_norms = []
+
+        for g in range(self.tq_n_groups):
+            g_start = g * self.tq_group_size
+            g_end = min(g_start + self.tq_group_size, self.kv_lora_rank)
+            g_dim = g_end - g_start
+
+            L_g = latent[:, g_start:g_end]
+            norms = L_g.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            L_norm = L_g / norms
+            all_norms.append(norms.squeeze(1))
+
+            Pi = self.tq_rotations[g_start]
+            Y = L_norm @ Pi.T * math.sqrt(g_dim)
+
+            indices = torch.searchsorted(self.tq_boundaries, Y.reshape(-1))
+            indices = indices.clamp(0, n_levels - 1).reshape(T, g_dim)
+            all_indices.append(indices)
+
+        full_indices = torch.cat(all_indices, dim=1)
+        norms_tensor = torch.stack(all_norms, dim=1).half()
+
+        padded = pad_for_packing(self.kv_lora_rank, self.tq_bit_width)
+        if padded > self.kv_lora_rank:
+            full_indices = torch.nn.functional.pad(
+                full_indices, (0, padded - self.kv_lora_rank), value=0
+            )
+        packed = pack_indices(full_indices, self.tq_bit_width)
+
+        result = torch.zeros(T, 1, self.tq_compressed_bytes, dtype=torch.uint8, device=kv_data.device)
+        result[:, 0, :self._tq_packed_end] = packed
+        result[:, 0, self._tq_packed_end:self._tq_norms_end] = (
+            norms_tensor.view(torch.uint8).reshape(T, -1)
+        )
+        result[:, 0, self._tq_norms_end:] = (
+            rope.half().contiguous().view(torch.uint8).reshape(T, -1)
+        )
+
+        return result
+
+    def _tq_decompress(self, compressed: torch.Tensor) -> torch.Tensor:
+        """Decompress packed data back to FP16/BF16 (2/3/4-bit)."""
+        import math
+        from sglang.srt.layers.quantization.turboquant_engine import (
+            unpack_indices, pad_for_packing,
+        )
+
+        T = compressed.shape[0]
+
+        if self._tq_gpu_kernel is not None and self.tq_bit_width == 4:
+            flat = compressed[:, 0, :]
+            out = self._deq_buffer[:T, 0, :].reshape(T, self.kv_cache_dim)
+            self._tq_gpu_kernel.turboquant_kv_decompress_inplace(
+                flat, self.tq_Pi_all, self.tq_centroids,
+                out, self.tq_n_groups, self.tq_group_size,
+                self.kv_lora_rank, self.qk_rope_head_dim,
+            )
+            return self._deq_buffer[:T]
+
+        packed = compressed[:, 0, :self._tq_packed_end]
+        norms_raw = compressed[:, 0, self._tq_packed_end:self._tq_norms_end]
+        rope_raw = compressed[:, 0, self._tq_norms_end:]
+
+        norms = norms_raw.view(torch.float16).reshape(T, self.tq_n_groups).float()
+        rope = rope_raw.view(torch.float16).reshape(T, self.qk_rope_head_dim)
+
+        padded = pad_for_packing(self.kv_lora_rank, self.tq_bit_width)
+        indices = unpack_indices(packed, padded, self.tq_bit_width)[:, :self.kv_lora_rank]
+
+        latent = torch.zeros(T, self.kv_lora_rank, dtype=torch.float32, device=compressed.device)
+        for g in range(self.tq_n_groups):
+            g_start = g * self.tq_group_size
+            g_end = min(g_start + self.tq_group_size, self.kv_lora_rank)
+            g_dim = g_end - g_start
+            scale = math.sqrt(g_dim)
+
+            Pi = self.tq_rotations[g_start]
+            Y_g = self.tq_centroids[indices[:, g_start:g_end].long()] / scale
+            L_g = Y_g @ Pi
+
+            if norms.dim() == 1:
+                L_g = L_g * norms.unsqueeze(1)
+            else:
+                L_g = L_g * norms[:, g].unsqueeze(1)
+
+            latent[:, g_start:g_end] = L_g
+
+        kv_out = torch.cat([latent.to(self.dtype), rope.to(self.dtype)], dim=-1)
+        return kv_out.reshape(T, 1, self.kv_cache_dim)
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        layer_idx = layer_id - self.start_layer
+        # O1: skip full decompress if this layer hasn't changed since last read
+        if self._deq_dirty[layer_idx]:
+            compressed = self.kv_buffer[layer_idx]
+            decompressed = self._tq_decompress(compressed)
+            self._deq_buffer[:decompressed.shape[0]] = decompressed
+            self._deq_dirty[layer_idx] = False
+        return self._deq_buffer
+
+    def get_value_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        key_buf = self.get_key_buffer(layer_id)
+        return key_buf[..., :self.kv_lora_rank]
+
+    def set_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        layer_idx = layer_id - self.start_layer
+        compressed = self._tq_compress(cache_k.unsqueeze(1) if cache_k.dim() == 2 else cache_k)
+        self.kv_buffer[layer_idx][loc] = compressed
+        self._deq_dirty[layer_idx] = True
+
+    def set_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        layer_idx = layer_id - self.start_layer
+        if cache_k_nope.dim() == 2:
+            cache_k_nope = cache_k_nope.unsqueeze(1)
+        if cache_k_rope.dim() == 2:
+            cache_k_rope = cache_k_rope.unsqueeze(1)
+        kv_full = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+        compressed = self._tq_compress(kv_full)
+        self.kv_buffer[layer_idx][loc] = compressed
+        self._deq_dirty[layer_idx] = True
