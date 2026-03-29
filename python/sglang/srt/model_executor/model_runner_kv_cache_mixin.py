@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -25,6 +26,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
+    MLATokenToKVPoolTQ,
     NSATokenToKVPool,
     ReqToTokenPool,
 )
@@ -524,6 +526,20 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+            elif os.environ.get("SGLANG_KV_CACHE_TURBOQUANT", "0") not in ("0", ""):
+                logger.info("Using TurboQuant KV cache compression for MLA")
+                self.token_to_kv_pool = MLATokenToKVPoolTQ(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
             else:
                 self.token_to_kv_pool = MLATokenToKVPool(
                     self.max_total_num_tokens,
@@ -631,6 +647,23 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                    )
+                elif os.environ.get("SGLANG_KV_CACHE_TURBOQUANT", "0") not in ("0", ""):
+                    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolTQ
+                    logger.info("Using TurboQuant KV cache compression for MHA/GQA")
+                    self.token_to_kv_pool = MHATokenToKVPoolTQ(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
                     )
                 else:
                     self.token_to_kv_pool = MHATokenToKVPool(
