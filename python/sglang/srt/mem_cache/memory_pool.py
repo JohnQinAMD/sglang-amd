@@ -1076,6 +1076,14 @@ class MHATokenToKVPool(KVCache):
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def _create_buffers(self):
+        self._mxfp4_kernel = None
+        if _is_hip:
+            try:
+                self._mxfp4_kernel = MLATokenToKVPoolFP4._load_mxfp4_hip_kernel()
+                logger.info("MXFP4 HIP kernel loaded for MHA/GQA pool")
+            except Exception as e:
+                logger.warning(f"MXFP4 HIP kernel unavailable for MHA/GQA: {e}")
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -1130,36 +1138,36 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         del self.k_scale_buffer
         del self.v_scale_buffer
 
+    def _fp4_dequantize(self, packed, scales):
+        """MXFP4 dequant: HIP kernel on AMD if available, else torch.compile."""
+        if self._mxfp4_kernel is not None:
+            N = packed.shape[-1] * 2
+            return self._mxfp4_kernel.mxfp4_dequantize(packed, scales, N)
+        from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+
+        return KVFP4QuantizeUtil.batched_dequantize(packed, scales)
+
+    def _fp4_quantize(self, tensor):
+        """MXFP4 quant: HIP kernel on AMD if available, else torch.compile."""
+        if self._mxfp4_kernel is not None:
+            result = self._mxfp4_kernel.mxfp4_quantize(tensor)
+            return result[0], result[1]
+        from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+
+        return KVFP4QuantizeUtil.batched_quantize(tensor)
+
     def _get_key_buffer(self, layer_id: int):
-        # for internal use of referencing
         if self.store_dtype != self.dtype:
-            cache_k_nope_fp4 = self.k_buffer[layer_id - self.start_layer].view(
-                torch.uint8
-            )
-            cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
-
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
-
-            cache_k_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
-                cache_k_nope_fp4, cache_k_nope_fp4_sf
-            )
-            return cache_k_nope_fp4_dequant
+            cache_k_fp4 = self.k_buffer[layer_id - self.start_layer].view(torch.uint8)
+            cache_k_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
+            return self._fp4_dequantize(cache_k_fp4, cache_k_fp4_sf)
         return self.k_buffer[layer_id - self.start_layer]
 
     def _get_value_buffer(self, layer_id: int):
-        # for internal use of referencing
         if self.store_dtype != self.dtype:
-            cache_v_nope_fp4 = self.v_buffer[layer_id - self.start_layer].view(
-                torch.uint8
-            )
-            cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
-
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
-
-            cache_v_nope_fp4_dequant = KVFP4QuantizeUtil.batched_dequantize(
-                cache_v_nope_fp4, cache_v_nope_fp4_sf
-            )
-            return cache_v_nope_fp4_dequant
+            cache_v_fp4 = self.v_buffer[layer_id - self.start_layer].view(torch.uint8)
+            cache_v_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
+            return self._fp4_dequantize(cache_v_fp4, cache_v_fp4_sf)
         return self.v_buffer[layer_id - self.start_layer]
 
     def set_kv_buffer(
@@ -1184,10 +1192,8 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             if v_scale is not None:
                 cache_v.div_(v_scale)
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
-
-            cache_k, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
-            cache_v, cache_v_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_v)
+            cache_k, cache_k_fp4_sf = self._fp4_quantize(cache_k)
+            cache_v, cache_v_fp4_sf = self._fp4_quantize(cache_v)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
