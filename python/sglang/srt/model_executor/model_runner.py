@@ -1839,7 +1839,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
-            if hasattr(torch, "float4_e2m1fn_x2"):
+            if hasattr(torch, "float4_e2m1fn_x2") and not _is_hip:
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
             else:
                 self.kv_cache_dtype = "fp4_e2m1"

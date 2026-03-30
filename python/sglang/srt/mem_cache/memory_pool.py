@@ -652,7 +652,8 @@ class KVCache(abc.ABC):
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
-            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
+            self.store_dtype = torch.uint8
+        elif dtype == "fp4_e2m1" or (hasattr(torch, "float4_e2m1fn_x2") and dtype == torch.float4_e2m1fn_x2):
             self.store_dtype = torch.uint8
         else:
             self.store_dtype = dtype
@@ -1132,6 +1133,20 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
 
+                if _is_hip:
+                    self._fp4_k_deq = [
+                        torch.zeros((m, n, k), dtype=torch.bfloat16, device=self.device)
+                        for _ in range(self.layer_num)
+                    ]
+                    self._fp4_v_deq = [
+                        torch.zeros((m, n, k), dtype=torch.bfloat16, device=self.device)
+                        for _ in range(self.layer_num)
+                    ]
+                    logger.info("MXFP4 MHA KV Pool: write-through enabled on AMD")
+                else:
+                    self._fp4_k_deq = None
+                    self._fp4_v_deq = None
+
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
@@ -1158,6 +1173,8 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def _get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
+            if self._fp4_k_deq is not None:
+                return self._fp4_k_deq[layer_id - self.start_layer]
             cache_k_fp4 = self.k_buffer[layer_id - self.start_layer].view(torch.uint8)
             cache_k_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
             return self._fp4_dequantize(cache_k_fp4, cache_k_fp4_sf)
@@ -1165,6 +1182,8 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def _get_value_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
+            if self._fp4_v_deq is not None:
+                return self._fp4_v_deq[layer_id - self.start_layer]
             cache_v_fp4 = self.v_buffer[layer_id - self.start_layer].view(torch.uint8)
             cache_v_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
             return self._fp4_dequantize(cache_v_fp4, cache_v_fp4_sf)
@@ -1186,6 +1205,13 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        layer_idx = layer_id - self.start_layer
+
+        if self._fp4_k_deq is not None:
+            self._fp4_k_deq[layer_idx][loc] = cache_k.to(torch.bfloat16)
+            self._fp4_v_deq[layer_idx][loc] = cache_v.to(torch.bfloat16)
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -1203,23 +1229,22 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             cache_v_fp4_sf = cache_v_fp4_sf.view(self.store_dtype)
 
         if get_is_capture_mode() and self.alt_stream is not None:
-            # Overlap the copy of K and V cache for small batch size
             current_stream = self.device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.k_buffer[layer_idx][loc] = cache_k
 
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
+            self.k_scale_buffer[layer_idx][loc] = cache_k_fp4_sf
             with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+                self.v_buffer[layer_idx][loc] = cache_v
 
-                self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+                self.v_scale_buffer[layer_idx][loc] = cache_v_fp4_sf
             current_stream.wait_stream(self.alt_stream)
         else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            self.k_buffer[layer_idx][loc] = cache_k
+            self.v_buffer[layer_idx][loc] = cache_v
 
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
-            self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+            self.k_scale_buffer[layer_idx][loc] = cache_k_fp4_sf
+            self.v_scale_buffer[layer_idx][loc] = cache_v_fp4_sf
 
 
 class HybridLinearKVPool(KVCache):

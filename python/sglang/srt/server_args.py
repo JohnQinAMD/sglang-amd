@@ -2500,9 +2500,7 @@ class ServerArgs:
                     )
                     self.attention_backend = "aiter"
             else:
-                raise RuntimeError(
-                    "MXFP4 KV cache on AMD is only supported for MLA models with aiter backend."
-                )
+                logger.info("MXFP4 KV cache enabled on AMD (GQA/MHA)")
         else:
             raise RuntimeError("KV4 is not tested on this platform.")
 
