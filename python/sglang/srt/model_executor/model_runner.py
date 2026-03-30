@@ -1839,14 +1839,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
-            if hasattr(torch, "float4_e2m1fn_x2"):
+            if hasattr(torch, "float4_e2m1fn_x2") and not _is_hip:
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
-                logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
             else:
-                logger.warning(
-                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
-                )
-                self.kv_cache_dtype = self.dtype
+                self.kv_cache_dtype = "fp4_e2m1"
+            logger.warning("FP4 (E2M1) KV Cache might lead to a accuracy drop!")
+        elif self.server_args.kv_cache_dtype in ("tq2", "tq3", "tq4"):
+            self.kv_cache_dtype = self.server_args.kv_cache_dtype
+            if not _is_hip:
+                logger.warning("TurboQuant KV on non-AMD GPU: Python fallback only.")
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -2742,6 +2743,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.pp_group.is_last_rank
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
+
+        if hasattr(self.token_to_kv_pool, "run_deferred_compress"):
+            if getattr(self.token_to_kv_pool, "_compress_enabled", False):
+                self.token_to_kv_pool.run_deferred_compress(
+                    forward_batch.out_cache_loc
+                )
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
