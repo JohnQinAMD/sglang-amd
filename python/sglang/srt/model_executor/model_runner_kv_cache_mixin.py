@@ -25,6 +25,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
+    MLATokenToKVPoolTQ,
+    MHATokenToKVPoolTQ,
     NSATokenToKVPool,
     ReqToTokenPool,
 )
@@ -68,16 +70,32 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
+def _kv_element_size(dtype):
+    """Get element size, handling string sentinels (fp4_e2m1, tq2/tq3/tq4)."""
+    if isinstance(dtype, str):
+        return 1
+    return torch._utils._element_size(dtype)
+
+
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
-        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        kv_size = _kv_element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
                 * kv_size
             )
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            if isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype.startswith("tq"):
+                from sglang.srt.layers.quantization.turboquant_engine import packed_bytes_per_dim
+                kv_dim = self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim
+                tq_bits = int(self.kv_cache_dtype[-1])
+                compressed = packed_bytes_per_dim(self.model_config.kv_lora_rank, tq_bits)
+                n_groups = (self.model_config.kv_lora_rank + 127) // 128
+                compressed += n_groups * 2 + self.model_config.qk_rope_head_dim * 2
+                deq = kv_dim * 2
+                cell_size = (compressed + deq) * num_layers
+            elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
                 cell_size = (cell_size // 2) + (
@@ -127,7 +145,15 @@ class ModelRunnerKVCacheMixin:
                     * kv_size
                 )
 
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            if isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype.startswith("tq"):
+                from sglang.srt.layers.quantization.turboquant_engine import packed_bytes_per_dim
+                tq_bits = int(self.kv_cache_dtype[-1])
+                n_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+                hd = self.model_config.head_dim
+                compressed_per_head = packed_bytes_per_dim(hd, tq_bits) + 2
+                deq_per_head = hd * 2
+                cell_size = n_heads * (compressed_per_head + deq_per_head) * 2 * num_layers
+            elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
 
@@ -321,7 +347,7 @@ class ModelRunnerKVCacheMixin:
         #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
         #               = token_capacity * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
 
-        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        kv_size = _kv_element_size(self.kv_cache_dtype)
 
         # Full layer per-token memory
         full_per_token = (
@@ -524,6 +550,22 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+            elif isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype.startswith("tq"):
+                tq_bits = int(self.kv_cache_dtype[-1])
+                logger.info(f"Using TurboQuant {tq_bits}-bit KV cache for MLA")
+                self.token_to_kv_pool = MLATokenToKVPoolTQ(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=torch.bfloat16,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    tq_bit_width=tq_bits,
+                )
             else:
                 self.token_to_kv_pool = MLATokenToKVPool(
                     self.max_total_num_tokens,
@@ -565,11 +607,20 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
+                swa_pool_cls = MHATokenToKVPool
+                swa_extra_kwargs = {}
+                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    swa_pool_cls = MHATokenToKVPoolFP4
+                elif isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype.startswith("tq"):
+                    swa_pool_cls = MHATokenToKVPoolTQ
+                    swa_extra_kwargs["tq_bit_width"] = int(self.kv_cache_dtype[-1])
+                    logger.info(f"Using TurboQuant {self.kv_cache_dtype[-1]}-bit KV for SWA")
+                swa_dtype = torch.bfloat16 if swa_pool_cls == MHATokenToKVPoolTQ else self.kv_cache_dtype
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
                     page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
+                    dtype=swa_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
                     ),
@@ -578,7 +629,9 @@ class ModelRunnerKVCacheMixin:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    token_to_kv_pool_class=swa_pool_cls,
                     **kwargs,
+                    **swa_extra_kwargs,
                 )
             elif config := self.mambaish_config:
                 extra_args = {}
@@ -631,6 +684,24 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                    )
+                elif isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype.startswith("tq"):
+                    tq_bits = int(self.kv_cache_dtype[-1])
+                    logger.info(f"Using TurboQuant {tq_bits}-bit KV cache for MHA/GQA")
+                    self.token_to_kv_pool = MHATokenToKVPoolTQ(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=torch.bfloat16,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        tq_bit_width=tq_bits,
                     )
                 else:
                     self.token_to_kv_pool = MHATokenToKVPool(
