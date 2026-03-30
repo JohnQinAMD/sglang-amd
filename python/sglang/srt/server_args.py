@@ -2490,8 +2490,19 @@ class ServerArgs:
                             f"KV4 MHA expects attention_backend to be one of "
                             f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {self.attention_backend}"
                         )
+        elif is_hip():
+            if use_mla_backend:
+                KV4_AMD_MLA_BACKENDS = ["aiter"]
+                if self.attention_backend not in KV4_AMD_MLA_BACKENDS:
+                    logger.warning(
+                        f"MXFP4 KV cache on AMD MLA requires aiter backend, "
+                        f"got {self.attention_backend}. Switching to aiter."
+                    )
+                    self.attention_backend = "aiter"
+            else:
+                logger.info("MXFP4 KV cache enabled on AMD (GQA/MHA)")
         else:
-            raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
+            raise RuntimeError("KV4 is not tested on this platform.")
 
     def _handle_page_size(self):
         if self.page_size is None:
@@ -3772,8 +3783,11 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1",
+                     "tq4", "tq3", "tq2"],
+            help='Data type for kv cache storage. "auto" will use model data type. '
+                 '"fp8_e5m2"/"fp8_e4m3" for FP8. "fp4_e2m1" for MXFP4. '
+                 '"tq4"/"tq3"/"tq2" for TurboQuant 4/3/2-bit KV (data-oblivious, no calibration).',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
