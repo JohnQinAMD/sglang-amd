@@ -305,6 +305,7 @@ class NativeSparseAttnBackend(
         self.nsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
+        self.kv_scale_ones = torch.ones(1, dtype=torch.float32, device=self.device)
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
@@ -1815,6 +1816,13 @@ class NativeSparseAttnBackend(
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.nsa.tilelang_kernel import tilelang_sparse_fwd
 
+        # Tilelang kernels require BF16 for both Q and KV.
+        # Prefill is not CUDAGraph-captured, so casts are safe here.
+        if q_all.dtype != torch.bfloat16:
+            q_all = q_all.to(torch.bfloat16)
+        if kv_cache.dtype != torch.bfloat16:
+            kv_cache = kv_cache.to(torch.bfloat16)
+
         return tilelang_sparse_fwd(
             q=q_all,
             kv=kv_cache,
@@ -1832,6 +1840,12 @@ class NativeSparseAttnBackend(
         metadata: NSAMetadata,
         bs: int,
     ) -> torch.Tensor:
+        # ASM MLA kernel requires BF16 Q; FP8 Q triggers an assert for
+        # q_scale/kv_scale.  BF16 Q + FP8 KV is a supported path that
+        # only needs kv_scale.
+        if q_all.dtype != torch.bfloat16:
+            q_all = q_all.to(torch.bfloat16)
+
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
         if layer.head_dim != layer.v_head_dim:
@@ -1848,6 +1862,7 @@ class NativeSparseAttnBackend(
         kv_indices = self.kv_indices
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
+        kv_scale = self.kv_scale_ones if kv_cache.dtype != torch.bfloat16 else None
         mla_decode_fwd(
             q.view(-1, layer.tp_q_head_num, layer.head_dim),
             kv_cache.view(-1, 1, 1, layer.head_dim),
@@ -1859,8 +1874,8 @@ class NativeSparseAttnBackend(
             metadata.max_seq_len_q,
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
+            kv_scale=kv_scale,
         )
-        # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
         return o
 
     def _forward_aiter_extend(
@@ -1870,6 +1885,9 @@ class NativeSparseAttnBackend(
         page_table_1: torch.Tensor,
         layer: RadixAttention,
     ) -> torch.Tensor:
+        if q_all.dtype != torch.bfloat16:
+            q_all = q_all.to(torch.bfloat16)
+
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -1897,6 +1915,7 @@ class NativeSparseAttnBackend(
         cu_seqlens_q = torch.arange(
             0, num_tokens + 1, dtype=torch.int32, device=self.device
         )
+        kv_scale = self.kv_scale_ones if kv_cache.dtype != torch.bfloat16 else None
         # TODO support more forward_mode
         mla_decode_fwd(
             q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1909,6 +1928,7 @@ class NativeSparseAttnBackend(
             1,  # max_seq_len_q = 1 for per-token attention
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
+            kv_scale=kv_scale,
         )
         return o
 
