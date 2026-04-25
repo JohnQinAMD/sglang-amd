@@ -121,15 +121,29 @@ def topk_transform_512_triton(
 ) -> None:
     """Triton equivalent of the CUDA TopK512Kernel.
 
+    Despite the "512" in the name, K is taken from out_page_indices.shape[1]
+    so this works for both Flash (K=512) and Pro (K=1024) c4_sparse_topk values.
+
     Shapes:
       scores:           [B, max_seq_len] f32
       seq_lens:         [B] i32 — actual valid length per batch row
       page_tables:      [B, num_pages] i32
-      out_page_indices: [B, 512] i32
-      out_raw_indices:  [B, 512] i32 or None
+      out_page_indices: [B, K] i32
+      out_raw_indices:  [B, K] i32 or None
     """
+    import os
+
+    # Apply the indexer cap before the kernel reads scores.shape[1].
+    # Without this, BLOCK_L = next_pow2(scores.shape[1]) can exceed Triton's
+    # TRITON_MAX_TENSOR_NUMEL (1M) under cuda graph capture (capture pre-allocates
+    # logits to the worst-case context length, e.g. 262144). The cap is also
+    # enforced upstream in fp8_paged_mqa_logits, so seq_lens are always <= cap.
+    cap = int(os.environ.get("SGLANG_INDEXER_MAX_SEQ_LEN", "0"))
+    if cap > 0 and scores.shape[1] > cap:
+        scores = scores[:, :cap]
+
     B, max_seq_len = scores.shape
-    K = 512
+    K = out_page_indices.shape[1]
     assert page_size > 0 and (page_size & (page_size - 1)) == 0, "page_size must be power of 2"
     page_bits = (page_size - 1).bit_length()
     page_mask = page_size - 1

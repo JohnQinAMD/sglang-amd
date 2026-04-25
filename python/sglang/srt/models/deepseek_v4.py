@@ -132,6 +132,30 @@ def rms_normalize(x: torch.Tensor, eps: float) -> torch.Tensor:
     return x
 
 
+# HC pre/post are decorated at module level so torch.compile is invoked at most
+# once per process. Previously these were nested inside hc_pre/hc_post methods,
+# which created a new local function object each call. With maybe_torch_compile's
+# in-capture wrap (`if get_is_capture_mode(): return torch.compile(func)`),
+# every cuda graph capture call recompiled the same code from scratch — 43
+# layers × N captured batch sizes × 2 functions = hundreds of fresh Inductor
+# compiles, all serializing on the file_baton lock. That was the cuda-graph
+# capture wedge that shadowed every stacked-best run.
+@maybe_torch_compile
+def _hc_pre_torch_impl(x, hc_fn, rms_norm_eps: float):
+    x_flat = x.flatten(1).float()
+    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_norm_eps)
+    mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
+    return x_flat, mixes
+
+
+@maybe_torch_compile
+def _hc_post_torch_impl(x, residual, post, comb):
+    return (
+        post.unsqueeze(-1) * x.unsqueeze(1)
+        + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
+    ).type_as(x)
+
+
 @triton.jit
 def _rms_normalize_kernel(
     x_ptr,
@@ -1891,15 +1915,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        @maybe_torch_compile
-        def hc_pre_torch_impl(x, hc_fn):
-            x_flat = x.flatten(1).float()
-            rsqrt = torch.rsqrt(
-                x_flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
-            )
-            mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
-            return x_flat, mixes
-
         # x: [n,hc,d] -> y: [n,d], where n=b*s
         shape, dtype = x.size(), x.dtype
 
@@ -1947,7 +1962,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
             # Naive Torch implementation
-            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+            x_flat, mixes = _hc_pre_torch_impl(x, hc_fn, self.rms_norm_eps)
 
         from sglang.srt.layers.mhc import hc_split_sinkhorn
 
@@ -1989,14 +2004,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         assert post.shape == (x.shape[0], self.hc_mult)
         assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
 
-        @maybe_torch_compile
-        def hc_post_torch_impl(x, residual, post, comb):
-            return (
-                post.unsqueeze(-1) * x.unsqueeze(1)
-                + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
-            ).type_as(x)
-
-        result = hc_post_torch_impl(x, residual, post, comb)
+        result = _hc_post_torch_impl(x, residual, post, comb)
         return result
 
     def forward(

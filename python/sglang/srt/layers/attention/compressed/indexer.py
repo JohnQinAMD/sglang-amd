@@ -851,6 +851,23 @@ class C4IndexerBackend:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
+        elif is_hip():
+            # On HIP the tvm_ffi-backed topk_transform_512 hardcodes CUDA_HOME
+            # and crashes ("Could not find CUDA installation") during JIT build.
+            # Route to the native Triton port instead — same algorithm
+            # (bit-pack + tl.sort), AMDGCN-compatible, no nvcc dependency.
+            from sglang.jit_kernel.topk_transform_512_triton import (
+                topk_transform_512_triton,
+            )
+
+            topk_transform_512_triton(
+                logits,
+                indexer_metadata.c4_seq_lens,
+                core_metadata.page_table,
+                core_metadata.c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                raw_indices,
+            )
         else:
             topk_transform_512(
                 logits,
