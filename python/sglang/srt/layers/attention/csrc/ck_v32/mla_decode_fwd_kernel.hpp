@@ -28,7 +28,10 @@
 namespace ck_mla_sparse_fp8 {
 
 static constexpr int WARP_SIZE   = 64;
-static constexpr int QK_HEAD_DIM = 576;
+// V_HEAD_DIM is shared by both production DSv4 attention shapes (V32 / 2604).
+// QK_HEAD_DIM is templated below — see `mla_decode_fwd_kernel<QK_HEAD_DIM_T>`.
+//   * V32  / Pro V32 mode  : QK_HEAD_DIM = 576 (d_qk = nope=512 + rope=64)
+//   * 2604 / Flash-Base    : QK_HEAD_DIM = 512 (d_qk = nope=512, no rope)
 static constexpr int V_HEAD_DIM  = 512;
 
 typedef __attribute__((ext_vector_type(8))) __bf16 bf16x8_native;
@@ -122,22 +125,45 @@ static constexpr int NUM_WARPS   = 4;
 static constexpr int BLOCK_SIZE  = NUM_WARPS * WARP_SIZE;
 static constexpr int MFMA_K      = 32;
 static constexpr int MFMA_N      = 16;
-static constexpr int QK_K_ITERS  = QK_HEAD_DIM / MFMA_K;
 static constexpr int QK_N_TILES  = BLOCK_N / MFMA_N;
 static constexpr int PV_N_TILES  = V_HEAD_DIM / MFMA_N;
 static constexpr int PV_PER_WARP = PV_N_TILES / NUM_WARPS;
 
 static constexpr int LDS_PAD     = 8;
-static constexpr int LDS_STRIDE  = QK_HEAD_DIM + LDS_PAD;
-static constexpr int LDS_KV_ONE  = BLOCK_N * LDS_STRIDE * 2;
-static constexpr int LDS_KV_SIZE = LDS_KV_ONE * 2;
+// LDS for the P (softmax) tile is independent of QK_HEAD_DIM — only depends
+// on MFMA_HEADS x BLOCK_N x bf16 size, shared across both V32 and 2604.
 static constexpr int LDS_P_ONE   = MFMA_HEADS * BLOCK_N * 2;
 static constexpr int LDS_P_SIZE  = LDS_P_ONE * Q_PASSES;
-static constexpr int LDS_TOTAL   = LDS_KV_SIZE + LDS_P_SIZE;
 
-// FP8 KV-tile loader: read 576 fp8 bytes per row from HBM via indirect gather,
-// decode to bf16 in registers, store 9 uint4 (= 72 bf16) per row to LDS.
-// Each thread handles 1 of 8 column groups in a row, 9 uint4 chunks each.
+// Per-shape derived sizes. The kernel template instantiates these and the
+// launcher reads `lds_total<QK_HEAD_DIM_T>()` to size the dynamic LDS request.
+//
+// Math sanity per shape (verified at compile time below via static_asserts
+// inside the templated loader):
+//   QK_HEAD_DIM=576: QK_K_ITERS=18 (576/32), VECS_PER_ROW=72 (576/8), 72/8=9
+//   QK_HEAD_DIM=512: QK_K_ITERS=16 (512/32), VECS_PER_ROW=64 (512/8), 64/8=8
+template <int QK_HEAD_DIM_T>
+struct MlaSizes {
+    static constexpr int QK_HEAD_DIM = QK_HEAD_DIM_T;
+    static constexpr int QK_K_ITERS  = QK_HEAD_DIM_T / MFMA_K;
+    static constexpr int LDS_STRIDE  = QK_HEAD_DIM_T + LDS_PAD;
+    static constexpr int LDS_KV_ONE  = BLOCK_N * LDS_STRIDE * 2;
+    static constexpr int LDS_KV_SIZE = LDS_KV_ONE * 2;
+    static constexpr int LDS_TOTAL   = LDS_KV_SIZE + LDS_P_SIZE;
+};
+
+template <int QK_HEAD_DIM_T>
+__host__ __device__ constexpr int lds_total() {
+    return MlaSizes<QK_HEAD_DIM_T>::LDS_TOTAL;
+}
+
+// FP8 KV-tile loader: read QK_HEAD_DIM_T fp8 bytes per row from HBM via
+// indirect gather, decode to bf16 in registers, store VECS_PER_ROW uint4 (=
+// VECS_PER_ROW*8 bf16) per row to LDS. Each thread handles 1 of 8 column
+// groups in a row.
+//   QK_HEAD_DIM=576 -> 9 uint4 chunks per thread
+//   QK_HEAD_DIM=512 -> 8 uint4 chunks per thread
+template <int QK_HEAD_DIM_T>
 __device__ __forceinline__ void
 load_kv_tile_fp8_to_lds(const MlaDecodeArgs& args, int tid, int kv_start, int s_end,
                         int n_start, const uint8_t* __restrict__ kv_base_fp8,
@@ -145,16 +171,19 @@ load_kv_tile_fp8_to_lds(const MlaDecodeArgs& args, int tid, int kv_start, int s_
 {
     int n_valid = min(BLOCK_N, s_end - n_start);
     constexpr int VEC_BF16        = 8;
-    constexpr int VECS_PER_ROW    = QK_HEAD_DIM / VEC_BF16;        // 72
+    constexpr int VECS_PER_ROW    = QK_HEAD_DIM_T / VEC_BF16;
     constexpr int THREADS_PER_ROW = 8;
-    constexpr int VECS_PER_THREAD = VECS_PER_ROW / THREADS_PER_ROW; // 9
+    constexpr int VECS_PER_THREAD = VECS_PER_ROW / THREADS_PER_ROW;
+    constexpr int LDS_STRIDE_T    = MlaSizes<QK_HEAD_DIM_T>::LDS_STRIDE;
     static_assert(BLOCK_N * THREADS_PER_ROW == BLOCK_SIZE, "schedule mismatch");
     static_assert(VECS_PER_ROW == THREADS_PER_ROW * VECS_PER_THREAD, "vec count mismatch");
+    static_assert(QK_HEAD_DIM_T % VEC_BF16 == 0,
+                  "QK_HEAD_DIM_T must be a multiple of 8 (bf16 vec width)");
 
     int ld_row       = tid / THREADS_PER_ROW;
     int ld_col_group = tid & (THREADS_PER_ROW - 1);
 
-    uint4* dst_row = reinterpret_cast<uint4*>(dst_buf + ld_row * LDS_STRIDE);
+    uint4* dst_row = reinterpret_cast<uint4*>(dst_buf + ld_row * LDS_STRIDE_T);
     // Mask for SGLang-style invalid indices (pidx < 0). Treating those as
     // zero K rows is mathematically equivalent to fully masking them out:
     // QK product is 0 for that row → softmax weight cancels through, and
@@ -187,9 +216,15 @@ load_kv_tile_fp8_to_lds(const MlaDecodeArgs& args, int tid, int kv_start, int s_
     }
 }
 
+template <int QK_HEAD_DIM_T>
 __global__ void __launch_bounds__(BLOCK_SIZE, 2)
 mla_decode_fwd_kernel(MlaDecodeArgs args)
 {
+    constexpr int QK_K_ITERS  = MlaSizes<QK_HEAD_DIM_T>::QK_K_ITERS;
+    constexpr int LDS_STRIDE  = MlaSizes<QK_HEAD_DIM_T>::LDS_STRIDE;
+    constexpr int LDS_KV_ONE  = MlaSizes<QK_HEAD_DIM_T>::LDS_KV_ONE;
+    constexpr int LDS_KV_SIZE = MlaSizes<QK_HEAD_DIM_T>::LDS_KV_SIZE;
+
     const int batch_id   = blockIdx.x;
     const int head_group = blockIdx.y;
     const int split_id   = blockIdx.z;
@@ -246,7 +281,7 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
     }
 
     if (s_start < s_end) {
-        load_kv_tile_fp8_to_lds(args, tid, kv_start, s_end, s_start,
+        load_kv_tile_fp8_to_lds<QK_HEAD_DIM_T>(args, tid, kv_start, s_end, s_start,
                                 kv_base, lds_kv_buf0);
     }
     __syncthreads();
@@ -259,7 +294,7 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
         int next_n = n_start + BLOCK_N;
         if (next_n < s_end) {
             __bf16* next_buf = (buf_idx == 0) ? lds_kv_buf1 : lds_kv_buf0;
-            load_kv_tile_fp8_to_lds(args, tid, kv_start, s_end, next_n,
+            load_kv_tile_fp8_to_lds<QK_HEAD_DIM_T>(args, tid, kv_start, s_end, next_n,
                                     kv_base, next_buf);
         }
 

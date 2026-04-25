@@ -1,9 +1,16 @@
-"""CK Tile FP8 sparse MLA decode kernel adapter (V32 / DSv4-Pro shape).
+"""CK Tile FP8 sparse MLA decode kernel adapter (V32 + 2604 / DSv4 shapes).
 
-This module wraps the gfx950 CK Tile kernel that lives in the aiter-amd
-checkout. Used by ``debug_flash_mla_adapter.py`` when:
+This module wraps the gfx950 CK Tile kernel that lives bundled at
+``sglang/srt/layers/attention/csrc/ck_v32/``. Used by
+``debug_flash_mla_adapter.py`` when:
   * ``SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1`` is set, AND
-  * ``head_dim_v == 512`` (V32 shape — DSv4-Pro / V3-style 576/512 dims).
+  * ``head_dim_v == 512`` AND
+  * ``head_dim_qk in {576, 512}``
+
+Two production shape specializations are emitted from the same templated
+kernel — one runtime-dispatch on ``q.size(-1)`` selects:
+  * 576: V32 / Pro V32 mode (DSv4-Pro non-2604, DSv4 V32 reference)
+  * 512: 2604 mode (DSv4-Pro & Flash in ``SGLANG_DSV4_MODE=2604``)
 
 The kernel beats the asm `.co` baseline by ~1.7-3.4× across the typical
 B×topk decode grid; see ``CK_V32_RESULTS.md`` in the kernel-agents
@@ -91,13 +98,15 @@ def _apply_sink_fold_inplace(out_bf16: torch.Tensor, lse: torch.Tensor,
         out_bf16, lse, sink, H=H, V=V, BLOCK_V=BLOCK_V,
     )
 
-# V32 (DSv4-Pro) head dimensions; these are baked into the kernel template
-# parameters and the reduce metadata builders below.
+# V32 (DSv4-Pro) head dimensions; these define the V32 reference. The kernel
+# is also instantiated for QK_HEAD_DIM=512 (2604 mode); SUPPORTED_QK_DIMS
+# below mirrors the static dispatch in mla_decode_fwd.cu.
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
-QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576
+QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576 — V32 reference
 V_HEAD_DIM = KV_LORA_RANK
 HEAD_GROUPS = 4  # = num_heads (128) / TILE_HEADS (32) — kernel constant
+SUPPORTED_QK_DIMS = (576, 512)
 
 # Bundled kernel source ships with the SGLang Python package at
 # sglang/srt/layers/attention/csrc/ck_v32/. Override via env var if you
@@ -262,27 +271,32 @@ def ck_sparse_mla_decode_fp8_v32(
     """Returns (output[B, S_q, H, V=512] bf16, lse[B, H, S_q] fp32)."""
     assert q.dim() == 4
     B, S_q, H, D = q.shape
-    assert D == QK_HEAD_DIM, f"expected qk_head_dim={QK_HEAD_DIM}, got {D}"
+    assert D in SUPPORTED_QK_DIMS, (
+        f"expected qk_head_dim in {SUPPORTED_QK_DIMS} (V32=576 / 2604=512), got {D}"
+    )
 
     topk = indices.shape[-1]
     device = q.device
     total_q = B * S_q
 
-    # Normalize KV pool to [num_pages, 1, 1, 576] FP8 — accepts 2D, 3D, or 4D
-    # depending on how the caller materialized the cache.
+    # Normalize KV pool to [num_pages, 1, 1, D] FP8 — accepts 2D, 3D, or 4D
+    # depending on how the caller materialized the cache. D matches q's last
+    # dim and the templated kernel dispatches on it inside the launcher.
     if k_cache.dim() == 2:
         n_kv = k_cache.shape[0]
-        kv_view = k_cache.view(n_kv, 1, 1, QK_HEAD_DIM)
+        kv_view = k_cache.view(n_kv, 1, 1, D)
     elif k_cache.dim() == 3:
         n_kv = k_cache.shape[0] * k_cache.shape[1]
-        kv_view = k_cache.view(n_kv, 1, 1, QK_HEAD_DIM)
+        kv_view = k_cache.view(n_kv, 1, 1, D)
     elif k_cache.dim() == 4:
-        if k_cache.shape[-1] == QK_HEAD_DIM:
+        if k_cache.shape[-1] == D:
             kv_view = k_cache
         else:
             num_pages, page_size, h_kv, d = k_cache.shape
-            assert h_kv == 1 and d == QK_HEAD_DIM
-            kv_view = k_cache.view(num_pages * page_size, 1, 1, QK_HEAD_DIM)
+            assert h_kv == 1 and d == D, (
+                f"k_cache last-2 dims {(h_kv, d)} mismatch q's d_qk={D}"
+            )
+            kv_view = k_cache.view(num_pages * page_size, 1, 1, D)
     else:
         raise AssertionError(f"unexpected k_cache shape: {tuple(k_cache.shape)}")
 
@@ -303,9 +317,9 @@ def ck_sparse_mla_decode_fp8_v32(
     )
 
     q_2d = (
-        q.view(total_q, H, QK_HEAD_DIM).contiguous()
+        q.view(total_q, H, D).contiguous()
         if q.is_contiguous()
-        else q.reshape(total_q, H, QK_HEAD_DIM)
+        else q.reshape(total_q, H, D)
     )
 
     ck = _get_ck_mod()

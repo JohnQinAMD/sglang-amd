@@ -7,9 +7,13 @@
 
 namespace ck_mla_sparse_fp8 {
 
-void mla_decode_fwd_launch(
-    torch::Tensor q,            // bf16 [total_q, nhead, QK_HEAD_DIM]
-    torch::Tensor kv_buffer,    // fp8_e4m3fnuz [num_page, ..., QK_HEAD_DIM]
+// Per-shape launch helper. Reshapes the KV buffer to the right inner dim and
+// dispatches the templated kernel. Each instantiation is fully specialized at
+// compile time (loop trip counts, LDS strides, MFMA tile counts).
+template <int QK_HEAD_DIM_T>
+static void launch_one(
+    torch::Tensor q,
+    torch::Tensor kv_buffer,
     torch::Tensor split_data,
     torch::Tensor split_lse,
     torch::Tensor qo_indptr,
@@ -22,7 +26,7 @@ void mla_decode_fwd_launch(
     const int nhead = q.size(1);
     const int num_head_groups = (nhead + TILE_HEADS - 1) / TILE_HEADS;
 
-    auto kv_flat = kv_buffer.reshape({-1, QK_HEAD_DIM});
+    auto kv_flat = kv_buffer.reshape({-1, QK_HEAD_DIM_T});
 
     MlaDecodeArgs args;
     args.q_ptr           = q.data_ptr();
@@ -53,9 +57,40 @@ void mla_decode_fwd_launch(
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     hipLaunchKernelGGL(
-        mla_decode_fwd_kernel,
-        grid, block, LDS_TOTAL, stream,
+        (mla_decode_fwd_kernel<QK_HEAD_DIM_T>),
+        grid, block, lds_total<QK_HEAD_DIM_T>(), stream,
         args);
+}
+
+void mla_decode_fwd_launch(
+    torch::Tensor q,            // bf16 [total_q, nhead, qk_head_dim]
+    torch::Tensor kv_buffer,    // fp8_e4m3fnuz [num_page, ..., qk_head_dim]
+    torch::Tensor split_data,
+    torch::Tensor split_lse,
+    torch::Tensor qo_indptr,
+    torch::Tensor kv_indptr,
+    torch::Tensor kv_indices,
+    float sm_scale,
+    int num_kv_splits)
+{
+    // Runtime dispatch on q's last dim. Both DSv4 attention shapes are
+    // bundled in the same kernel module — V32 (576) and Flash-Base 2604
+    // (512). Anything else is a hard error so the caller's adapter never
+    // silently routes a mismatched shape into this kernel.
+    const int qk_head_dim = q.size(-1);
+    if (qk_head_dim == 576) {
+        launch_one<576>(q, kv_buffer, split_data, split_lse,
+                        qo_indptr, kv_indptr, kv_indices,
+                        sm_scale, num_kv_splits);
+    } else if (qk_head_dim == 512) {
+        launch_one<512>(q, kv_buffer, split_data, split_lse,
+                        qo_indptr, kv_indptr, kv_indices,
+                        sm_scale, num_kv_splits);
+    } else {
+        TORCH_CHECK(false,
+            "CK V32 sparse MLA: unsupported q_head_dim ", qk_head_dim,
+            " (expected 576 for V32 or 512 for 2604)");
+    }
 }
 
 } // namespace ck_mla_sparse_fp8
