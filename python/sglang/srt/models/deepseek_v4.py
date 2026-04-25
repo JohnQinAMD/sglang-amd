@@ -2492,7 +2492,11 @@ class DeepseekV4ForCausalLM(nn.Module):
     # This is used externally, please try to keep the API mostly unchanged
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
-        name: str, is_nextn: bool = False, num_hidden_layers: Optional[int] = None
+        name: str,
+        is_nextn: bool = False,
+        num_hidden_layers: Optional[int] = None,
+        *,
+        mlp_scale_to_weight_scale_inv: bool = True,
     ) -> str:
         if name == "embed.weight":
             return "model.embed_tokens.weight"
@@ -2551,9 +2555,93 @@ class DeepseekV4ForCausalLM(nn.Module):
             name = name.replace(".w2.", ".down_proj.")
             name = name.replace(".w3.", ".up_proj.")
             if "mlp" in name:
-                name = name.replace(".scale", ".weight_scale_inv")
+                # Hybrid mxfp4 ckpt: routed experts (`mlp.experts.{E}.*`)
+                # use `.scale` (e8m0) directly; do NOT rename. Shared
+                # experts and other mlp linears stay pure fp8 and need the
+                # `.scale -> .weight_scale_inv` rename either way.
+                if mlp_scale_to_weight_scale_inv or ".experts." not in name:
+                    name = name.replace(".scale", ".weight_scale_inv")
 
         return name
+
+    def _try_consume_mxfp4_expert_weight(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        loaded_params: Set[str],
+    ) -> bool:
+        """Per-expert mxfp4 weight slot copy for hybrid checkpoints.
+
+        Matches names of the form
+            model.layers.{L}.mlp.experts.{E}.{gate|up|down}_proj.{weight|scale}
+        and writes a TP-sliced copy of `loaded_weight` into the fused
+        `experts.{w13_weight[_scale]|w2_weight[_scale]}` parameter slot for
+        local expert `E`. Returns True if the name was consumed.
+
+        Both the int8-packed mxfp4 weights and the float8_e8m0fnu scales are
+        single-byte tensors; we reinterpret them as `uint8` (the dtype of the
+        registered Mxfp4MoEMethod params) without value conversion.
+        """
+        import re
+        m = re.match(
+            r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|scale)$",
+            name,
+        )
+        if m is None:
+            return False
+        layer_idx = int(m.group(1))
+        global_eid = int(m.group(2))
+        proj = m.group(3)
+        suffix = m.group(4)
+
+        try:
+            layer = self.model.layers[layer_idx]
+            experts = layer.mlp.experts
+        except (AttributeError, IndexError):
+            return False
+        # Only intercept mxfp4 FusedMoE experts; otherwise fall through.
+        if not hasattr(experts, "w13_weight") or not hasattr(experts, "w13_weight_scale"):
+            return False
+
+        local_eid = experts._map_global_expert_id_to_local_expert_id(global_eid)
+        if local_eid is None or local_eid < 0:
+            # This rank doesn't own this expert; treat as consumed.
+            return True
+
+        ipp = experts.intermediate_size_per_partition
+        moe_tp_rank = experts.moe_tp_rank
+
+        # Reinterpret int8/e8m0 byte storage as uint8 for the registered param.
+        src = loaded_weight.view(torch.uint8) if loaded_weight.dtype != torch.uint8 else loaded_weight
+
+        if proj in ("gate_proj", "up_proj"):
+            row_start = moe_tp_rank * ipp
+            row_end = row_start + ipp
+            src = src.narrow(0, row_start, ipp)  # (ipp, K)
+            dst = experts.w13_weight if suffix == "weight" else experts.w13_weight_scale
+            slot_lo = 0 if proj == "gate_proj" else ipp
+            slot_hi = slot_lo + ipp
+            dst.data[local_eid, slot_lo:slot_hi, : src.shape[1]].copy_(src)
+            fused_name = (
+                f"model.layers.{layer_idx}.mlp.experts."
+                + ("w13_weight" if suffix == "weight" else "w13_weight_scale")
+            )
+            loaded_params.add(fused_name)
+        else:  # down_proj
+            if suffix == "weight":
+                col_size = ipp // 2
+            else:  # scale uses mxfp4 block of 32
+                col_size = ipp // 32
+            col_start = moe_tp_rank * col_size
+            src = src.narrow(1, col_start, col_size)  # (hidden, col_size)
+            dst = experts.w2_weight if suffix == "weight" else experts.w2_weight_scale
+            dst.data[local_eid, : src.shape[0], : col_size].copy_(src)
+            fused_name = (
+                f"model.layers.{layer_idx}.mlp.experts."
+                + ("w2_weight" if suffix == "weight" else "w2_weight_scale")
+            )
+            loaded_params.add(fused_name)
+        return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         assert envs.SGLANG_DSV4_MODE.get() in ["2601", "2604"]
@@ -2569,6 +2657,16 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+
+        # Hybrid mxfp4 checkpoints (e.g. DeepSeek-V4-Flash) ship per-expert
+        # mxfp4 packed weights with `.scale` (e8m0) suffix, no biases. The
+        # default mlp `.scale -> .weight_scale_inv` rename is wrong for that
+        # path (registered Mxfp4 params end in `_weight_scale`, not `_inv`).
+        is_mxfp4_moe_static = bool(
+            self.quant_config is not None
+            and self.quant_config.get_name() == "mxfp4"
+            and getattr(self.quant_config, "is_checkpoint_mxfp4_serialized", False)
+        )
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -2655,7 +2753,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
+                        mlp_scale_to_weight_scale_inv=not is_mxfp4_moe_static,
                     )
+
+                    # mxfp4 hybrid checkpoint: per-expert experts.{E}.{proj}
+                    # weight + .scale tensors land in the fused
+                    # `experts.w13_weight[_scale]` / `experts.w2_weight[_scale]`
+                    # params via direct slice copy. Skip the rest of the
+                    # standard mapping pipeline for these keys.
+                    if is_mxfp4_moe_static and self._try_consume_mxfp4_expert_weight(
+                        name, loaded_weight, loaded_params
+                    ):
+                        continue
 
                     layer_id = get_layer_id(name)
                     if (
@@ -2920,9 +3029,10 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequant fp8 block-quantized wo_a weight: bf16 = fp8_weight * e8m0_scale.
 
-    Specifically for wo_a in 2604 checkpoint:
-      weight: [8192, 4096] fp8_e4m3fn   (64*128 x 32*128)
-      scale:  [64, 32]     fp8_e8m0fnu  (per 128x128 block)
+    Per-128x128 block scaling. Shapes seen in DSv4 2604 checkpoints:
+      Flash-Base: weight [8192, 4096] fp8_e4m3fn, scale [64, 32]
+      Pro-Base:   weight [16384, 4096] fp8_e4m3fn, scale [128, 32]
+    Generalised to any 2D (M, K) with M % 128 == 0 and K % 128 == 0.
     """
     from einops import rearrange
 
@@ -2933,8 +3043,13 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         torch.float8_e8m0fnu,
         torch.float32,
     ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
-    assert weight.shape == (8192, 4096), f"unexpected weight shape {weight.shape}"
-    assert scale.shape == (64, 32), f"unexpected scale shape {scale.shape}"
+    assert (
+        weight.dim() == 2 and weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
+    ), f"unexpected weight shape {weight.shape} (need 2D, both dims % 128 == 0)"
+    expected_scale_shape = (weight.shape[0] // 128, weight.shape[1] // 128)
+    assert (
+        scale.shape == expected_scale_shape
+    ), f"scale shape {scale.shape} doesn't match {expected_scale_shape} for weight {weight.shape}"
 
     weight_f32 = rearrange(
         weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=128, bk=128
@@ -2943,7 +3058,7 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
     )
 
-    assert result.shape == (8192, 4096)
+    assert result.shape == weight.shape
     return result.to(torch.bfloat16)
 
 
