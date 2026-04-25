@@ -72,6 +72,68 @@ def flash_mla_with_kvcache_torch(
     b, s_q, h_q, d_qk = q.shape
     d_v = head_dim_v
 
+    # ---------------------------------------------------------------
+    # SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1 — bypass the BF16 dequant
+    # round-trip and call the TileLang FP8-direct sparse-MLA decode
+    # kernel. The kernel's wrapper consumes the FP8-packed KV cache
+    # directly (MODEL1 layout, 584 B/token) and returns (output, lse)
+    # in the same shape as ref_sparse_attn_decode.
+    #
+    # Falls back to the BF16 dequant + ref_sparse_attn_decode path
+    # whenever extra_k_cache is set (concat path not yet supported).
+    # ---------------------------------------------------------------
+    import os as _os
+    if (
+        _os.environ.get("SGLANG_HIP_SPARSE_MLA_DECODE_FP8") == "1"
+        and extra_k_cache is None
+        and indices is not None
+    ):
+        topk = indices.shape[-1]
+        invalid_mask = indices < 0
+        if topk_length is not None:
+            arange_topk = torch.arange(
+                topk, device=indices.device, dtype=topk_length.dtype
+            ).view(1, 1, topk)
+            invalid_mask = invalid_mask | (arange_topk >= topk_length.view(b, 1, 1))
+        invalid_mask_2d = invalid_mask.view(b * s_q, topk)
+
+        # Dispatch on d_v: V32 (d_v=512, DSv4-Pro) → CK Tile FP8 sparse;
+        # MODEL1 (d_v=448, DSv4-Flash 2604) → TileLang FP8 direct.
+        if d_v == 512:
+            # ---- V32 path: CK Tile FP8 sparse (1.7-3.4× asm `.co`) ----
+            from sglang.srt.layers.attention.ck_v32_sparse_mla import (
+                ck_sparse_mla_decode_fp8_v32,
+            )
+            out, lse = ck_sparse_mla_decode_fp8_v32(
+                q=q.contiguous(),
+                k_cache=k_cache,
+                indices=indices.to(torch.int32) if indices.dtype != torch.int32 else indices,
+                invalid_mask=invalid_mask_2d,
+                attn_sink=attn_sink,
+                sm_scale=float(softmax_scale) if softmax_scale is not None else 1.0,
+            )
+            return out, lse
+
+        # ---- MODEL1 path (d_v=448): TileLang FP8 direct (parity-correct
+        # fallback; not in-tree yet — sourced from kernel-agents workspace) ----
+        import sys as _sys
+        _ws = "/mnt/vast/john/rocm-dynamo/kernel-agents/experiments/dsv4_sparse_mla_decode_hip_workspace"
+        if _ws not in _sys.path:
+            _sys.path.insert(0, _ws)
+        import sparse_mla_decode_fp8_kernel_model1 as _kmod
+        # k_cache may arrive as float8_e4m3fn (per FP8_DTYPE module-level).
+        kv_packed = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
+        out, lse = _kmod.sparse_mla_decode_fp8(
+            q.contiguous(),
+            kv_packed,
+            indices.to(torch.int32) if indices.dtype != torch.int32 else indices,
+            invalid_mask_2d,
+            attn_sink,
+            float(softmax_scale) if softmax_scale is not None else 1.0,
+            d_v=d_v,
+        )
+        return out, lse
+
     fp8_layout = flashmla_quant.FP8KVCacheLayout.MODEL1_FP8Sparse
 
     p = TestParam(

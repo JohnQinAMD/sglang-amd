@@ -1,0 +1,431 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// CK-tile MLA Decode Forward Kernel — FP8 sparse port (P0/P1)
+//
+// Derived from `ck_mla_decode/mla_decode_fwd_kernel.hpp` (bf16 dense). For P0
+// we keep the LDS layout in bf16 and the existing bf16 MFMA path. The only
+// dtype change is on the global KV side: the KV cache is now stored as
+// fp8_e4m3fnuz (gfx950 native), and the KV-tile loader decodes fp8 -> bf16
+// while staging from HBM into LDS. This halves HBM bandwidth (the dominant
+// cost for memory-bound MLA decode) while keeping the validated MFMA output
+// layout. Q remains bf16 for P0; we'll quantize Q to fp8 in P2 alongside the
+// switch to native fp8 MFMA.
+//
+// Sparse: the existing args.kv_indices indirect gather (kv_base[pidx*stride])
+// already implements per-row sparse access. The wrapper feeds the
+// page_table/topk indices through kv_indices and sets kv_indptr=[0,topk,...]
+// to express "this batch has `topk` valid KV rows from the indirect index
+// array". Zero kernel changes for sparse beyond what the dense kernel
+// already supports.
+
+#pragma once
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+#include <cstdint>
+
+namespace ck_mla_sparse_fp8 {
+
+static constexpr int WARP_SIZE   = 64;
+static constexpr int QK_HEAD_DIM = 576;
+static constexpr int V_HEAD_DIM  = 512;
+
+typedef __attribute__((ext_vector_type(8))) __bf16 bf16x8_native;
+typedef __attribute__((ext_vector_type(4))) float  float4_native;
+typedef __attribute__((ext_vector_type(2))) float  float2_native;
+
+struct bf16x8_t { unsigned int v[4]; };
+struct float4_t {
+    float v[4];
+    __device__ float& operator[](int i) { return v[i]; }
+    __device__ float  operator[](int i) const { return v[i]; }
+};
+
+__device__ __forceinline__ void
+mfma_bf16_16x16x32(float4_t& c, bf16x8_t a, bf16x8_t b)
+{
+    float4_native cn = *reinterpret_cast<float4_native*>(&c);
+    cn = __builtin_amdgcn_mfma_f32_16x16x32_bf16(
+        *reinterpret_cast<bf16x8_native*>(&a),
+        *reinterpret_cast<bf16x8_native*>(&b),
+        cn, 0, 0, 0);
+    asm volatile("" : "+v"(cn));
+    *reinterpret_cast<float4_native*>(&c) = cn;
+}
+
+__device__ __forceinline__ bf16x8_t
+lds_load_bf16x8(const __bf16* p)
+{
+    bf16x8_t r;
+    *reinterpret_cast<uint4*>(&r) = *reinterpret_cast<const uint4*>(p);
+    return r;
+}
+
+// Decode 8 packed fp8_e4m3fnuz bytes (in two uint32_t lanes) to 8 bf16 values.
+// Uses the gfx950 native fp8->f32 hardware converter (`v_cvt_pk_f32_fp8`).
+//
+// CALIBRATION (verified by /tmp/_fp8_decode_probe.py on this gfx950 +
+// ROCm 7.0.0 + clang 20 stack): the HW intrinsic decodes the byte stream
+// with the e4m3*fn* exponent bias (=7), producing exactly 2x the value that
+// `torch.float8_e4m3fnuz.float()` returns (which uses bias=8). To match the
+// PyTorch native fnuz cast — which is what the FP32 oracle and the wrapper's
+// fp8 quantization agree on — we post-multiply by 0.5. Single VALU op per
+// 8 fp8 lanes; routed into the bf16 narrow as `f[i] * 0.5f`.
+//
+// This is the SAME upstream-decoder bug TileLang's V32 port found and
+// documented (see `feedback_flydsl_mfma32_layout` peers and the V32 wrapper
+// SCALE_ONE_U8=126 workaround). Source-of-truth fix would be in LLVM's gfx950
+// fp8 codegen / hipcc routing; for the kernel-side workaround a 0.5 fold is
+// simplest and lossless because the compensation is in f32 before bf16
+// narrowing.
+struct fp8x8_t { uint32_t v[2]; };  // 8 fp8 bytes
+__device__ __forceinline__ bf16x8_t
+fp8x8_decode_to_bf16x8(fp8x8_t in)
+{
+    float2_native lo0 = __builtin_amdgcn_cvt_pk_f32_fp8(in.v[0], false);
+    float2_native hi0 = __builtin_amdgcn_cvt_pk_f32_fp8(in.v[0], true);
+    float2_native lo1 = __builtin_amdgcn_cvt_pk_f32_fp8(in.v[1], false);
+    float2_native hi1 = __builtin_amdgcn_cvt_pk_f32_fp8(in.v[1], true);
+
+    constexpr float kFnuzBiasFix = 0.5f;  // compensates HW bias=7 vs torch fnuz bias=8
+    float f[8];
+    f[0] = lo0[0] * kFnuzBiasFix; f[1] = lo0[1] * kFnuzBiasFix;
+    f[2] = hi0[0] * kFnuzBiasFix; f[3] = hi0[1] * kFnuzBiasFix;
+    f[4] = lo1[0] * kFnuzBiasFix; f[5] = lo1[1] * kFnuzBiasFix;
+    f[6] = hi1[0] * kFnuzBiasFix; f[7] = hi1[1] * kFnuzBiasFix;
+
+    bf16x8_t out;
+    __bf16* outp = reinterpret_cast<__bf16*>(&out);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        outp[i] = __float2bfloat16(f[i]);
+    }
+    return out;
+}
+
+struct MlaDecodeArgs {
+    const void* q_ptr; const void* kv_ptr;          // q: bf16, kv: fp8_e4m3fnuz
+    float* split_data_ptr; float* split_lse_ptr;
+    const int32_t* qo_indptr; const int32_t* kv_indptr; const int32_t* kv_indices;
+    float sm_scale; int nhead; int num_kv_splits;
+    int64_t stride_q_s, stride_q_h, stride_kv;       // stride_kv counted in fp8 bytes (per-row stride in bytes)
+    int64_t stride_sd_s, stride_sd_split, stride_sd_h;
+    int64_t stride_lse_s, stride_lse_split, stride_lse_h;
+};
+
+static constexpr int MFMA_HEADS  = 16;
+static constexpr int Q_PASSES    = 2;
+static constexpr int TILE_HEADS  = MFMA_HEADS * Q_PASSES;
+static constexpr int BLOCK_N     = 32;
+static constexpr int NUM_WARPS   = 4;
+static constexpr int BLOCK_SIZE  = NUM_WARPS * WARP_SIZE;
+static constexpr int MFMA_K      = 32;
+static constexpr int MFMA_N      = 16;
+static constexpr int QK_K_ITERS  = QK_HEAD_DIM / MFMA_K;
+static constexpr int QK_N_TILES  = BLOCK_N / MFMA_N;
+static constexpr int PV_N_TILES  = V_HEAD_DIM / MFMA_N;
+static constexpr int PV_PER_WARP = PV_N_TILES / NUM_WARPS;
+
+static constexpr int LDS_PAD     = 8;
+static constexpr int LDS_STRIDE  = QK_HEAD_DIM + LDS_PAD;
+static constexpr int LDS_KV_ONE  = BLOCK_N * LDS_STRIDE * 2;
+static constexpr int LDS_KV_SIZE = LDS_KV_ONE * 2;
+static constexpr int LDS_P_ONE   = MFMA_HEADS * BLOCK_N * 2;
+static constexpr int LDS_P_SIZE  = LDS_P_ONE * Q_PASSES;
+static constexpr int LDS_TOTAL   = LDS_KV_SIZE + LDS_P_SIZE;
+
+// FP8 KV-tile loader: read 576 fp8 bytes per row from HBM via indirect gather,
+// decode to bf16 in registers, store 9 uint4 (= 72 bf16) per row to LDS.
+// Each thread handles 1 of 8 column groups in a row, 9 uint4 chunks each.
+__device__ __forceinline__ void
+load_kv_tile_fp8_to_lds(const MlaDecodeArgs& args, int tid, int kv_start, int s_end,
+                        int n_start, const uint8_t* __restrict__ kv_base_fp8,
+                        __bf16* __restrict__ dst_buf)
+{
+    int n_valid = min(BLOCK_N, s_end - n_start);
+    constexpr int VEC_BF16        = 8;
+    constexpr int VECS_PER_ROW    = QK_HEAD_DIM / VEC_BF16;        // 72
+    constexpr int THREADS_PER_ROW = 8;
+    constexpr int VECS_PER_THREAD = VECS_PER_ROW / THREADS_PER_ROW; // 9
+    static_assert(BLOCK_N * THREADS_PER_ROW == BLOCK_SIZE, "schedule mismatch");
+    static_assert(VECS_PER_ROW == THREADS_PER_ROW * VECS_PER_THREAD, "vec count mismatch");
+
+    int ld_row       = tid / THREADS_PER_ROW;
+    int ld_col_group = tid & (THREADS_PER_ROW - 1);
+
+    uint4* dst_row = reinterpret_cast<uint4*>(dst_buf + ld_row * LDS_STRIDE);
+    // Mask for SGLang-style invalid indices (pidx < 0). Treating those as
+    // zero K rows is mathematically equivalent to fully masking them out:
+    // QK product is 0 for that row → softmax weight cancels through, and
+    // V contribution is 0. For an all-invalid query (lonely-Q), this also
+    // gives a correct zero output without a separate wrapper correction.
+    int pidx = (ld_row < n_valid)
+                   ? args.kv_indices[kv_start + n_start + ld_row]
+                   : -1;
+    if (pidx >= 0) {
+        // stride_kv is counted in fp8 BYTES at the launcher (one full row of
+        // QK_HEAD_DIM=576 fp8 bytes per row).
+        const uint32_t* src_row_fp8 = reinterpret_cast<const uint32_t*>(
+            kv_base_fp8 + pidx * args.stride_kv);
+        #pragma unroll
+        for (int k = 0; k < VECS_PER_THREAD; ++k) {
+            int vc = ld_col_group + k * THREADS_PER_ROW;  // 0..71 bf16x8 column index
+            // Each bf16x8 (8 bf16 = uint4) corresponds to 8 fp8 = 2 uint32.
+            fp8x8_t fp8_in;
+            fp8_in.v[0] = src_row_fp8[vc * 2 + 0];
+            fp8_in.v[1] = src_row_fp8[vc * 2 + 1];
+            bf16x8_t bf = fp8x8_decode_to_bf16x8(fp8_in);
+            dst_row[vc] = *reinterpret_cast<uint4*>(&bf);
+        }
+    } else {
+        #pragma unroll
+        for (int k = 0; k < VECS_PER_THREAD; ++k) {
+            int vc = ld_col_group + k * THREADS_PER_ROW;
+            dst_row[vc] = make_uint4(0, 0, 0, 0);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(BLOCK_SIZE, 2)
+mla_decode_fwd_kernel(MlaDecodeArgs args)
+{
+    const int batch_id   = blockIdx.x;
+    const int head_group = blockIdx.y;
+    const int split_id   = blockIdx.z;
+    const int head_start = head_group * TILE_HEADS;
+    const int tid        = threadIdx.x;
+    const int warp_id    = tid / WARP_SIZE;
+    const int lane_id    = tid % WARP_SIZE;
+    const int kgrp       = lane_id / 16;
+
+    const int kv_start = args.kv_indptr[batch_id];
+    const int kv_len   = args.kv_indptr[batch_id + 1] - kv_start;
+    const int qo_start = args.qo_indptr[batch_id];
+    const int split_len = (kv_len + args.num_kv_splits - 1) / args.num_kv_splits;
+    const int s_start   = split_len * split_id;
+    const int s_end     = min(s_start + split_len, kv_len);
+    if (s_end <= s_start) return;
+
+    extern __shared__ char smem[];
+    // Avoid initializer-list of LDS-derived pointers (triggers an
+    // "addrspacecast in static initializer" compiler error on ROCm 7 hipcc).
+    // Materialize per-buffer pointers separately and select via ternary at use.
+    __bf16* lds_kv_buf0 = reinterpret_cast<__bf16*>(smem);
+    __bf16* lds_kv_buf1 = reinterpret_cast<__bf16*>(smem + LDS_KV_ONE);
+
+    const uint8_t* __restrict__ kv_base = reinterpret_cast<const uint8_t*>(args.kv_ptr);
+    const __bf16*  __restrict__ q_base  = reinterpret_cast<const __bf16*>(args.q_ptr);
+    __bf16* __restrict__ lds_p_r =
+        reinterpret_cast<__bf16*>(smem + LDS_KV_SIZE);
+
+    constexpr int O_FLAT = Q_PASSES * PV_PER_WARP;
+    float4_t o_acc[O_FLAT];
+    float rmax[Q_PASSES * 4];
+    float rsum[Q_PASSES * 4];
+    #pragma unroll
+    for (int i = 0; i < O_FLAT; ++i)
+        o_acc[i] = {{0,0,0,0}};
+    #pragma unroll
+    for (int i = 0; i < Q_PASSES * 4; ++i) {
+        rmax[i] = -1e30f;
+        rsum[i] = 0;
+    }
+
+    const __bf16* q_row_ptrs[Q_PASSES];
+    bool qp_active[Q_PASSES];
+    const int q_head_lane = lane_id % 16;
+    const int64_t q_row_base_off = (int64_t)qo_start * args.stride_q_s;
+    #pragma unroll
+    for (int qp = 0; qp < Q_PASSES; ++qp) {
+        int qp_head_start = head_start + qp * MFMA_HEADS;
+        int q_row_head    = qp_head_start + q_head_lane;
+        qp_active[qp]     = (qp_head_start < args.nhead);
+        int q_row_safe    = (q_row_head < args.nhead) ? q_row_head : 0;
+        q_row_ptrs[qp]    = q_base + q_row_base_off + q_row_safe * args.stride_q_h;
+    }
+
+    if (s_start < s_end) {
+        load_kv_tile_fp8_to_lds(args, tid, kv_start, s_end, s_start,
+                                kv_base, lds_kv_buf0);
+    }
+    __syncthreads();
+
+    int buf_idx = 0;
+    for (int n_start = s_start; n_start < s_end; n_start += BLOCK_N)
+    {
+        int n_valid = min(BLOCK_N, s_end - n_start);
+
+        int next_n = n_start + BLOCK_N;
+        if (next_n < s_end) {
+            __bf16* next_buf = (buf_idx == 0) ? lds_kv_buf1 : lds_kv_buf0;
+            load_kv_tile_fp8_to_lds(args, tid, kv_start, s_end, next_n,
+                                    kv_base, next_buf);
+        }
+
+        __bf16* __restrict__ lds_kv = (buf_idx == 0) ? lds_kv_buf0 : lds_kv_buf1;
+
+        float4_t s_acc_all[Q_PASSES][QK_N_TILES];
+        #pragma unroll
+        for (int qp = 0; qp < Q_PASSES; ++qp)
+            #pragma unroll
+            for (int nt = 0; nt < QK_N_TILES; ++nt)
+                s_acc_all[qp][nt] = {{0,0,0,0}};
+
+        #pragma unroll 3
+        for (int ki = 0; ki < QK_K_ITERS; ++ki)
+        {
+            bf16x8_t qa[Q_PASSES];
+            #pragma unroll
+            for (int qp = 0; qp < Q_PASSES; ++qp)
+                qa[qp] = *reinterpret_cast<const bf16x8_t*>(
+                    q_row_ptrs[qp] + ki * MFMA_K + kgrp * 8);
+            #pragma unroll
+            for (int nt = 0; nt < QK_N_TILES; ++nt)
+            {
+                int krow = (lane_id % 16) + nt * 16;
+                bf16x8_t kb = lds_load_bf16x8(
+                    &lds_kv[krow * LDS_STRIDE + ki * MFMA_K + kgrp * 8]);
+                #pragma unroll
+                for (int qp = 0; qp < Q_PASSES; ++qp)
+                    mfma_bf16_16x16x32(s_acc_all[qp][nt], qa[qp], kb);
+            }
+        }
+
+        bf16x8_t pa_all[Q_PASSES];
+        for (int qp = 0; qp < Q_PASSES; ++qp)
+        {
+            if (!qp_active[qp]) break;
+            float4_t (&s_acc)[QK_N_TILES] = s_acc_all[qp];
+
+            constexpr float kLog2e = 1.4426950408889634f;
+            const float sm_scale_log2e = args.sm_scale * kLog2e;
+            #pragma unroll
+            for (int nt = 0; nt < QK_N_TILES; ++nt)
+                #pragma unroll
+                for (int c = 0; c < 4; ++c)
+                    s_acc[nt][c] *= sm_scale_log2e;
+            {
+                int kv_col = lane_id % 16;
+                #pragma unroll
+                for (int nt = 0; nt < QK_N_TILES; ++nt)
+                    if (kv_col + nt * 16 >= n_valid)
+                        #pragma unroll
+                        for (int c = 0; c < 4; ++c)
+                            s_acc[nt][c] = -1e30f;
+            }
+
+            float lmax[4];
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                lmax[c] = -1e30f;
+                #pragma unroll
+                for (int nt = 0; nt < QK_N_TILES; ++nt)
+                    lmax[c] = fmaxf(lmax[c], s_acc[nt][c]);
+            }
+            #pragma unroll
+            for (int off = 1; off < 16; off *= 2) {
+                #pragma unroll
+                for (int c = 0; c < 4; ++c)
+                    lmax[c] = fmaxf(lmax[c], __shfl_xor(lmax[c], off));
+            }
+
+            float new_max_arr[4];
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                new_max_arr[c] = fmaxf(rmax[qp*4+c], lmax[c]);
+                float rsc = exp2f(rmax[qp*4+c] - new_max_arr[c]);
+                #pragma unroll
+                for (int i = 0; i < PV_PER_WARP; ++i)
+                    o_acc[qp*PV_PER_WARP+i][c] *= rsc;
+                rsum[qp*4+c] *= rsc;
+            }
+
+            float lsum[4];
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                lsum[c] = 0.0f;
+                #pragma unroll
+                for (int nt = 0; nt < QK_N_TILES; ++nt) {
+                    float pv = exp2f(s_acc[nt][c] - new_max_arr[c]);
+                    s_acc[nt][c] = pv;
+                    lsum[c] += pv;
+                }
+            }
+            #pragma unroll
+            for (int off = 1; off < 16; off *= 2) {
+                #pragma unroll
+                for (int c = 0; c < 4; ++c)
+                    lsum[c] += __shfl_xor(lsum[c], off);
+            }
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                rsum[qp*4+c] += lsum[c];
+                rmax[qp*4+c] = new_max_arr[c];
+            }
+
+            __bf16* __restrict__ lds_p_qp = lds_p_r + qp * (MFMA_HEADS * BLOCK_N);
+            {
+                int kv_col = lane_id % 16;
+                for (int c = 0; c < 4; ++c) {
+                    int head = kgrp * 4 + c;
+                    for (int nt = 0; nt < QK_N_TILES; ++nt)
+                        lds_p_qp[head * BLOCK_N + kv_col + nt * 16] =
+                            __float2bfloat16(s_acc[nt][c]);
+                }
+            }
+
+            pa_all[qp] = lds_load_bf16x8(
+                &lds_p_qp[(lane_id % 16) * BLOCK_N + kgrp * 8]);
+
+        } // Q passes
+
+        #pragma unroll 2
+        for (int vl = 0; vl < PV_PER_WARP; ++vl)
+        {
+            int vt = warp_id * PV_PER_WARP + vl;
+            int v_col = (lane_id % 16) + vt * 16;
+            int kv_bt = kgrp * 8;
+            __bf16 vb[8];
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                vb[j] = lds_kv[(kv_bt + j) * LDS_STRIDE + v_col];
+            }
+            bf16x8_t vb_v = *reinterpret_cast<bf16x8_t*>(vb);
+            #pragma unroll
+            for (int qp = 0; qp < Q_PASSES; ++qp) {
+                if (!qp_active[qp]) continue;
+                mfma_bf16_16x16x32(
+                    o_acc[qp*PV_PER_WARP+vl], pa_all[qp], vb_v);
+            }
+        }
+        __syncthreads();
+        buf_idx ^= 1;
+    } // KV tiles
+
+    int v_col_base = lane_id % 16;
+    for (int qp = 0; qp < Q_PASSES; ++qp) {
+        for (int c = 0; c < 4; ++c) {
+            int cur_head = head_start + qp * MFMA_HEADS + kgrp * 4 + c;
+            if (cur_head >= args.nhead) continue;
+            float inv = (rsum[qp*4+c] > 0) ? 1.0f / rsum[qp*4+c] : 0;
+            int sd = qo_start * args.stride_sd_s +
+                     split_id * args.stride_sd_split +
+                     cur_head * args.stride_sd_h;
+            for (int vl = 0; vl < PV_PER_WARP; ++vl) {
+                int vc = v_col_base + (warp_id * PV_PER_WARP + vl) * 16;
+                if (vc < V_HEAD_DIM)
+                    args.split_data_ptr[sd + vc] = o_acc[qp*PV_PER_WARP+vl][c] * inv;
+            }
+            if (v_col_base == 0) {
+                int lb = qo_start * args.stride_lse_s +
+                         split_id * args.stride_lse_split +
+                         cur_head * args.stride_lse_h;
+                constexpr float kLn2 = 0.6931471805599453f;
+                args.split_lse_ptr[lb] = rmax[qp*4+c] * kLn2 + logf(rsum[qp*4+c]);
+            }
+        }
+    }
+}
+
+} // namespace ck_mla_sparse_fp8
