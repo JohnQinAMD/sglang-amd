@@ -264,6 +264,12 @@ class Compressor(nn.Module):
             prefix=add_prefix("wkv_gate", prefix),
             params_dtype=wkv_gate_dtype,
         )
+        # NOTE: kept on DeepseekRefRMSNorm (not the fast SGLang RMSNorm) because
+        # `kv_compressed` here is asserted fp32 (see compress_extend / compress_decode)
+        # and HIP's fast RMSNorm path dispatches to `aiter.rmsnorm2d_fwd` which
+        # only supports fp16/bf16 (verified RuntimeError on this stack). Casting
+        # fp32→bf16→fp32 around the call would bypass that limit but introduces
+        # ~2.5% quantization noise, which violates the asserted-fp32 contract.
         # self.norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.norm = DeepseekRefRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary_emb = rotary_emb
