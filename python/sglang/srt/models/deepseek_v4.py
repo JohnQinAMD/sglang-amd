@@ -46,6 +46,16 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+# Optional aiter fused q/k RMSNorm — falls back to the two-call path if not
+# available (CUDA build, older aiter releases). One launch instead of two for
+# the q-lora-norm + kv-norm pair in MQALayer._forward_prepare.
+try:
+    from aiter.ops.fused_qk_norm_rope_cache_quant import (
+        fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm,
+    )
+except Exception:  # pragma: no cover - import-time fallback only
+    _aiter_fused_qk_rmsnorm = None
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -254,6 +264,12 @@ class Compressor(nn.Module):
             prefix=add_prefix("wkv_gate", prefix),
             params_dtype=wkv_gate_dtype,
         )
+        # NOTE: kept on DeepseekRefRMSNorm (not the fast SGLang RMSNorm) because
+        # `kv_compressed` here is asserted fp32 (see compress_extend / compress_decode)
+        # and HIP's fast RMSNorm path dispatches to `aiter.rmsnorm2d_fwd` which
+        # only supports fp16/bf16 (verified RuntimeError on this stack). Casting
+        # fp32→bf16→fp32 around the call would bypass that limit but introduces
+        # ~2.5% quantization noise, which violates the asserted-fp32 contract.
         # self.norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.norm = DeepseekRefRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary_emb = rotary_emb
@@ -986,6 +1002,12 @@ class Compressor(nn.Module):
 
         self.forward_mode = forward_batch.forward_mode
 
+        # Cannot use aiter.fused_qk_rmsnorm here: wkv_gate emits
+        # [bs, 2*coff*head_dim] which is [kv | score], NOT [q | k]. The two
+        # halves go through different downstream ops (kv is mixed by the
+        # softmax of score; score itself is never normed). And `self.norm`
+        # only fires AFTER the score-weighted sum, on a single fp32 tensor —
+        # no second tensor exists to pair-norm with. Structure does not fit.
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
         return self.compress_dispatch(kv_score, forward_batch)
 
@@ -1279,6 +1301,14 @@ class C4Indexer(nn.Module):
 
     def compute_q(self, q_lora: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # [bs, n_heads, head_dim]
+        #
+        # NOTE: not batched with `compute_weights` below — the two GEMMs take
+        # *different* inputs (q_lora, the lora-projected+normed Q vector, vs.
+        # x, the un-normed hidden state). Batching via torch.bmm/aiter
+        # batched_gemm would require restructuring the call chain in
+        # `forward_c4_indexer` so that both projections share an input, which
+        # changes the model semantics (q-norm cannot be applied to x). Skipped
+        # — see fusion item 6c discussion in MQALAYER_ELEMENTWISE_ANALYSIS.md.
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         fused_rope(
@@ -1291,6 +1321,10 @@ class C4Indexer(nn.Module):
         return q
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
+        # See `compute_q` note: cannot batch this GEMM with `wq_b` because the
+        # input tensors differ (q_lora vs x). The two are 1 launch each at the
+        # measured shapes, total addressable saving is ~30-60us/token if
+        # somehow batched, not worth a model-semantics-changing refactor.
         out, _ = self.weights_proj(x)
         if not skip_scale:
             out = out * self.weight_scale
@@ -1676,19 +1710,33 @@ class MQALayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # [bs, q_lora_rank]
         q, _ = self.wq_a(x)
-        # [bs, q_lora_rank]
-        q = self.q_norm(q)
-        q_lora = q  # only used for indexer
+        # [bs, head_dim]
+        kv, _ = self.wkv(x)
+        # Fuse q_norm + kv_norm into a single launch when both are bf16 and
+        # share the leading dim (always true here since they read the same x).
+        # Saves ~1 launch / layer × 61 = ~250-300 µs / decoded token. The aiter
+        # op falls back internally to two rmsnorm2d_fwd calls at M >= 16384.
+        if (
+            _aiter_fused_qk_rmsnorm is not None
+            and q.dtype == torch.bfloat16
+            and kv.dtype == torch.bfloat16
+            and q.size(0) == kv.size(0)
+        ):
+            q, kv = _aiter_fused_qk_rmsnorm(
+                q, self.q_norm.weight, self.eps,
+                kv, self.kv_norm.weight, self.eps,
+            )
+        else:
+            # [bs, q_lora_rank]
+            q = self.q_norm(q)
+            # [bs, head_dim]
+            kv = self.kv_norm(kv)
+        q_lora = q  # only used for indexer (post-q_norm, pre-wq_b — unchanged)
         # [bs, n_local_heads, head_dim]
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         # [bs, n_local_heads, head_dim]
         q = rms_normalize_triton(q, self.eps)
-
-        # [bs, head_dim]
-        kv, _ = self.wkv(x)
-        # [bs, head_dim]
-        kv = self.kv_norm(kv)
 
         fused_rope(
             q[..., -self.qk_rope_head_dim :],
@@ -1830,6 +1878,37 @@ class MQALayer(nn.Module):
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
+        # NOTE on fusion item 7 (wo_b AllReduce + next-layer RMSNorm fusion):
+        #
+        # `aiter.dist.fused_allreduce_rmsnorm{,_quant}` exists and would fuse
+        # AllReduce + add(residual) + RMSNorm into one launch — and
+        # RowParallelLinear already supports `skip_all_reduce=True`. But
+        # DSv4's decoder layer is structurally different from the standard
+        # transformer this op was designed for:
+        #
+        #   wo_b output [n, d]  (post-AllReduce in stock SGLang)
+        #     -> hc_post([n, d], residual=[n, hc, d], post, comb)  -> [n, hc, d]
+        #     -> hc_pre(...)  -> [n, d] + post' + comb'
+        #     -> post_attention_layernorm([n, d])     <- the next RMSNorm
+        #
+        # Two reasons fusion is structurally infeasible here:
+        #   1. The "residual" between wo_b's AllReduce and the next RMSNorm is
+        #      *not* an additive [n, d] residual — it's a [n, hc, d]
+        #      hierarchical-compression tensor consumed by `hc_post`, which is
+        #      itself a TileLang-fused op (mhc_post). The aiter fused op
+        #      assumes `out = rmsnorm(input + residual)`; here we have
+        #      `out = rmsnorm(hc_pre(hc_post(input, residual_hc, post, comb)))`
+        #      which is non-linear in `input`.
+        #   2. The next RMSNorm weight (`post_attention_layernorm.weight`)
+        #      lives in a different module than this MQALayer; threading it
+        #      across the layer boundary would require either passing it
+        #      through `hc_post` + `hc_pre` (defeats the point) or restructur-
+        #      ing DeepseekV4DecoderLayer.forward to inline the AllReduce-
+        #      reduce -+-rmsnorm step (defeats the layer abstraction).
+        #
+        # Skipped per the task spec ("If cross-layer wiring is too invasive,
+        # implement just the fused AllReduce + RMSNorm... If that's also too
+        # messy, SKIP with a thorough comment").
         o, _ = self.wo_b(o.flatten(1))
 
         return o

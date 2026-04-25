@@ -22,6 +22,74 @@ import os
 from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
+
+
+# Single-launch sink fold: out *= 1 / (1 + exp(sink - lse))
+#
+# Replaces the previous 3-4-launch torch chain (broadcast sub → exp → add → div
+# → mul → cast) with one Triton kernel that streams `out` and writes it back in
+# place. Kernel is launched per (total_q, head, V-tile); each program reads one
+# (q, h)'s lse + sink scalar, broadcasts the resulting scale across the V tile.
+#
+# `total_q` is small (B*S_q, e.g. 1-8 in decode), `H=128`, `V=512` for V32
+# DSv4-Pro — so a single 1D launch over (total_q*H) with 512 lanes per
+# program is well-sized for MI355X (~5 µs typical → ~1-2 µs after fusion).
+@triton.jit
+def _sink_fold_inplace_kernel(
+    out_ptr,      # [total_q, H, V] bf16, modified in place
+    lse_ptr,      # [total_q, H]    fp32
+    sink_ptr,     # [H]             fp32
+    H: tl.constexpr,
+    V: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    pid = tl.program_id(0)            # 0 .. total_q*H
+    qh_id = pid                        # row index in flattened (total_q, H)
+    h_id = qh_id % H
+
+    # Per-row scale: 1 / (1 + exp(sink[h] - lse[q, h])).
+    sink = tl.load(sink_ptr + h_id).to(tl.float32)
+    lse = tl.load(lse_ptr + qh_id).to(tl.float32)
+    scale = 1.0 / (1.0 + tl.exp(sink - lse))
+
+    offs = tl.arange(0, BLOCK_V)
+    base = qh_id * V
+    for v_start in tl.static_range(0, V, BLOCK_V):
+        cur = offs + v_start
+        mask = cur < V
+        x = tl.load(out_ptr + base + cur, mask=mask, other=0.0).to(tl.float32)
+        x = x * scale
+        tl.store(out_ptr + base + cur, x.to(tl.bfloat16), mask=mask)
+
+
+def _apply_sink_fold_inplace(out_bf16: torch.Tensor, lse: torch.Tensor,
+                              sink: torch.Tensor) -> None:
+    """In-place: out_bf16[q, h, :] *= 1 / (1 + exp(sink[h] - lse[q, h]))."""
+    assert out_bf16.dtype == torch.bfloat16
+    total_q, H, V = out_bf16.shape
+    assert lse.shape == (total_q, H), f"lse shape {tuple(lse.shape)} vs ({total_q},{H})"
+    assert sink.shape == (H,), f"sink shape {tuple(sink.shape)} vs ({H},)"
+    if not out_bf16.is_contiguous():
+        out_bf16 = out_bf16.contiguous()
+    if lse.dtype != torch.float32:
+        lse = lse.float()
+    if sink.dtype != torch.float32:
+        sink = sink.float()
+    if not lse.is_contiguous():
+        lse = lse.contiguous()
+    if not sink.is_contiguous():
+        sink = sink.contiguous()
+
+    # BLOCK_V=512 covers the full V dim in one program for V32 (V=512), so the
+    # static_range loop is single-iter — single 512-wide vector load+store per
+    # (q, h) row. For larger V the loop tiles automatically.
+    BLOCK_V = min(512, V)
+    grid = (total_q * H,)
+    _sink_fold_inplace_kernel[grid](
+        out_bf16, lse, sink, H=H, V=V, BLOCK_V=BLOCK_V,
+    )
 
 # V32 (DSv4-Pro) head dimensions; these are baked into the kernel template
 # parameters and the reduce metadata builders below.
@@ -260,10 +328,18 @@ def ck_sparse_mla_decode_fp8_v32(
     # P@V=0. No wrapper correction needed.
 
     # Attention sink correction: out *= 1 / (1 + exp(sink - lse)).
+    #
+    # Fused into a single Triton kernel (`_sink_fold_inplace_kernel`) — one
+    # launch instead of the previous 3-4-kernel torch chain (broadcast sub →
+    # exp → add → div → mul → cast). The kernel streams `out_bf16` in place
+    # so we avoid the f32 round-trip and the extra HBM allocation.
     if attn_sink is not None:
-        sink = attn_sink.float() if attn_sink.dtype != torch.float32 else attn_sink
-        scale = 1.0 / (1.0 + torch.exp(sink.view(1, H) - lse))   # [total_q, H]
-        out_bf16 = (out_bf16.float() * scale.unsqueeze(-1)).to(torch.bfloat16)
+        # `out_bf16` may not be contiguous in the num_splits==1 fast path
+        # (it's a `.to(bfloat16)` of a strided view of split_data), so make
+        # it contiguous first — the kernel writes in place.
+        if not out_bf16.is_contiguous():
+            out_bf16 = out_bf16.contiguous()
+        _apply_sink_fold_inplace(out_bf16, lse, attn_sink)
 
     out_bf16 = out_bf16.view(B, S_q, H, V_HEAD_DIM)
     lse_bhs = lse.view(B, S_q, H).transpose(1, 2).contiguous()  # [B, H, S_q]
