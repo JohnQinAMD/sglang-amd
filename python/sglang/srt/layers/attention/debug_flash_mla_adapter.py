@@ -7,6 +7,39 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 
+# ---------------------------------------------------------------
+# Cross-layer cache for `invalid_mask = indices < 0 (| arange >= topk_length)`.
+# DSv4-Pro decode runs MQALayer.attn_backend.forward 61× per token using the
+# same `indices` / `topk_length` tensors — so the mask only needs to be built
+# once per forward_batch. Saves ~60 × 3.4µs = ~200µs/token.
+#
+# Keyed by (indices.data_ptr, id(topk_length), b, s_q, topk); we additionally
+# verify `id(indices)` to invalidate when the underlying tensor object is
+# rebuilt at a new pointer for the next batch. Cap size to bound memory.
+# ---------------------------------------------------------------
+_invalid_mask_cache: dict = {}
+
+
+def _get_invalid_mask(indices, topk_length, b, s_q, topk):
+    key = (indices.data_ptr(), id(topk_length), b, s_q, topk)
+    cached = _invalid_mask_cache.get(key)
+    if cached is not None:
+        cached_mask, cached_indices_id = cached
+        if cached_indices_id == id(indices):
+            return cached_mask
+    mask = indices < 0
+    if topk_length is not None:
+        arange_topk = torch.arange(
+            topk, device=indices.device, dtype=topk_length.dtype
+        ).view(1, 1, topk)
+        mask = mask | (arange_topk >= topk_length.view(b, 1, 1))
+    mask_2d = mask.view(b * s_q, topk)
+    if len(_invalid_mask_cache) > 16:
+        _invalid_mask_cache.clear()
+    _invalid_mask_cache[key] = (mask_2d, id(indices))
+    return mask_2d
+
+
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if is_hip():
         # backend == "torch"
@@ -89,13 +122,7 @@ def flash_mla_with_kvcache_torch(
         and indices is not None
     ):
         topk = indices.shape[-1]
-        invalid_mask = indices < 0
-        if topk_length is not None:
-            arange_topk = torch.arange(
-                topk, device=indices.device, dtype=topk_length.dtype
-            ).view(1, 1, topk)
-            invalid_mask = invalid_mask | (arange_topk >= topk_length.view(b, 1, 1))
-        invalid_mask_2d = invalid_mask.view(b * s_q, topk)
+        invalid_mask_2d = _get_invalid_mask(indices, topk_length, b, s_q, topk)
 
         # Dispatch on d_v: V32 (d_v=512, DSv4-Pro) → CK Tile FP8 sparse;
         # MODEL1 (d_v=448, DSv4-Flash 2604) → TileLang FP8 direct.
