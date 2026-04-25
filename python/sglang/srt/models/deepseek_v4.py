@@ -1301,6 +1301,14 @@ class C4Indexer(nn.Module):
 
     def compute_q(self, q_lora: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # [bs, n_heads, head_dim]
+        #
+        # NOTE: not batched with `compute_weights` below — the two GEMMs take
+        # *different* inputs (q_lora, the lora-projected+normed Q vector, vs.
+        # x, the un-normed hidden state). Batching via torch.bmm/aiter
+        # batched_gemm would require restructuring the call chain in
+        # `forward_c4_indexer` so that both projections share an input, which
+        # changes the model semantics (q-norm cannot be applied to x). Skipped
+        # — see fusion item 6c discussion in MQALAYER_ELEMENTWISE_ANALYSIS.md.
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         fused_rope(
@@ -1313,6 +1321,10 @@ class C4Indexer(nn.Module):
         return q
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
+        # See `compute_q` note: cannot batch this GEMM with `wq_b` because the
+        # input tensors differ (q_lora vs x). The two are 1 launch each at the
+        # measured shapes, total addressable saving is ~30-60us/token if
+        # somehow batched, not worth a model-semantics-changing refactor.
         out, _ = self.weights_proj(x)
         if not skip_scale:
             out = out * self.weight_scale
