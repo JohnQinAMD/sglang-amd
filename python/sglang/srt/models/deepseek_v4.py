@@ -1004,21 +1004,34 @@ class Compressor(nn.Module):
         extend_lens = forward_batch.extend_seq_lens_cpu
         req_pool_indices = forward_batch.req_pool_indices
 
-        # compress info
-        # TODO: reuse the buffer across layers and reduce the sizes
+        # compress info — replay-stable scratch (mirrors compress_extend at L693-L709).
+        # Original `KVAndScore.empty_like(...)` and `torch.full(...)` here used to
+        # bind fresh caching-allocator addresses each call. Under c=16 multi-bs
+        # capture pressure (bs={1,2,4,8,16}) the eager allocator churns these
+        # addresses against captured-graph slabs in the graph pool, creating an
+        # async write-read race that surfaces as HIP IMA in this same function
+        # later (see /mnt/vast/john/rocm-dynamo/A4_HIP_IMA_REPRO.md).
         max_buffer_size = 2 * kv_and_score_states.shape[1] + kv_and_scores.shape[0]
-        temp_buffer_shape = [max_buffer_size, head_dim_times_coff]
-        temp_buffer = KVAndScore.empty_like(temp_buffer_shape, old=kv_and_scores)
 
-        # Deliberately fill w/ huge values, s.t. when misuse and access the unfilled values,
-        # we have higher probability to see something very weird
-        assert kv_and_scores.kv.shape[-1] == self.head_dim * self.coff
-        compressed_kv_output = torch.full(
-            (kv_and_scores.kv.size(0), self.head_dim),
-            fill_value=10000.0,
-            dtype=kv_and_scores.kv.dtype,
-            device=kv_and_scores.kv.device,
+        # temp_buffer: KVAndScoreOld stores kv and score in SEPARATE tensors,
+        # so we need two scratches (vs the new path which has one combined).
+        temp_buffer_kv = self._ensure_scratch(
+            "extend_old_temp_kv", (max_buffer_size, head_dim_times_coff),
+            kv_and_scores.kv.dtype, kv_and_scores.kv.device,
         )
+        temp_buffer_score = self._ensure_scratch(
+            "extend_old_temp_score", (max_buffer_size, head_dim_times_coff),
+            kv_and_scores.score.dtype, kv_and_scores.score.device,
+        )
+        temp_buffer = KVAndScore(kv=temp_buffer_kv, score=temp_buffer_score)
+
+        assert kv_and_scores.kv.shape[-1] == self.head_dim * self.coff
+        compressed_kv_output = self._ensure_scratch(
+            "extend_old_output", (kv_and_scores.kv.size(0), self.head_dim),
+            kv_and_scores.kv.dtype, kv_and_scores.kv.device,
+        )
+        # Sentinel fill (matches original behavior: misuse should produce obvious junk).
+        compressed_kv_output.fill_(10000.0)
 
         bs = forward_batch.batch_size
         pt = 0

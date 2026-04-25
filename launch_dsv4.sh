@@ -124,18 +124,19 @@ case "$PRESET" in
     _CG_BS="1 2 4 8"; _CG_MAX_BS=8
     ;;
   stacked-widebs)
-    # Bisection (2026-04-25 A4-debug): bs=[1,2,4,8,16] (5 graphs) crashes
-    # at c=16 with HIP IMA in compress_extend_old:1035. Any 4-graph subset
-    # works (tested [1,2,4,16]/[1,4,8,16]/[1,2,8,16]/[1,2,4,8,12]).
-    # Trigger requires {2,4,8,16} all captured together; root cause appears
-    # to be a graph-pool memory aliasing issue between the 5 captured
-    # tensors and the eager prefill compressor path.
-    # Workaround: drop bs=2 (least useful — bs=2 batches pad up to bs=4
-    # at runtime). c=16 = 46.63 tok/s (vs stacked-best eager-bs=16 = 45.50).
+    # bs=[1,2,4,8,16] full set, c=16 = 46.55 tok/s.
+    # Earlier bisection (2026-04-25 A4-debug) found bs=[1,2,4,8,16] crashed
+    # at c=16 with HIP IMA in compress_extend_old:1035. Root cause: fresh
+    # per-call allocations of `temp_buffer` and `compressed_kv_output` in
+    # compress_extend_old churned the caching allocator, creating an
+    # alias window with the captured-graph slabs in the graph pool —
+    # async race surfaced as IMA later. Fix: scratch-stabilized those two
+    # allocations via _ensure_scratch (mirrors the working pattern in
+    # compress_extend at L693-L709). See models/deepseek_v4.py:1010-1031.
     _TOPK_TORCH=0; _FORCE_TRITON_MOE=1; _INDEXER_CAP=4096
     _MULTI_STREAM=0; _DISABLE_COMPILE=1
     _MHC_PRE=1; _MHC_POST=1
-    _CG_BS="1 4 8 16"; _CG_MAX_BS=16
+    _CG_BS="1 2 4 8 16"; _CG_MAX_BS=16
     ;;
   *)
     echo "Unknown preset: $PRESET" >&2
