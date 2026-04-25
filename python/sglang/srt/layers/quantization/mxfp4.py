@@ -223,24 +223,37 @@ class Mxfp4Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
-        if isinstance(layer, LinearBase):
-            if self.ignored_layers and is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
-            ):
-                return UnquantizedLinearMethod()
-            elif _is_hip:
-                return UnquantizedLinearMethod()
-        elif isinstance(layer, FusedMoE):
+        # Mxfp4 routes the FusedMoE path. Non-MoE layers (LinearBase for proj
+        # weights, RadixAttention for kv-cache) come from a hybrid checkpoint
+        # like DeepSeek-V4-Flash where attention is fp8 e4m3 + ue8m0 scales
+        # and only experts are packed mxfp4. Delegate those to Fp8Config so
+        # the right method (Fp8LinearMethod / Fp8KVCacheMethod) is returned;
+        # otherwise the prior HIP path returned UnquantizedLinearMethod which
+        # silently drops the fp8 dequant and the model produces garbage.
+        if isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
                 return Mxfp4MoEMethod(prefix=prefix)
             else:
                 return Mxfp4DynamicQuantMoEMethod()
-        else:
-            if self.is_checkpoint_mxfp4_serialized:
-                raise NotImplementedError("Mxfp4 attention layer is not implemented")
-        return None
+
+        if isinstance(layer, LinearBase) and self.ignored_layers and is_layer_skipped(
+            prefix=prefix,
+            ignored_layers=self.ignored_layers,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            return UnquantizedLinearMethod()
+
+        # Hybrid fallback: fp8 for everything that isn't a FusedMoE.
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        if not hasattr(self, "_fp8_fallback"):
+            self._fp8_fallback = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                ignored_layers=self.ignored_layers,
+                weight_block_size=[128, 128],
+            )
+        return self._fp8_fallback.get_quant_method(layer, prefix)
 
     def get_scaled_act_names(self) -> List[str]:
         return []
@@ -328,16 +341,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
 
-        w13_weight_bias = torch.nn.Parameter(
-            torch.zeros(
-                layer.num_local_experts,
-                2 * intermediate_size_per_partition_after_pad,
-                dtype=torch.bfloat16,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_bias", w13_weight_bias)
-        set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+        # Some hybrid checkpoints (e.g. DeepSeek-V4-Flash) ship mxfp4 experts
+        # without per-row biases. Skip the bias parameter so the weight loader
+        # doesn't trip "weights not initialized from checkpoints" on absent keys.
+        if with_bias:
+            w13_weight_bias = torch.nn.Parameter(
+                torch.zeros(
+                    layer.num_local_experts,
+                    2 * intermediate_size_per_partition_after_pad,
+                    dtype=torch.bfloat16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_bias", w13_weight_bias)
+            set_weight_attrs(w13_weight_bias, extra_weight_attrs)
 
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
@@ -364,12 +381,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
-        w2_weight_bias = torch.nn.Parameter(
-            torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_bias", w2_weight_bias)
-        set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+        if with_bias:
+            w2_weight_bias = torch.nn.Parameter(
+                torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_bias", w2_weight_bias)
+            set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
         if self.use_flashinfer:
@@ -535,11 +553,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
-            w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
-            w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
+            if self.with_bias:
+                w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
+                w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
 
-            layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
-            layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
+                layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
+                layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
 
             num_warps = 8
 
@@ -567,13 +586,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_weight = upcast_from_mxfp(
                 layer.w13_weight,
                 layer.w13_weight_scale,
-                target_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 axis=-1,
             )
             w2_weight = upcast_from_mxfp(
                 layer.w2_weight,
                 layer.w2_weight_scale,
-                target_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 axis=-1,
             )
             del layer.w13_weight
