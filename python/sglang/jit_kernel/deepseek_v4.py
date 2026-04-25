@@ -137,6 +137,9 @@ def _jit_metadata_module():
     )
 
 
+_TOPK_HIP_FALLBACK_WARNED = False
+
+
 def topk_transform_512(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -146,7 +149,57 @@ def topk_transform_512(
     out_raw_indices: Optional[torch.Tensor] = None,
     ver: Literal[1, 2] = 1,
 ) -> None:
-    """Output to page_indices tensor, optionally also output raw abs position indices"""
+    """Output to page_indices tensor, optionally also output raw abs position indices.
+
+    On ROCm/HIP the JIT-CUDA path is unavailable (`tvm_ffi.cpp.load_inline`
+    requires `CUDA_HOME`/`nvcc` and has no HIP build path). To make
+    `SGLANG_TOPK_TRANSFORM_512_TORCH=0` not crash on HIP, we transparently
+    fall back to the vectorized torch implementation. The torch path is
+    capture-safe after the `scores.clone()` -> `torch.where` fix at
+    indexer.py:271.
+
+    TODO(rocm): write a Triton port of TopK512Kernel (it runs natively on
+    AMDGCN without needing nvcc) and wire it in here as a third option,
+    e.g. via `SGLANG_TOPK_TRANSFORM_512_BACKEND={torch,jit,triton}`. Hook
+    point: dispatch on `is_hip()` below.
+    """
+    from sglang.srt.utils import is_hip
+
+    if is_hip():
+        # Native HIP path: Triton port at jit_kernel/topk_transform_512_triton.py.
+        # Microbenched 4-9x faster than the torch fallback at DSv4 decode shapes
+        # (B=1..16, L=256..4096); see aiter_capture_repro/bench_topk_triton.py.
+        # Set SGLANG_TOPK_TRANSFORM_512_BACKEND=torch to force the torch path
+        # (e.g., for debugging numerical mismatches).
+        import os
+        backend = os.environ.get("SGLANG_TOPK_TRANSFORM_512_BACKEND", "triton").lower()
+        if backend == "triton":
+            from sglang.jit_kernel.topk_transform_512_triton import (
+                topk_transform_512_triton,
+            )
+            topk_transform_512_triton(
+                scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices,
+            )
+            return
+        # torch fallback (lazy import to avoid circular dependency).
+        global _TOPK_HIP_FALLBACK_WARNED
+        if not _TOPK_HIP_FALLBACK_WARNED:
+            import warnings
+            warnings.warn(
+                "[HIP] topk_transform_512 forced to torch path via "
+                "SGLANG_TOPK_TRANSFORM_512_BACKEND=torch (8x slower than the "
+                "Triton port). Unset to use the Triton kernel.",
+                RuntimeWarning,
+            )
+            _TOPK_HIP_FALLBACK_WARNED = True
+        from sglang.srt.layers.attention.compressed.indexer import (
+            topk_transform_512_pytorch_vectorized,
+        )
+        topk_transform_512_pytorch_vectorized(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices,
+        )
+        return
+
     module = _jit_topk_v2_module() if ver == 2 else _jit_topk_module()
     module.topk_transform(
         scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices

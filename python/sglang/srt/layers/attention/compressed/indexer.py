@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
@@ -39,6 +40,43 @@ else:
     FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 
+def _ensure_scratch(scratch_dict, name, shape, dtype, device):
+    """Lazily allocate a persistent scratch tensor and return a contiguous
+    EXACT-shape tensor. Reallocates on any shape mismatch — by design, since
+    a non-contig slice of a grow-only buffer breaks downstream `.view()`.
+
+    THIS HELPER MUST NOT BE SHARED ACROSS THE CAPTURE/EAGER BOUNDARY. A
+    captured-bs=1 graph that reads from `scratch_dict[name]` baked in the
+    storage's physical address; if eager (bs > 1) work later reallocates
+    `scratch_dict[name]`, the bs=1 storage is freed and the captured graph
+    faults (HSA 0x29) when it next replays. Use the per-mode dicts
+    `_FP8_PAGED_SCRATCH_CAPTURED` / `_FP8_PAGED_SCRATCH_EAGER` below — only
+    `_EAGER` ever reallocates; `_CAPTURED` is allocated once during graph
+    capture and kept frozen so its address stays valid for every replay.
+    """
+    cur = scratch_dict.get(name)
+    target = tuple(shape)
+    if (
+        cur is None
+        or cur.dtype != dtype
+        or cur.device != device
+        or tuple(cur.shape) != target
+    ):
+        scratch_dict[name] = torch.empty(target, dtype=dtype, device=device)
+    return scratch_dict[name]
+
+
+# Per-mode scratch for fp8_paged_mqa_logits_torch.
+#
+# `_CAPTURED` is allocated during `torch.cuda.is_current_stream_capturing()` —
+# i.e. while the bs=1 cuda graph is being recorded. Its tensors are baked
+# into the captured kernels by physical address and MUST NEVER be
+# reassigned thereafter, or replay reads freed memory → HSA 0x29.
+# `_EAGER` services every other (bs > 1) call and is free to reallocate.
+_FP8_PAGED_SCRATCH_CAPTURED: dict = {}
+_FP8_PAGED_SCRATCH_EAGER: dict = {}
+
+
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -49,9 +87,29 @@ def fp8_paged_mqa_logits_torch(
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
+    """Vectorized pytorch fallback — CUDA-graph compatible (no .item() / .tolist()).
+
+    The prior loop-based version had `seq_len = int(seq_lens[i].item())` inside
+    the batch loop, which forces a GPU->CPU sync per iter AND blocks CUDA graph
+    capture. This version is branch-free: it gathers ALL pages up to
+    `max_num_pages = ceil(max_seq_len / block_size)`, masks positions >=
+    seq_lens[b] to -inf, and returns `[B, max_seq_len]`. Equivalent output for
+    valid positions; padding entries are -inf, which matches the downstream
+    top-K's semantics (it already ignores -inf via the seq_lens mask).
+
+    NOTE on graph-pool stability: `gathered = kvcache_flat[pages]` (fancy
+    indexing), `torch.arange(padded_seq_len)` and `torch.full((B, max_seq_len),
+    -inf)` each allocate fresh tensors per call. Inside `torch.cuda.graph` they
+    bind to whatever caching-allocator pool slab is live at capture. After
+    eager multi-bs work churns that slab, replay reads stale addresses → HSA
+    0x29. We route all three allocations through persistent module-level
+    scratch buffers (`_FP8_PAGED_SCRATCH`) so addresses stay stable across
+    replays.
+    """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
+    device = q_fp8.device
 
     assert head_dim == 128, "TODO"
     assert block_size == 64, "TODO"
@@ -60,35 +118,228 @@ def fp8_paged_mqa_logits_torch(
     assert weight.shape == (batch_size, num_heads)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
-    assert clean_logits == False
+    assert clean_logits is False
 
-    logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
-    for i in range(batch_size):
-        q = q_fp8[i, 0]  # (num_heads, head_dim)
-        q = q.to(torch.float32)
-        q_scale = weight[i]  # (num_heads)
-        seq_len = int(seq_lens[i].item())
-        assert seq_len <= max_seq_len
-        num_pages = (seq_len + block_size - 1) // block_size
-        padded_seq_len = num_pages * block_size
-        pages = page_table[i, :num_pages]  # (num_pages,)
-        kvcache_fp8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
-        kvcache = kvcache_fp8[pages]  # (num_pages, block_size * (head_dim + 4))
-        SCALE_OFFSET = block_size * head_dim
-        kvcache_value = kvcache[..., :SCALE_OFFSET].view(dtype=FP8_DTYPE)
-        kvcache_scale = kvcache[..., SCALE_OFFSET:].view(dtype=torch.float32)
-        kvcache_value = kvcache_value.to(torch.float32)
-        kvcache_scale = kvcache_scale.contiguous()
-        kvcache_value = kvcache_value.view(padded_seq_len, head_dim)
-        kvcache_scale = kvcache_scale.view(padded_seq_len)
-        score = F.linear(kvcache_value, q)
-        score = F.relu(score)
-        score *= q_scale[None, :]
-        score = score.sum(dim=1)  # (padded_seq_len,)
-        score *= kvcache_scale
-        logits[i, :seq_len] = score[:seq_len]
+    # Cap padded_seq_len aggressively. Caller passes
+    # `max_seq_len = page_table.shape[1] * page_size` (worst-case from
+    # --context-len, e.g. 1048576 at 1M). At bs=8 x H=64, transient allocs
+    # (kvcache_value_f32, score pre-sum) scale as B * padded * (D | H) * 4 and
+    # hit ~66 GiB before the caching allocator can reuse, OOMing the scheduler.
+    #
+    # Two bounds applied:
+    #   1. SGLANG_INDEXER_MAX_SEQ_LEN env (host int) — caps BOTH capture and
+    #      eager so the captured graph's worst-case reserve stays in budget.
+    #   2. seq_lens.max() in eager (single D2H sync, cheap vs per-layer MFMA) —
+    #      shrinks decode allocs to the actual content length.
+    # During capture we can't sync on seq_lens, so only (1) applies there.
+    env_cap = envs.SGLANG_INDEXER_MAX_SEQ_LEN.get()
+    base_cap = env_cap if env_cap > 0 else max_seq_len
+    if torch.cuda.is_current_stream_capturing():
+        effective_max_seq_len = base_cap
+    else:
+        effective_max_seq_len = min(int(seq_lens.max().item()), base_cap)
+        # Round up to block_size so max_num_pages * block_size == padded len.
+        effective_max_seq_len = max(
+            block_size,
+            ((effective_max_seq_len + block_size - 1) // block_size) * block_size,
+        )
 
-    return logits
+    max_num_pages = min(
+        (effective_max_seq_len + block_size - 1) // block_size,
+        page_table.shape[1],
+    )
+    padded_seq_len = max_num_pages * block_size
+    row_bytes = block_size * (head_dim + 4)  # last-dim of gathered
+
+    # Pick the captured-graph or eager scratch dict by current stream state.
+    # During cuda graph capture this returns True, so the captured graph
+    # binds to `_FP8_PAGED_SCRATCH_CAPTURED` and that dict is never mutated
+    # again (replay doesn't run Python). Eager calls use the separate
+    # `_EAGER` dict, which is free to reallocate per shape.
+    _paged_scratch = (
+        _FP8_PAGED_SCRATCH_CAPTURED
+        if torch.cuda.is_current_stream_capturing()
+        else _FP8_PAGED_SCRATCH_EAGER
+    )
+
+    # q: [B, H, D] fp32 — .to() returns fresh; route into scratch.
+    q_f32_buf = _ensure_scratch(
+        _paged_scratch, "q_f32",
+        (batch_size, num_heads, head_dim),
+        torch.float32, device,
+    )
+    q_f32_buf.copy_(q_fp8[:, 0].to(torch.float32))
+    q_f32 = q_f32_buf
+
+    # gathered: logically [B, max_pages, row_bytes] but stored as a 2-D
+    # exact-shape scratch so that `out=` receives a contiguous tensor (a
+    # 3-D slice of a grow-only scratch is non-contiguous when batch or
+    # max_pages shrinks, which makes `.view()` reject it). We pick the
+    # 2-D shape `[B*max_pages, row_bytes]` and re-view to 3-D after the
+    # gather.
+    kvcache_flat = kvcache_fp8.view(-1, row_bytes)
+    pages = page_table[:, :max_num_pages]
+    gathered_2d = _ensure_scratch(
+        _paged_scratch, "gathered",
+        (batch_size * max_num_pages, row_bytes),
+        kvcache_flat.dtype, device,
+    )
+    torch.index_select(
+        kvcache_flat, 0, pages.reshape(-1),
+        out=gathered_2d,
+    )
+    gathered = gathered_2d.view(batch_size, max_num_pages, row_bytes)
+
+    SCALE_OFFSET = block_size * head_dim
+    value_flat = gathered[..., :SCALE_OFFSET].contiguous().view(dtype=FP8_DTYPE)
+    scale_flat = gathered[..., SCALE_OFFSET:].contiguous().view(dtype=torch.float32)
+
+    kvcache_value_f32 = value_flat.to(torch.float32).view(
+        batch_size, padded_seq_len, head_dim
+    )
+    kvcache_scale_f32 = scale_flat.view(batch_size, padded_seq_len)
+
+    # [B, padded, H] = [B, padded, D] @ [B, D, H]
+    score = torch.bmm(kvcache_value_f32, q_f32.transpose(1, 2))
+    score = torch.relu(score)
+    score = score * weight.unsqueeze(1)   # [B, padded, H]
+    score = score.sum(dim=2)              # [B, padded]
+    score = score * kvcache_scale_f32     # [B, padded]
+
+    # positions: [padded_seq_len] — fresh arange. Route through scratch.
+    positions_buf = _ensure_scratch(
+        _paged_scratch, "positions",
+        (padded_seq_len,), torch.long, device,
+    )
+    torch.arange(padded_seq_len, dtype=torch.long, device=device, out=positions_buf)
+    positions = positions_buf
+
+    valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)  # [B, padded]
+    # `score.new_full((), -inf)` routes through graph pool (per the
+    # topk_transform_512 .clone() fix at indexer.py:271-279).
+    neg_inf = score.new_full((), float("-inf"))
+    score = torch.where(valid, score, neg_inf)
+
+    # out: [B, effective_max_seq_len], filled with -inf, then copy
+    # `score[:, :fill]` into the head. Persistent scratch + fill_(-inf) instead
+    # of torch.full. Width is bounded by effective_max_seq_len (NOT the
+    # caller-passed worst-case max_seq_len) — downstream topk_transform_512
+    # reads scores.shape[1] off the tensor and runs min(TOPK, width), so any
+    # consistent width is fine; tokens past seq_lens[b] are already -inf.
+    fill = min(padded_seq_len, effective_max_seq_len)
+    out = _ensure_scratch(
+        _paged_scratch, "out",
+        (batch_size, effective_max_seq_len), torch.float32, device,
+    )
+    out.fill_(float("-inf"))
+    out[:, :fill] = score[:, :fill]
+    return out
+
+
+def fp8_paged_mqa_logits_aiter(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """aiter Triton fp8_paged_mqa_logits — HIP path.
+
+    Drop-in replacement for fp8_paged_mqa_logits_torch. Wraps
+    `aiter.ops.triton.pa_mqa_logits.deepgemm_fp8_paged_mqa_logits`, which is
+    the AMD-tuned Triton (or Gluon) kernel for the same compute the
+    NVIDIA-only `deep_gemm.fp8_paged_mqa_logits` performs. Output buffer is
+    pre-filled with -inf so positions past `seq_lens[b]` carry the correct
+    masking semantics for downstream top-K (matches the torch fallback).
+
+    Output buffer is routed through the per-mode scratch dicts so it stays
+    graph-pool stable across cuda-graph replays (same convention as
+    fp8_paged_mqa_logits_torch).
+    """
+    _ = deep_gemm_metadata
+    _ = clean_logits
+    from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+
+    batch_size, next_n, num_heads, head_dim = q_fp8.shape
+    block_size = kvcache_fp8.shape[1]
+    device = q_fp8.device
+
+    # Cap padded length using the same bound logic as the torch fallback so
+    # capture-time and eager-time output shapes are consistent.
+    env_cap = envs.SGLANG_INDEXER_MAX_SEQ_LEN.get()
+    base_cap = env_cap if env_cap > 0 else max_seq_len
+    if torch.cuda.is_current_stream_capturing():
+        effective_max_seq_len = base_cap
+    else:
+        eff = min(int(seq_lens.max().item()), base_cap)
+        effective_max_seq_len = max(
+            block_size,
+            ((eff + block_size - 1) // block_size) * block_size,
+        )
+
+    _paged_scratch = (
+        _FP8_PAGED_SCRATCH_CAPTURED
+        if torch.cuda.is_current_stream_capturing()
+        else _FP8_PAGED_SCRATCH_EAGER
+    )
+
+    # aiter writes [batch * next_n, max_model_len] fp32; downstream topk reads
+    # `[batch, max_seq_len]`, which equals the same buffer when next_n == 1
+    # (DSv4 decode). Allocate via persistent scratch — addresses must stay
+    # stable across replays (else HSA 0x29 on graph replay).
+    out = _ensure_scratch(
+        _paged_scratch,
+        "out_aiter",
+        (batch_size * next_n, effective_max_seq_len),
+        torch.float32,
+        device,
+    )
+    out.fill_(float("-inf"))
+
+    # On HIP with Triton 3.4.0, aiter's `_deepgemm_fp8_paged_mqa_logits` only
+    # supports KVBlockSize=1 (the Gluon path that handles 64 needs Triton 3.5+).
+    # Reshape kv_cache to per-token rows and expand page_table accordingly:
+    #   kv_cache: [num_blocks, 64, 1, D+4] -> [num_blocks*64, 1, 1, D+4]   (free view)
+    #   page_table: [B, max_pages] (block ids) -> [B, max_pages*64] (token ids)
+    kv_flat = kvcache_fp8.view(-1, 1, 1, kvcache_fp8.shape[-1])
+
+    max_pages = page_table.shape[1]
+    pt_expanded = _ensure_scratch(
+        _paged_scratch,
+        "pt_aiter_expanded",
+        (batch_size, max_pages * block_size),
+        page_table.dtype,
+        device,
+    )
+    arange_buf = _ensure_scratch(
+        _paged_scratch,
+        "pt_aiter_arange",
+        (block_size,),
+        page_table.dtype,
+        device,
+    )
+    torch.arange(block_size, dtype=page_table.dtype, device=device, out=arange_buf)
+    # expanded[b, j*block_size + t] = page_table[b, j] * block_size + t
+    pt_expanded.copy_(
+        (page_table.unsqueeze(-1) * block_size + arange_buf.view(1, 1, -1)).view(
+            batch_size, -1
+        )
+    )
+
+    deepgemm_fp8_paged_mqa_logits(
+        q_fp8=q_fp8,
+        kv_cache=kv_flat,
+        weights=weight,
+        out_logits=out,
+        context_lens=seq_lens,
+        kv_indices=pt_expanded,
+        max_model_len=effective_max_seq_len,
+        KVBlockSize=1,
+    )
+    return out
 
 
 # def fp8_paged_mqa_logits_torch(
@@ -234,9 +485,16 @@ def topk_transform_512_pytorch_vectorized(
     )
     valid_mask = positions < seq_lens.unsqueeze(1)
 
-    # Mask out invalid positions with -inf
-    masked_scores = scores.clone()
-    masked_scores[~valid_mask] = float("-inf")
+    # Mask out invalid positions with -inf.
+    #
+    # NOTE: Earlier this was `scores.clone(); masked_scores[~valid_mask] = -inf`,
+    # which allocates a new tensor inside the captured graph. Allocations from
+    # the caching allocator inside `torch.cuda.graph` cause stale-pointer
+    # APERTURE_VIOLATION (HSA 0x29) on multi-bs replay because each replay can
+    # bind a different physical address while the captured kernel reads the
+    # original. Using `torch.where` avoids the .clone() and routes through the
+    # graph-pool allocator for the temporary, which IS replay-safe.
+    masked_scores = torch.where(valid_mask, scores, scores.new_full((), float("-inf")))
 
     # Get top-k indices
     actual_k = min(TOPK, max_seq_len)
@@ -265,28 +523,34 @@ def topk_transform_512_pytorch_vectorized(
         pad_mask = torch.arange(TOPK, device=device).unsqueeze(0) >= actual_k
         valid_topk = valid_topk & ~pad_mask
 
-    # For short sequences, use sequential indices
+    # For short sequences, use sequential indices.
+    # NOTE: was guarded by `if needs_sequential.any():` which forces a
+    # GPU->CPU sync and breaks CUDA graph capture. We now always apply the
+    # where — it's a no-op when needs_sequential is all-False.
     needs_sequential = seq_lens <= TOPK
-    if needs_sequential.any():
-        sequential_indices = (
-            torch.arange(TOPK, device=device, dtype=torch.int32)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
+    sequential_indices = (
+        torch.arange(TOPK, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+    sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
 
-        raw_indices = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK),
-            torch.where(
-                sequential_valid,
-                sequential_indices,
-                torch.tensor(-1, device=device, dtype=torch.int32),
-            ),
-            raw_indices,
-        )
-        valid_topk = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK), sequential_valid, valid_topk
-        )
+    # Pre-allocate the fill constants on the same device/stream to avoid
+    # CUDA-graph capture issues ('capturing stream has unjoined work') that
+    # `torch.tensor(-1, device=...)` inline creation can trigger.
+    minus_one_i32 = raw_indices.new_full((), -1)
+    raw_indices = torch.where(
+        needs_sequential.unsqueeze(1).expand(-1, TOPK),
+        torch.where(
+            sequential_valid,
+            sequential_indices,
+            minus_one_i32,
+        ),
+        raw_indices,
+    )
+    valid_topk = torch.where(
+        needs_sequential.unsqueeze(1).expand(-1, TOPK), sequential_valid, valid_topk
+    )
 
     # Transform to page indices
     page_idx = raw_indices >> page_bits
@@ -299,7 +563,7 @@ def topk_transform_512_pytorch_vectorized(
     page_indices = page_indices.to(torch.int32)
 
     page_indices = torch.where(
-        valid_topk, page_indices, torch.tensor(-1, device=device, dtype=torch.int32)
+        valid_topk, page_indices, page_indices.new_full((), -1)
     )
 
     out_page_indices.copy_(page_indices)
@@ -489,6 +753,17 @@ class C4IndexerBackend:
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
 
         _x_comp = x_for_compressor if (is_nsa_enable_prefill_cp() and x_for_compressor is not None) else x
+        # Capture-mode flatten: HIP 7.0 / gfx950 SIGSEGVs in hipGraphInstantiate when
+        # torch.cuda.stream() is nested inside another torch.cuda.stream() during capture.
+        # The inner 2-way fork (stream_q + stream_weights) is the second level. Outer MQA
+        # 3-way fork (kv/compressor/indexer) is fine. Force the flat path inside capture.
+        # See /mnt/vast/john/rocm-dynamo/hip_repro/ for minimal reproducer.
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        if enable_multi_stream and get_is_capture_mode():
+            enable_multi_stream = False
+            if q_lora_ready is not None:
+                torch.cuda.current_stream().wait_event(q_lora_ready)
+                q_lora_ready = None
         if enable_multi_stream:
             q_fp8, weights, c4_indexer_kv_cache = self._forward_prepare_multi_stream(
                 x=x,
@@ -531,6 +806,9 @@ class C4IndexerBackend:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_AITER.get():
+            # AMD path: aiter Triton/Gluon kernel.
+            fn = fp8_paged_mqa_logits_aiter
         # elif is_hip():
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             fn = fp8_paged_mqa_logits_torch

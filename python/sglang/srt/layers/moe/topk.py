@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import (
@@ -819,7 +820,11 @@ def biased_grouped_topk_gpu(
             )
         return topk_weights, topk_ids
 
-    elif _use_aiter:
+    elif _use_aiter and os.environ.get("SGLANG_DISABLE_AITER_TOPK", "0") != "1":
+        # Set SGLANG_DISABLE_AITER_TOPK=1 to fall through to the pytorch impl below.
+        # Needed when CUDA-graph capture is enabled: aiter's module_moe_asm
+        # biased_grouped_topk SIGSEGVs under HIP stream capture even after
+        # warmup passes. Report tracked at: (upstream aiter issue TBD).
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]
         device = gating_output.device

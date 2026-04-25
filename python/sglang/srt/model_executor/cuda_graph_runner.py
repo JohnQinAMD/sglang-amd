@@ -533,17 +533,29 @@ class CudaGraphRunner:
             self._post_process_after_profile(prof)
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
+        import os, sys
+        _trace = os.environ.get("SGLANG_CAPTURE_TRACE", "0") == "1"
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.model_runner.server_args.enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
-        graph_fn = (
+        _cap_err_mode = os.environ.get("SGLANG_CAPTURE_ERROR_MODE", "global")
+        graph_fn_base = (
             partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
             if memory_saver_adapter.enabled
             else self.device_module.graph
         )
+        graph_fn = partial(graph_fn_base, capture_error_mode=_cap_err_mode) if _cap_err_mode != "global" else graph_fn_base
+        if _trace:
+            sys.stderr.write(f"[trace] _capture_graph before graph_fn ctx enter (cap_err_mode={_cap_err_mode})\n"); sys.stderr.flush()
         with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
+            if _trace:
+                sys.stderr.write("[trace] _capture_graph inside ctx before run_once_fn\n"); sys.stderr.flush()
             out = run_once_fn()
+            if _trace:
+                sys.stderr.write("[trace] _capture_graph inside ctx after run_once_fn; about to exit ctx\n"); sys.stderr.flush()
+        if _trace:
+            sys.stderr.write("[trace] _capture_graph after graph_fn ctx exit (graph instantiated)\n"); sys.stderr.flush()
         return out
 
     def _create_device_graph(self):

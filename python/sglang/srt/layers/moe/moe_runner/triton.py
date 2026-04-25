@@ -302,7 +302,10 @@ class TritonRunnerCore(MoeRunnerCore):
                         routed_scaling_factor,
                     )
         elif _is_hip:
-            if _use_aiter:
+            # SGLANG_DISABLE_AITER_MOE_SUM=1 forces the vllm_ops path — needed
+            # when CUDA-graph capture is enabled; aiter's module_moe_asm moe_sum
+            # SIGSEGVs under HIP stream capture even after warmup.
+            if _use_aiter and os.environ.get("SGLANG_DISABLE_AITER_MOE_SUM", "0") != "1":
                 moe_sum(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
