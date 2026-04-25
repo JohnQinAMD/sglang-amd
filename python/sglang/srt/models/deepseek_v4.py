@@ -1002,6 +1002,12 @@ class Compressor(nn.Module):
 
         self.forward_mode = forward_batch.forward_mode
 
+        # Cannot use aiter.fused_qk_rmsnorm here: wkv_gate emits
+        # [bs, 2*coff*head_dim] which is [kv | score], NOT [q | k]. The two
+        # halves go through different downstream ops (kv is mixed by the
+        # softmax of score; score itself is never normed). And `self.norm`
+        # only fires AFTER the score-weighted sum, on a single fp32 tensor —
+        # no second tensor exists to pair-norm with. Structure does not fit.
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
         return self.compress_dispatch(kv_score, forward_batch)
 
