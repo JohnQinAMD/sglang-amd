@@ -46,6 +46,16 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+# Optional aiter fused q/k RMSNorm — falls back to the two-call path if not
+# available (CUDA build, older aiter releases). One launch instead of two for
+# the q-lora-norm + kv-norm pair in MQALayer._forward_prepare.
+try:
+    from aiter.ops.fused_qk_norm_rope_cache_quant import (
+        fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm,
+    )
+except Exception:  # pragma: no cover - import-time fallback only
+    _aiter_fused_qk_rmsnorm = None
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -1676,19 +1686,33 @@ class MQALayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # [bs, q_lora_rank]
         q, _ = self.wq_a(x)
-        # [bs, q_lora_rank]
-        q = self.q_norm(q)
-        q_lora = q  # only used for indexer
+        # [bs, head_dim]
+        kv, _ = self.wkv(x)
+        # Fuse q_norm + kv_norm into a single launch when both are bf16 and
+        # share the leading dim (always true here since they read the same x).
+        # Saves ~1 launch / layer × 61 = ~250-300 µs / decoded token. The aiter
+        # op falls back internally to two rmsnorm2d_fwd calls at M >= 16384.
+        if (
+            _aiter_fused_qk_rmsnorm is not None
+            and q.dtype == torch.bfloat16
+            and kv.dtype == torch.bfloat16
+            and q.size(0) == kv.size(0)
+        ):
+            q, kv = _aiter_fused_qk_rmsnorm(
+                q, self.q_norm.weight, self.eps,
+                kv, self.kv_norm.weight, self.eps,
+            )
+        else:
+            # [bs, q_lora_rank]
+            q = self.q_norm(q)
+            # [bs, head_dim]
+            kv = self.kv_norm(kv)
+        q_lora = q  # only used for indexer (post-q_norm, pre-wq_b — unchanged)
         # [bs, n_local_heads, head_dim]
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         # [bs, n_local_heads, head_dim]
         q = rms_normalize_triton(q, self.eps)
-
-        # [bs, head_dim]
-        kv, _ = self.wkv(x)
-        # [bs, head_dim]
-        kv = self.kv_norm(kv)
 
         fused_rope(
             q[..., -self.qk_rope_head_dim :],
