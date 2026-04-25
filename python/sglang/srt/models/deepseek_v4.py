@@ -1878,6 +1878,37 @@ class MQALayer(nn.Module):
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
+        # NOTE on fusion item 7 (wo_b AllReduce + next-layer RMSNorm fusion):
+        #
+        # `aiter.dist.fused_allreduce_rmsnorm{,_quant}` exists and would fuse
+        # AllReduce + add(residual) + RMSNorm into one launch — and
+        # RowParallelLinear already supports `skip_all_reduce=True`. But
+        # DSv4's decoder layer is structurally different from the standard
+        # transformer this op was designed for:
+        #
+        #   wo_b output [n, d]  (post-AllReduce in stock SGLang)
+        #     -> hc_post([n, d], residual=[n, hc, d], post, comb)  -> [n, hc, d]
+        #     -> hc_pre(...)  -> [n, d] + post' + comb'
+        #     -> post_attention_layernorm([n, d])     <- the next RMSNorm
+        #
+        # Two reasons fusion is structurally infeasible here:
+        #   1. The "residual" between wo_b's AllReduce and the next RMSNorm is
+        #      *not* an additive [n, d] residual — it's a [n, hc, d]
+        #      hierarchical-compression tensor consumed by `hc_post`, which is
+        #      itself a TileLang-fused op (mhc_post). The aiter fused op
+        #      assumes `out = rmsnorm(input + residual)`; here we have
+        #      `out = rmsnorm(hc_pre(hc_post(input, residual_hc, post, comb)))`
+        #      which is non-linear in `input`.
+        #   2. The next RMSNorm weight (`post_attention_layernorm.weight`)
+        #      lives in a different module than this MQALayer; threading it
+        #      across the layer boundary would require either passing it
+        #      through `hc_post` + `hc_pre` (defeats the point) or restructur-
+        #      ing DeepseekV4DecoderLayer.forward to inline the AllReduce-
+        #      reduce -+-rmsnorm step (defeats the layer abstraction).
+        #
+        # Skipped per the task spec ("If cross-layer wiring is too invasive,
+        # implement just the fused AllReduce + RMSNorm... If that's also too
+        # messy, SKIP with a thorough comment").
         o, _ = self.wo_b(o.flatten(1))
 
         return o
