@@ -59,8 +59,16 @@ _SHAPES = [
     (8, 128, 512),
 ]
 
+# (d_qk, d_v) supported by the templated CK kernel:
+#   (576, 512) — V32 / Pro V32 mode (d_qk = nope=512 + rope=64)
+#   (512, 512) — 2604 / Flash-Base 2604 mode (no rope dim)
+_DQK_DV = [
+    (576, 512),
+    (512, 512),
+]
 
-def _run_one(B: int, H: int, topk: int, seed: int = 0):
+
+def _run_one(B: int, H: int, topk: int, d_qk: int, d_v: int, seed: int = 0):
     """Run CK kernel and FP32 oracle. Returns (cos_sim, max_rel_err)."""
     from sglang.srt.flashmla_tests.ref import _sparse_attn_decode_inner
     from sglang.srt.layers.attention.ck_v32_sparse_mla import (
@@ -70,16 +78,15 @@ def _run_one(B: int, H: int, topk: int, seed: int = 0):
     torch.manual_seed(seed)
     device = torch.device("cuda")
 
-    D_NOPE, D_ROPE, D_TOTAL = 512, 64, 576
     S_q = 1
     n_kv_pool = max(topk * 2, 1024)
-    sm_scale = 1.0 / math.sqrt(D_TOTAL)
+    sm_scale = 1.0 / math.sqrt(d_qk)
     fp8 = torch.float8_e4m3fnuz
 
-    q_bf16 = torch.randn((B, S_q, H, D_TOTAL), device=device).to(torch.bfloat16)
-    kv_pool_bf16 = torch.randn((n_kv_pool, D_TOTAL), device=device).to(torch.bfloat16)
+    q_bf16 = torch.randn((B, S_q, H, d_qk), device=device).to(torch.bfloat16)
+    kv_pool_bf16 = torch.randn((n_kv_pool, d_qk), device=device).to(torch.bfloat16)
     kv_pool_fp8 = kv_pool_bf16.to(fp8).contiguous()
-    k_cache = kv_pool_fp8.view(n_kv_pool, 1, 1, D_TOTAL)
+    k_cache = kv_pool_fp8.view(n_kv_pool, 1, 1, d_qk)
 
     indices = (
         torch.arange(topk, device=device, dtype=torch.int32)
@@ -97,12 +104,13 @@ def _run_one(B: int, H: int, topk: int, seed: int = 0):
     )
     torch.cuda.synchronize()
 
-    # FP32 oracle on FP8-roundtripped KV
-    q_round = q_bf16.float().view(B * S_q, H, D_TOTAL)
-    gathered = kv_pool_fp8.float()[indices.long().view(-1)].view(B * S_q, topk, D_TOTAL)
+    # FP32 oracle on FP8-roundtripped KV. The oracle's d_v slices the last
+    # d_v cols out of the gathered K rows for the V-projection.
+    q_round = q_bf16.float().view(B * S_q, H, d_qk)
+    gathered = kv_pool_fp8.float()[indices.long().view(-1)].view(B * S_q, topk, d_qk)
     out_ref, _ = _sparse_attn_decode_inner(
         q_round, gathered, invalid_mask, None,
-        float(sm_scale), int(D_NOPE), int(H),
+        float(sm_scale), int(d_v), int(H),
     )
 
     out_ck_f = out_ck.float().reshape(-1)
@@ -116,13 +124,15 @@ def _run_one(B: int, H: int, topk: int, seed: int = 0):
     return cos, rel, torch.isnan(out_ck).any().item(), torch.isinf(out_ck).any().item()
 
 
+@pytest.mark.parametrize("d_qk,d_v", _DQK_DV)
 @pytest.mark.parametrize("B,H,topk", _SHAPES)
-def test_ck_v32_parity(B: int, H: int, topk: int):
-    cos, rel, has_nan, has_inf = _run_one(B, H, topk)
-    assert not has_nan, f"output contains NaN at B={B} topk={topk}"
-    assert not has_inf, f"output contains Inf at B={B} topk={topk}"
-    assert cos > 0.999, f"cos_sim={cos:.6f} < 0.999 at B={B} topk={topk}"
-    assert rel < 0.05, f"rel_err={rel:.4e} >= 5% at B={B} topk={topk}"
+def test_ck_v32_parity(B: int, H: int, topk: int, d_qk: int, d_v: int):
+    cos, rel, has_nan, has_inf = _run_one(B, H, topk, d_qk, d_v)
+    tag = f"B={B} H={H} topk={topk} d_qk={d_qk} d_v={d_v}"
+    assert not has_nan, f"output contains NaN at {tag}"
+    assert not has_inf, f"output contains Inf at {tag}"
+    assert cos > 0.999, f"cos_sim={cos:.6f} < 0.999 at {tag}"
+    assert rel < 0.05, f"rel_err={rel:.4e} >= 5% at {tag}"
 
 
 def test_ck_v32_lonely_q_zeros():
@@ -197,8 +207,10 @@ def test_ck_v32_attn_sink_correction():
 
 if __name__ == "__main__":
     # Also runnable as a script for quick repro outside pytest
-    for B, H, topk in _SHAPES:
-        cos, rel, has_nan, has_inf = _run_one(B, H, topk)
-        ok = (cos > 0.999 and rel < 0.05 and not has_nan and not has_inf)
-        print(f"B={B} H={H} topk={topk}  cos_sim={cos:.6f} rel_err={rel:.3e} "
-              f"nan={has_nan} inf={has_inf}  {'OK' if ok else 'FAIL'}")
+    for d_qk, d_v in _DQK_DV:
+        for B, H, topk in _SHAPES:
+            cos, rel, has_nan, has_inf = _run_one(B, H, topk, d_qk, d_v)
+            ok = (cos > 0.999 and rel < 0.05 and not has_nan and not has_inf)
+            print(f"d_qk={d_qk} d_v={d_v} B={B} H={H} topk={topk}  "
+                  f"cos_sim={cos:.6f} rel_err={rel:.3e} "
+                  f"nan={has_nan} inf={has_inf}  {'OK' if ok else 'FAIL'}")

@@ -124,10 +124,18 @@ def flash_mla_with_kvcache_torch(
         topk = indices.shape[-1]
         invalid_mask_2d = _get_invalid_mask(indices, topk_length, b, s_q, topk)
 
-        # Dispatch on d_v: V32 (d_v=512, DSv4-Pro) → CK Tile FP8 sparse;
-        # MODEL1 (d_v=448, DSv4-Flash 2604) → TileLang FP8 direct.
-        if d_v == 512:
-            # ---- V32 path: CK Tile FP8 sparse (1.7-3.4× asm `.co`) ----
+        # Dispatch on (d_qk, d_v) — supports the full DSv4 model family:
+        #   Pro V32       (d_qk=576, d_v=512) → CK Tile FP8 sparse  [V32 instantiation]
+        #   Pro/Flash 2604 (d_qk=512, d_v=512) → CK Tile FP8 sparse [2604 instantiation]
+        #   Flash 2604-MODEL1 (d_qk=512, d_v=448) → TileLang FP8    [legacy fallback]
+        #   Anything else                                → fall through to ref BF16 path
+        # Tighten on BOTH dims so the CK kernel never fires on a mismatched
+        # shape. Unsupported shapes drop out of this `if` and land in the
+        # `ref_sparse_attn_decode` BF16 path below for correctness.
+        if (d_qk == 576 or d_qk == 512) and d_v == 512:
+            # ---- CK Tile FP8 sparse path: covers BOTH (576, 512) V32 and
+            # (512, 512) 2604. The kernel is templated on QK_HEAD_DIM and the
+            # launcher dispatches on q.size(-1) at call time. ----
             from sglang.srt.layers.attention.ck_v32_sparse_mla import (
                 ck_sparse_mla_decode_fp8_v32,
             )
@@ -141,25 +149,31 @@ def flash_mla_with_kvcache_torch(
             )
             return out, lse
 
-        # ---- MODEL1 path (d_v=448): TileLang FP8 direct (parity-correct
-        # fallback; not in-tree yet — sourced from kernel-agents workspace) ----
-        import sys as _sys
-        _ws = "/mnt/vast/john/rocm-dynamo/kernel-agents/experiments/dsv4_sparse_mla_decode_hip_workspace"
-        if _ws not in _sys.path:
-            _sys.path.insert(0, _ws)
-        import sparse_mla_decode_fp8_kernel_model1 as _kmod
-        # k_cache may arrive as float8_e4m3fn (per FP8_DTYPE module-level).
-        kv_packed = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
-        out, lse = _kmod.sparse_mla_decode_fp8(
-            q.contiguous(),
-            kv_packed,
-            indices.to(torch.int32) if indices.dtype != torch.int32 else indices,
-            invalid_mask_2d,
-            attn_sink,
-            float(softmax_scale) if softmax_scale is not None else 1.0,
-            d_v=d_v,
-        )
-        return out, lse
+        if d_qk == 512 and d_v == 448:
+            # ---- MODEL1 path (legacy d_v=448): TileLang FP8 direct ----
+            # Kept for safety — there's no production DSv4 shape that hits
+            # this today, but if a future model variant materializes the
+            # MODEL1 layout it'll route here instead of falling through.
+            import sys as _sys
+            _ws = "/mnt/vast/john/rocm-dynamo/kernel-agents/experiments/dsv4_sparse_mla_decode_hip_workspace"
+            if _ws not in _sys.path:
+                _sys.path.insert(0, _ws)
+            import sparse_mla_decode_fp8_kernel_model1 as _kmod
+            # k_cache may arrive as float8_e4m3fn (per FP8_DTYPE module-level).
+            kv_packed = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
+            out, lse = _kmod.sparse_mla_decode_fp8(
+                q.contiguous(),
+                kv_packed,
+                indices.to(torch.int32) if indices.dtype != torch.int32 else indices,
+                invalid_mask_2d,
+                attn_sink,
+                float(softmax_scale) if softmax_scale is not None else 1.0,
+                d_v=d_v,
+            )
+            return out, lse
+
+        # Other (d_qk, d_v) combinations: fall through to the BF16 dequant +
+        # ref_sparse_attn_decode path below. Slow but always correct.
 
     fp8_layout = flashmla_quant.FP8KVCacheLayout.MODEL1_FP8Sparse
 
