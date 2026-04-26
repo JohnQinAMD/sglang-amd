@@ -174,5 +174,14 @@ def offload_to_host(
     gpu_indices: torch.Tensor,
     cpu_indices: torch.Tensor,
 ) -> None:
+    from sglang.srt.utils import is_hip
+    if is_hip():
+        # tvm_ffi JIT is not available on HIP. The CUDA kernel walks the raw
+        # uint64 pointer arrays and per-token issues a value+scale pair of
+        # device-to-host memcpys; reproduce via a tiny C++ extension that
+        # calls hipMemcpyAsync. Cached after first compile.
+        from sglang.jit_kernel.hisparse_transfer_hip import offload_to_host_hip
+        offload_to_host_hip(gpu_ptrs, cpu_ptrs, gpu_indices, cpu_indices)
+        return
     module = _jit_sparse_transfer_module()
     module.offload(gpu_ptrs, cpu_ptrs, gpu_indices, cpu_indices)

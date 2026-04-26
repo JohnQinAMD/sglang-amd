@@ -224,6 +224,14 @@ def hash_topk(
     topk_weights = torch.empty(
         (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
     )
+    from sglang.srt.utils import is_hip
+    if is_hip():
+        from sglang.jit_kernel.hash_topk_triton import hash_topk_triton
+        hash_topk_triton(
+            router_logits, input_ids, tid2eid,
+            topk_weights, topk_ids, routed_scaling_factor,
+        )
+        return topk_weights, topk_ids
     module = _jit_hash_topk_module()
     module.hash_topk(
         router_logits,
@@ -264,19 +272,28 @@ class CompressorPrefillPlan(NamedTuple):
             device=seq_lens.device,
             pin_memory=seq_lens.is_cpu,
         )
-        module = _jit_common_module()
         is_overlap = compress_ratio == 4
-        # NOTE: when seq_lens on CUDA device or use_cuda_graph = True,
-        # the C++/CUDA implementation will pad up to num_q_tokens
-        plan_lens = module.plan_compress_prefill(
-            extend_lens,
-            seq_lens,
-            plan_tensor[0],
-            plan_tensor[1],
-            compress_ratio,
-            is_overlap,
-            use_cuda_graph,
-        )
+        from sglang.srt.utils import is_hip
+        if is_hip():
+            from sglang.jit_kernel.compress_torch import plan_compress_prefill_torch
+            plan_lens = plan_compress_prefill_torch(
+                extend_lens, seq_lens,
+                plan_tensor[0], plan_tensor[1],
+                compress_ratio, is_overlap, use_cuda_graph,
+            )
+        else:
+            module = _jit_common_module()
+            # NOTE: when seq_lens on CUDA device or use_cuda_graph = True,
+            # the C++/CUDA implementation will pad up to num_q_tokens
+            plan_lens = module.plan_compress_prefill(
+                extend_lens,
+                seq_lens,
+                plan_tensor[0],
+                plan_tensor[1],
+                compress_ratio,
+                is_overlap,
+                use_cuda_graph,
+            )
         return CompressorPrefillPlan(
             compress_ratio,
             plan_tensor[0, : plan_lens[0]].to(device, non_blocking=True),
@@ -352,6 +369,23 @@ def compress_forward(
             kv_score_input.device,
         )
     assert plan.compress_ratio == compress_ratio, "Mismatched compress ratio in plan!"
+    from sglang.srt.utils import is_hip
+    if is_hip():
+        from sglang.jit_kernel.compress_c4_c128_torch import (
+            compress_decode_hip, compress_prefill_hip,
+        )
+        if isinstance(plan, CompressorDecodePlan):
+            compress_decode_hip(
+                compress_ratio, kv_score_buffer, kv_score_input, out, ape,
+                indices, plan[1], extra_data,
+            )
+        else:
+            # Prefill: plan = (compress_ratio, compress_plan, write_plan)
+            compress_prefill_hip(
+                compress_ratio, kv_score_buffer, kv_score_input, out, ape,
+                indices, plan[1], plan[2], extra_data,
+            )
+        return out
     module = _jit_compress_module(
         head_dim,
         kv_score_input.dtype,
@@ -371,13 +405,21 @@ def compress_fused_norm_rope_inplace(
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    mode = 1 if isinstance(plan, CompressorDecodePlan) else 0
+    from sglang.srt.utils import is_hip
+    if is_hip():
+        from sglang.jit_kernel.fused_norm_rope_triton import fused_norm_rope_inplace_hip
+        fused_norm_rope_inplace_hip(
+            kv, weight, plan[1], freq_cis, mode, eps, plan.compress_ratio,
+        )
+        return
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
     module.forward(
         kv,
         weight,
         plan[1],  # decode: seq_lens, prefill: compress_plan
         freq_cis,
-        1 if isinstance(plan, CompressorDecodePlan) else 0,  # mode
+        mode,
         eps,
         plan.compress_ratio,
     )
@@ -391,6 +433,13 @@ def fused_norm_rope_inplace(
     positions: torch.Tensor,
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    from sglang.srt.utils import is_hip
+    if is_hip():
+        from sglang.jit_kernel.fused_norm_rope_triton import fused_norm_rope_inplace_hip
+        fused_norm_rope_inplace_hip(
+            kv, weight, positions, freq_cis, 2, eps, 0,
+        )
+        return
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
     module.forward(
         kv,
@@ -434,81 +483,16 @@ def fused_rope(
     module.forward(q, k, freqs_real, positions, inverse)
 
 
-@cache_once
-def _tilelang_make_swa_indices_kernel(swa_window_size: int, threads: int = 128) -> Any:
-    import tilelang
-    import tilelang.language as T
-
-    batch_size = T.dynamic("batch_size")
-    batch_size_plus_1 = T.dynamic("batch_size_plus_1")
-    num_q_tokens = T.dynamic("num_q_tokens")
-    num_warps = threads // 32
-    assert swa_window_size % 32 == 0
-
-    @tilelang.jit
-    def make_swa_prefill_indices(
-        seq_lens_k: T.Tensor[(batch_size,), T.int32],
-        seq_lens_q: T.Tensor[(batch_size,), T.int32],
-        cu_seqlens_q: T.Tensor[(batch_size_plus_1,), T.int32],
-        swa_indices: T.Tensor[(num_q_tokens, swa_window_size), T.int32],
-    ):
-        _ = batch_size_plus_1  # unused, but don't remove it
-        with T.Kernel(T.ceildiv(num_q_tokens, num_warps), threads=threads) as bx:
-            # each warp handles 1 q token
-            tx = T.get_thread_binding()
-            warp_id = tx // 32
-            lane_id = tx % 32
-            s_batch_id = T.alloc_shared((num_warps,), dtype=T.int32)
-
-            token_id = warp_id + bx * num_warps
-            if token_id >= num_q_tokens:
-                return
-            for i in T.serial(0, batch_size, step=32):
-                j = i + lane_id
-                if cu_seqlens_q[j] <= token_id < cu_seqlens_q[j + 1]:
-                    s_batch_id[warp_id] = j
-            T.sync_warp()
-
-            seq_idx = s_batch_id[warp_id]
-            kv_len = seq_lens_k[seq_idx]
-            qo_len = seq_lens_q[seq_idx]
-            cum_qo_len = cu_seqlens_q[seq_idx]
-            prefix_len = kv_len - qo_len
-            curr_seq_qo_idx = token_id - cum_qo_len
-            end_abs_pos = prefix_len + curr_seq_qo_idx + 1
-            start_abs_pos = T.max(end_abs_pos - swa_window_size, 0)
-            old_kv_start = seq_idx * swa_window_size
-            new_kv_start = batch_size * swa_window_size + cum_qo_len
-
-            for i in T.unroll(0, swa_window_size, step=32):
-                j = i + lane_id
-                abs_pos = start_abs_pos + j
-                swa_indices[token_id, j] = T.if_then_else(
-                    abs_pos < end_abs_pos,
-                    T.if_then_else(
-                        abs_pos < prefix_len,
-                        old_kv_start + abs_pos % swa_window_size,
-                        new_kv_start + (abs_pos - prefix_len),
-                    ),
-                    -1,
-                )
-
-    return make_swa_prefill_indices
-
-
-def tilelang_make_swa_prefill_indices(
-    seq_lens_k: torch.Tensor,
-    seq_lens_q: torch.Tensor,
-    swa_indices: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if cu_seqlens_q is None:
-        cu_seqlens_q = torch.cumsum(seq_lens_q, dim=0, dtype=torch.int32)
-        cu_seqlens_q = torch.nn.functional.pad(cu_seqlens_q, (1, 0), value=0)
-    swa_window_size = swa_indices.shape[1]
-    kernel = _tilelang_make_swa_indices_kernel(swa_window_size)
-    kernel(seq_lens_k, seq_lens_q, cu_seqlens_q, swa_indices)
-    return swa_indices
+# NOTE: TileLang's `@tilelang.jit` does not work in modules with
+# `from __future__ import annotations` — `typing.get_type_hints` evaluates
+# `T.Tensor[(...), T.int32]` to a TileLang Buffer instance which is not a
+# Python type, and `typing._type_check` rejects it with "Forward references
+# must evaluate to types. Got buffer." The kernel therefore lives in a
+# sibling module without future-annotations.
+from sglang.jit_kernel.swa_indices_tilelang import (  # noqa: F401
+    _tilelang_make_swa_indices_kernel,
+    tilelang_make_swa_prefill_indices,
+)
 
 
 @triton.jit
@@ -648,6 +632,16 @@ def fused_store_cache(
     page_size: int,
     type: Literal["flashmla", "indexer"],
 ) -> None:
+    # On ROCm/HIP the JIT-CUDA path is unavailable (`tvm_ffi.cpp.load_inline`
+    # requires `CUDA_HOME`/`nvcc` and has no HIP build path). To make
+    # `SGLANG_OPT_USE_FUSED_STORE_CACHE=true` work on HIP we route through
+    # a Triton port (flashmla) and a torch fallback (indexer) — same pattern
+    # as topk_transform_512_triton.py at lines 154-180 above.
+    from sglang.srt.utils import is_hip
+    if is_hip():
+        from sglang.jit_kernel.fused_store_cache_triton import fused_store_cache_hip
+        fused_store_cache_hip(input, cache, indices, page_size=page_size, type=type)
+        return
     module = _jit_fused_store_module(
         name=type,
         input_dtype=input.dtype,
@@ -698,6 +692,17 @@ def silu_and_mul_masked_post_quant(
     apply_swiglu_limit = swiglu_limit is not None
     if apply_swiglu_limit:
         deepseek_v4_moe_code_path_checker.observed += 1
+    from sglang.srt.utils import is_hip
+    if is_hip():
+        from sglang.jit_kernel.silu_and_mul_masked_post_quant_triton import (
+            silu_and_mul_masked_post_quant_hip,
+        )
+        silu_and_mul_masked_post_quant_hip(
+            input, output, output_scale, quant_group_size, masked_m,
+            scale_ue8m0=scale_ue8m0, topk=topk, transposed=transposed,
+            swiglu_limit=float(swiglu_limit) if apply_swiglu_limit else 0.0,
+        )
+        return
     module = _jit_silu_mul_quant_module(
         quant_group_size, scale_ue8m0, apply_swiglu_limit
     )
@@ -715,6 +720,12 @@ def silu_and_mul_masked_post_quant(
 def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm: int):
     assert page_size == 64
     seq_lens = seq_lens.to(torch.int32)
+    from sglang.srt.utils import is_hip
+    if is_hip():
+        from sglang.jit_kernel.paged_mqa_metadata_torch import (
+            get_paged_mqa_logits_metadata_torch,
+        )
+        return get_paged_mqa_logits_metadata_torch(seq_lens, page_size, num_sm)
     metadata = seq_lens.new_empty(num_sm + 1, 2)
     module = _jit_metadata_module()
     module.run(seq_lens, metadata)

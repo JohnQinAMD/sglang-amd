@@ -111,6 +111,51 @@ def _topk_transform_512_kernel(
         )
 
 
+def topk_transform_pytorch_parametric(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """torch.topk-based path, parametric in K (no hardcoded 512).
+
+    Used as the large-L dispatch target for `topk_transform_512_triton`: the
+    Triton kernel does a full `tl.sort(BLOCK_L)` per CTA, so its cost grows
+    as L·log L. torch.topk grows as L·log K and wins on MI355X for
+    scores.shape[1] ≳ 8192 (see bench_deepseek_v4.py). Capture-safe:
+    `torch.where` instead of `.clone() + masked_fill_`.
+    """
+    B, L = scores.shape
+    K = out_page_indices.shape[1]
+    page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
+    page_mask = page_size - 1
+
+    pos = torch.arange(L, device=scores.device).unsqueeze(0).expand(B, -1)
+    valid = pos < seq_lens.unsqueeze(1)
+    masked = torch.where(valid, scores, scores.new_full((), float("-inf")))
+    actual_k = min(K, L)
+    _, raw = torch.topk(masked, k=actual_k, dim=1, largest=True, sorted=False)
+    raw = raw.to(torch.int32)
+    if actual_k < K:
+        pad = torch.full((B, K - actual_k), -1, dtype=torch.int32,
+                         device=scores.device)
+        raw = torch.cat([raw, pad], dim=1)
+
+    bidx = torch.arange(B, device=scores.device).unsqueeze(1).expand(-1, K)
+    gathered = scores[bidx.flatten(), raw.clamp(min=0).long().flatten()].view(B, K)
+    valid_topk = gathered != float("-inf")
+
+    page_idx_clamped = torch.clamp(raw >> page_bits, min=0).long()
+    phys = torch.gather(page_tables, dim=1, index=page_idx_clamped)
+    out = ((phys << page_bits) | (raw & page_mask)).to(torch.int32)
+    out_page_indices.copy_(torch.where(valid_topk, out, out.new_full((), -1)))
+    if out_raw_indices is not None:
+        out_raw_indices.copy_(torch.where(valid_topk, raw,
+                                          raw.new_full((), -1)))
+
+
 def topk_transform_512_triton(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -141,6 +186,20 @@ def topk_transform_512_triton(
     cap = int(os.environ.get("SGLANG_INDEXER_MAX_SEQ_LEN", "0"))
     if cap > 0 and scores.shape[1] > cap:
         scores = scores[:, :cap]
+
+    # Large-L dispatch: the Triton kernel sorts BLOCK_L = next_pow2(L) per CTA,
+    # which scales as L·log L. For L ≳ 8192 on MI355X this is slower than
+    # torch.topk (which scales as L·log K). Dispatch on `scores.shape[1]`,
+    # not seq_lens.max() — the latter would force a GPU→CPU sync and break
+    # cuda graph capture; under capture, scores.shape[1] is the worst-case
+    # buffer size and is what the Triton kernel actually processes anyway.
+    triton_max_l = int(os.environ.get("SGLANG_TOPK_TRITON_MAX_L", "8192"))
+    if scores.shape[1] > triton_max_l:
+        topk_transform_pytorch_parametric(
+            scores, seq_lens, page_tables, out_page_indices, page_size,
+            out_raw_indices,
+        )
+        return
 
     B, max_seq_len = scores.shape
     K = out_page_indices.shape[1]

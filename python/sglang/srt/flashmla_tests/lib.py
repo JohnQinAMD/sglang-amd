@@ -233,7 +233,10 @@ class KVScope:
     t: TestParam
     cache_seqlens: torch.Tensor
     block_table: torch.Tensor
-    blocked_k: torch.Tensor
+    # P0-c gather-first dequant lets `flash_mla_with_kvcache_torch` set
+    # `blocked_k = None` and have `process_kv_scope` dequant only the topk
+    # rows it gathers from `blocked_k_quantized`. Widen the annotation.
+    blocked_k: Optional[torch.Tensor]
     abs_indices: torch.Tensor
     indices_in_kvcache: torch.Tensor
     topk_length: Optional[torch.Tensor]

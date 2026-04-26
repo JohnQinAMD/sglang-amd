@@ -1,3 +1,4 @@
+import os
 from typing import Any, Optional
 
 import torch
@@ -116,50 +117,107 @@ def flash_mla_with_kvcache_torch(
     # whenever extra_k_cache is set (concat path not yet supported).
     # ---------------------------------------------------------------
     import os as _os
+    _two_shot_env = _os.environ.get("SGLANG_HIP_CK_V32_TWO_SHOT", "auto")
+    # `auto` = enable two-shot only for prefill (s_q > 1); decode regressed in iter 3
+    # `1` = always; `0` = never.
+    if _two_shot_env == "auto":
+        _two_shot_enabled = s_q > 1
+    else:
+        _two_shot_enabled = _two_shot_env == "1"
     if (
         _os.environ.get("SGLANG_HIP_SPARSE_MLA_DECODE_FP8") == "1"
-        and extra_k_cache is None
         and indices is not None
+        and (extra_k_cache is None or _two_shot_enabled)
     ):
         topk = indices.shape[-1]
         invalid_mask_2d = _get_invalid_mask(indices, topk_length, b, s_q, topk)
 
-        # Dispatch on (d_qk, d_v) — supports the full DSv4 model family:
-        #   Pro V32       (d_qk=576, d_v=512) → CK Tile FP8 sparse  [V32 instantiation]
-        #   Pro/Flash 2604 (d_qk=512, d_v=512) → CK Tile FP8 sparse [2604 instantiation]
-        #   Flash 2604-MODEL1 (d_qk=512, d_v=448) → TileLang FP8    [legacy fallback]
-        #   Anything else                                → fall through to ref BF16 path
-        # Tighten on BOTH dims so the CK kernel never fires on a mismatched
-        # shape. Unsupported shapes drop out of this `if` and land in the
-        # `ref_sparse_attn_decode` BF16 path below for correctness.
+        # Dispatch on (d_qk, d_v) — supports the full DSv4 model family.
         if (d_qk == 576 or d_qk == 512) and d_v == 512:
-            # ---- CK Tile FP8 sparse path: covers BOTH (576, 512) V32 and
-            # (512, 512) 2604. The kernel is templated on QK_HEAD_DIM and the
-            # launcher dispatches on q.size(-1) at call time. ----
             from sglang.srt.layers.attention.ck_v32_sparse_mla import (
                 ck_sparse_mla_decode_fp8_v32,
+                _apply_sink_fold_inplace,
             )
-            out, lse = ck_sparse_mla_decode_fp8_v32(
-                q=q.contiguous(),
+
+            sm_scale_f = float(softmax_scale) if softmax_scale is not None else 1.0
+            indices_i32 = (
+                indices.to(torch.int32) if indices.dtype != torch.int32 else indices
+            )
+
+            if extra_k_cache is None:
+                # Single CK V32 call (production fast path).
+                out, lse = ck_sparse_mla_decode_fp8_v32(
+                    q=q.contiguous(),
+                    k_cache=k_cache,
+                    indices=indices_i32,
+                    invalid_mask=invalid_mask_2d,
+                    attn_sink=attn_sink,
+                    sm_scale=sm_scale_f,
+                )
+                return out, lse
+
+            # ---- two-shot CK V32 + online-softmax merge ----
+            # Run CK V32 twice (no sink applied per-call); merge with online
+            # softmax; finally apply sink once on the merged output.
+            from sglang.srt.layers.attention.sparse_mla_merge import (
+                merge_two_sparse_attn_outputs,
+            )
+
+            extra_topk = extra_indices_in_kvcache.shape[-1]
+            extra_invalid_mask_2d = _get_invalid_mask(
+                extra_indices_in_kvcache, extra_topk_length, b, s_q, extra_topk,
+            )
+            extra_indices_i32 = (
+                extra_indices_in_kvcache.to(torch.int32)
+                if extra_indices_in_kvcache.dtype != torch.int32
+                else extra_indices_in_kvcache
+            )
+
+            q_c = q.contiguous()
+            out_a, lse_a = ck_sparse_mla_decode_fp8_v32(
+                q=q_c,
                 k_cache=k_cache,
-                indices=indices.to(torch.int32) if indices.dtype != torch.int32 else indices,
+                indices=indices_i32,
                 invalid_mask=invalid_mask_2d,
-                attn_sink=attn_sink,
-                sm_scale=float(softmax_scale) if softmax_scale is not None else 1.0,
+                attn_sink=None,
+                sm_scale=sm_scale_f,
             )
+            out_b, lse_b = ck_sparse_mla_decode_fp8_v32(
+                q=q_c,
+                k_cache=extra_k_cache,
+                indices=extra_indices_i32,
+                invalid_mask=extra_invalid_mask_2d,
+                attn_sink=None,
+                sm_scale=sm_scale_f,
+            )
+
+            # Reshape to [total_q, H, V] for merge.
+            B_, S_q_, H_, V_ = out_a.shape
+            total_q_ = B_ * S_q_
+            out_a_2d = out_a.view(total_q_, H_, V_).contiguous()
+            out_b_2d = out_b.view(total_q_, H_, V_).contiguous()
+            # lse from CK V32 is [B, H, S_q]; flatten to [total_q, H].
+            lse_a_2d = lse_a.transpose(1, 2).reshape(total_q_, H_).contiguous()
+            lse_b_2d = lse_b.transpose(1, 2).reshape(total_q_, H_).contiguous()
+
+            out_m_2d, lse_m_2d = merge_two_sparse_attn_outputs(
+                out_a_2d, lse_a_2d, out_b_2d, lse_b_2d,
+            )
+
+            if attn_sink is not None:
+                _apply_sink_fold_inplace(out_m_2d, lse_m_2d, attn_sink)
+
+            out = out_m_2d.view(B_, S_q_, H_, V_)
+            lse = lse_m_2d.view(B_, S_q_, H_).transpose(1, 2).contiguous()  # [B, H, S_q]
             return out, lse
 
-        if d_qk == 512 and d_v == 448:
-            # ---- MODEL1 path (legacy d_v=448): TileLang FP8 direct ----
-            # Kept for safety — there's no production DSv4 shape that hits
-            # this today, but if a future model variant materializes the
-            # MODEL1 layout it'll route here instead of falling through.
+        if d_qk == 512 and d_v == 448 and extra_k_cache is None:
+            # MODEL1 legacy path; only single-cache supported.
             import sys as _sys
             _ws = "/mnt/vast/john/rocm-dynamo/kernel-agents/experiments/dsv4_sparse_mla_decode_hip_workspace"
             if _ws not in _sys.path:
                 _sys.path.insert(0, _ws)
             import sparse_mla_decode_fp8_kernel_model1 as _kmod
-            # k_cache may arrive as float8_e4m3fn (per FP8_DTYPE module-level).
             kv_packed = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
             out, lse = _kmod.sparse_mla_decode_fp8(
                 q.contiguous(),
@@ -203,10 +261,21 @@ def flash_mla_with_kvcache_torch(
         have_topk_length=True,
     )
 
+    # P0-c gather-first dequant: skip the whole-table dequant when the env
+    # flag is on (default). `process_kv_scope` in ref.py picks up the
+    # `blocked_k is None` signal and dequants only the topk rows it gathers
+    # from `blocked_k_quantized`, cutting per-layer HBM traffic by
+    # ~num_blocks*block_size / (b*s_q*topk) (typically 30-100× on DSv4).
+    # SGLANG_GATHER_FIRST_DEQUANT=0 forces the old whole-table path for A/B.
+    _gather_first = os.environ.get("SGLANG_GATHER_FIRST_DEQUANT", "1") == "1"
+
     blocked_k_quantized = k_cache
-    blocked_k = flashmla_quant.dequantize_k_cache(
-        blocked_k_quantized.view(FP8_DTYPE), fp8_layout
-    )
+    if _gather_first:
+        blocked_k = None
+    else:
+        blocked_k = flashmla_quant.dequantize_k_cache(
+            blocked_k_quantized.view(FP8_DTYPE), fp8_layout
+        )
     # blocked_k_requantized = flashmla_quant.quantize_k_cache(blocked_k, fp8_layout)
     # assert torch.testing.assert_allclose(blocked_k_requantized.byte(), blocked_k_quantized.byte())
     kv_scope = KVScope(
@@ -223,9 +292,12 @@ def flash_mla_with_kvcache_torch(
     extra_kv_scope = None
     if extra_k_cache is not None:
         extra_blocked_k_quantized = extra_k_cache
-        extra_blocked_k = flashmla_quant.dequantize_k_cache(
-            extra_blocked_k_quantized.view(FP8_DTYPE), fp8_layout
-        )
+        if _gather_first:
+            extra_blocked_k = None
+        else:
+            extra_blocked_k = flashmla_quant.dequantize_k_cache(
+                extra_blocked_k_quantized.view(FP8_DTYPE), fp8_layout
+            )
         # extra_blocked_k_requantized = flashmla_quant.quantize_k_cache(extra_blocked_k, fp8_layout)
         # assert torch.testing.assert_allclose(extra_blocked_k_requantized.byte(), extra_blocked_k_quantized.byte())
         extra_kv_scope = KVScope(

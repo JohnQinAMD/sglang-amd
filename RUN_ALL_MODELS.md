@@ -14,12 +14,14 @@ Single launcher per model. All assume:
 |---|---:|---|---:|---|---:|
 | DeepSeek-V4-Flash-Base | ~285 B | FP8 attn + FP8 experts | TP=4 | [`launch_dsv4.sh`](launch_dsv4.sh) | 2.15 tok/s/GPU (c=1 OSL=1024) |
 | DeepSeek-V4-Flash (mxfp4 cktile) | ~285 B | FP8 attn + mxfp4 experts | TP=4 | [`launch_dsv4.sh`](launch_dsv4.sh) + `SGLANG_MXFP4_AITER=1` | 1.00 tok/s/GPU (c=1 OSL=1024) |
-| **DeepSeek-V4-Flash (mxfp4 FlyDSL)** | ~285 B | FP8 attn + mxfp4 experts | TP=4 | + `SGLANG_MXFP4_FLYDSL=1` (needs FlyDSL wheel) | **4.85 tok/s/GPU** (c=1 OSL=1024) |
+| **DeepSeek-V4-Flash (mxfp4 FlyDSL + R5 stack)** | ~285 B | FP8 attn + mxfp4 experts | TP=4 | + `SGLANG_MXFP4_FLYDSL=1` (needs FlyDSL wheel) | **6.42 tok/s/GPU** (c=1 OSL=1024) |
 | DeepSeek-V4-Pro-Base | ~671 B | FP8 attn + FP8 experts | TP=8 | [`launch_dsv4_pro_base.sh`](launch_dsv4_pro_base.sh) | **6.51 tok/s/GPU** (c=8 OSL=1024) |
 | DeepSeek-V4-Pro (mxfp4) | ~671 B | FP8 attn + mxfp4 experts | TP=8 EP=8 | [`launch_dsv4_pro_mxfp4.sh`](launch_dsv4_pro_mxfp4.sh) | 4.45 tok/s/GPU (c=8 OSL=1024) |
 
 c=1 OSL=1024 num_prompts=10 warmup=2, ISL=1024 random, greedy.
-**Flash mxfp4 FlyDSL is currently the fastest per-GPU AMD path for the Flash family** — 2.27× faster than the FP8 baseline on the same hardware, because mxfp4's 4-bit weights halve the HBM read at decode time and FlyDSL is hand-tuned for gfx950.
+**Flash mxfp4 FlyDSL + R5 stack is currently the fastest per-GPU AMD path for the Flash family** — ~3× faster than the FP8 baseline on the same hardware (38.96 ms TPOT vs 115.4 ms), because mxfp4's 4-bit weights halve the HBM read at decode time, FlyDSL is hand-tuned for gfx950, and the R5 stack ports MI300's 5-patch dequant fusion (gather-first + Triton kernel + bf16 inner BMM + skip nan_to_num + fused index gather).
+
+> ⚠️ **CK V32 sparse MLA decode is currently broken for end-to-end Flash mxfp4 inference** at production TOPK ≥ 256 with the multi-split reduce path. `microbench_ck_v32_512.py` reports `cos_sim 0.999998` because it uses TOPK=64 / num_splits=1, which doesn't exercise the broken path. **Do NOT set `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1` for Flash mxfp4** until the kernel is fixed. The launchers below leave it unset.
 
 Recommended production targets:
 - 4-GPU node, low concurrency: **Flash mxfp4 FlyDSL** (fastest path, beats FP8 at c=1)
@@ -50,19 +52,31 @@ Python wrapper picks the right value from `k_cache.dtype`:
 - `torch.uint8` view → 1.0 (assume MI355X-style fn storage)
 
 After the fix:
-- CK V32 numerically matches reference (max_diff 1.34e-3 vs 1.82e-2 before).
-- **Pro V32 attention is now correct** — was running with halved output.
-- **Flash mxfp4 + CK V32 is now selectable** (was unusable due to the bug).
+- CK V32 numerically matches reference at TOPK=64 / num_splits=1 (max_diff 1.34e-3 vs 1.82e-2 before).
+- **Pro V32 attention is now correct** at small TOPK — was running with halved output.
 
-CK V32 is **roughly at parity** with the existing Triton sparse_attn_decode at c=1
-(both ~50 ms TPOT). Use whichever your model needs:
-- Pro V32 (qk_head_dim=576): use CK V32 (`SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1`)
-- Flash 2604 (qk_head_dim=512): either CK V32 OR Triton sparse — pick by env
+> ⚠️ **Open regression (2026-04-26):** CK V32 still produces silent garbage on
+> end-to-end Flash mxfp4 inference at production TOPK ≥ 256 + the multi-split
+> reduce path. `microbench_ck_v32_512.py` (TOPK=64) does NOT catch this — its
+> cos-sim is 0.999998. Bisected by toggling `SGLANG_HIP_SPARSE_MLA_DECODE_FP8`:
+>
+> | mode | greedy "The capital of France is" |
+> |---|---|
+> | `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1` (CK V32) | garbage tokens |
+> | `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0` (torch ref + R5) | ✓ " Paris.\nThe capital of France is Paris…" |
+>
+> Use **`SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0`** (or unset, which is the
+> default) for Flash mxfp4 until the kernel multi-split path is fixed.
+> The R5 stack on the torch ref path delivers SOTA Flash mxfp4 perf
+> (38.96 ms TPOT, see Flash mxfp4 section below). For Pro V32 the impact
+> is unverified — use at your own risk and validate against an FP32 oracle
+> at production shapes.
 
-Microbench: [`microbench_ck_v32_512.py`](microbench_ck_v32_512.py) — A/B test for
-fn vs fnuz storage at D=512 and D=576. Also [`_fp8_decode_probe2.py`](_fp8_decode_probe2.py)
-proves the gfx950 HW intrinsic decodes with fn semantics (0/256 byte mismatches
-vs 252/256 for fnuz).
+Recommended action items (ordered by ROI):
+- Extend [`microbench_ck_v32_512.py`](microbench_ck_v32_512.py) to TOPK ∈ {256, 512, 1024} and explicitly cover the multi-split reduce path (`pick_num_splits` returns >1) — should reproduce the inference garbage in a few seconds instead of needing a 2-min server restart.
+- Once reproducible, fix the multi-split reduce path or the wrapper's `pick_num_splits` heuristic.
+
+Microbench artifacts: [`microbench_ck_v32_512.py`](microbench_ck_v32_512.py) and [`_fp8_decode_probe2.py`](_fp8_decode_probe2.py) (proves the gfx950 HW intrinsic decodes with fn semantics — 0/256 byte mismatches vs 252/256 for fnuz).
 
 ## Common docker run prefix
 
@@ -142,47 +156,70 @@ Bench (c=1 OSL=1024, 4 prompts, greedy):
 
 **Known limitation**: c≥4 (or any prefill batch with M ≥ 2048 tokens reaching MoE) crashes with HIP IMA at `compress_state.py:32` (`KVAndScoreOld.__getitem__`). The IMA fires inside the compressor's metadata gather, not the MoE — a separate, pre-existing PR-tree issue. Until that's fixed, run Flash mxfp4 at c=1 only or use Flash-Base for higher concurrency.
 
-### FlyDSL (much faster — 4.86× over cktile, 2.27× over FP8)
+### FlyDSL + R5 stack (SOTA — 6.50× over cktile, ~3× over FP8)
 
-`SGLANG_MXFP4_FLYDSL=1` replaces the cktile `aiter.fused_moe` wrapper chain with a direct call to `flydsl_moe_stage1` + `flydsl_moe_stage2` (gfx950-tuned FP4 GEMM kernels). Bypasses the `fused_moe_2stages` Python overhead entirely. Fused-quant in stage1 outputs FP4 + sorted scale ready for stage2, so no intermediate dequant.
+Two independent components must be in the tree for SOTA Flash mxfp4:
 
-Setup (one-time):
+1. **`SGLANG_MXFP4_FLYDSL=1`** replaces the cktile `aiter.fused_moe` wrapper chain with a direct call to `flydsl_moe_stage1` + `flydsl_moe_stage2` (gfx950-tuned FP4 GEMM kernels). Bypasses the `fused_moe_2stages` Python overhead entirely. Fused-quant in stage1 outputs FP4 + sorted scale ready for stage2, so no intermediate dequant.
+
+2. **R5 attention stack + HIP routing** (default-on once the patch is in tree, no env knob needed beyond CK V32 OFF):
+   - **P0-c gather-first FP8 dequant** — only dequant the topk rows actually used, not the whole `[num_blocks*block_size, 512]` table
+   - **P1-a 14-tile dequant → 1 Triton kernel** in `flashmla_tests/quant.py` (`dequantize_k_cache_gather`)
+   - **P1-b skip `nan_to_num`** — `quantize_k_cache` now uses `FP8_MAX = finfo(dtype).max` so the defensive scrub becomes a redundant launch
+   - **P1-c fused index gather** — one launch reads packed FP8 + indices → bf16
+   - **P1-e bf16 inner BMM** — drops `.float()` upcast, gfx950 v_mfma is faster on bf16
+   - **HIP routing for compress / fused_norm_rope / hash_topk / topk_transform_512** — replaces JIT C++ kernels with Triton/torch versions tuned for gfx950 (`jit_kernel/{compress_torch, compress_c4_c128_torch, fused_norm_rope_triton, hash_topk_triton}.py`)
+
+Setup (one-time, host side — wheel + matching aiter glue must coexist on disk):
 
 ```bash
-# 1. Install FlyDSL wheel (must be exactly 0.1.3.1 — version check is strict)
-docker exec sglang bash -c '
-  curl -fSL -o /tmp/flydsl-0.1.3.1+20260418.68f5725-cp310-cp310-manylinux_2_35_x86_64.whl \
-    https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/flydsl-0.1.3.1%2B20260418.68f5725-cp310-cp310-manylinux_2_35_x86_64.whl
-  pip install /tmp/flydsl-0.1.3.1+20260418.68f5725-cp310-cp310-manylinux_2_35_x86_64.whl
-'
+# 1. Pre-stage the wheel + this tree's launcher into /mnt/vast/john/flydsl_setup
+#    (already in place on chi2761; replicate on other hosts):
+mkdir -p /mnt/vast/john/flydsl_setup
+curl -fSL -o /mnt/vast/john/flydsl_setup/flydsl-0.1.3.1+20260418.68f5725-cp310-cp310-manylinux_2_35_x86_64.whl \
+  https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/flydsl-0.1.3.1%2B20260418.68f5725-cp310-cp310-manylinux_2_35_x86_64.whl
+cp $REPO_ROOT/flydsl_setup/launch_with_flydsl.sh /mnt/vast/john/flydsl_setup/
 
-# 2. Drop in aiter.ops.flydsl module from the rocm-dynamo aiter-amd workspace
-docker exec sglang cp -r /flydsl_src /sgl-workspace/aiter/aiter/ops/flydsl
-# (mount /mnt/vast/john/rocm-dynamo/aiter-amd/aiter/ops/flydsl as /flydsl_src in docker run)
-
-# 3. Verify
-docker exec sglang python3 -c "
-from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
-print('available:', is_flydsl_available())
-"
+# 2. Pin the matching aiter-amd checkout (its `_REQUIRED_FLYDSL_VERSION` MUST
+#    equal the wheel version `0.1.3.1`, otherwise sglang crashes at first MoE
+#    call with `ImportError: Unsupported flydsl version`).
+#    Verify with:
+grep _REQUIRED_FLYDSL_VERSION /mnt/vast/john/rocm-dynamo/aiter-amd/aiter/ops/flydsl/__init__.py
+#    Expected: _REQUIRED_FLYDSL_VERSION = "0.1.3.1"
+#    DO NOT mount /mnt/vast/john/aiter_workspace/...   (expects 0.1.1.dev409)
+#    DO NOT mount /mnt/vast/john/tmp-sla-*/aiter-amd/  (expects 0.1.1+20260401)
 ```
+
+The launch script (`flydsl_setup/launch_with_flydsl.sh`) handles wheel install +
+aiter glue copy + version validation inside the container — no manual
+`docker exec ... pip install` step needed.
 
 Run with `SGLANG_MXFP4_FLYDSL=1`:
 
 ```bash
-docker run -d --name sglang \
+docker run -d --name sglang_flash \
   --device=/dev/kfd --device=/dev/dri --ipc=host --network=host --shm-size 64g \
   --security-opt seccomp=unconfined --group-add video --group-add render --cap-add SYS_PTRACE \
   -v /mnt/vast/john/huggingface:/hf \
   -v /mnt/vast/john/sglang_v4_pr:/sgl-pr \
   -v /mnt/vast/john/sglang_v4_pr_jitcache:/sgl-workspace/aiter/aiter/jit \
+  -v /mnt/vast/john/flydsl_setup:/flydsl_setup \
   -v /mnt/vast/john/rocm-dynamo/aiter-amd/aiter/ops/flydsl:/flydsl_src \
-  -e CUDA_VISIBLE_DEVICES=0,1,2,3 -e MODEL=/hf/DeepSeek-V4-Flash-srt \
+  -e CUDA_VISIBLE_DEVICES=0,1,2,3 -e MODEL=/hf/DeepSeek-V4-Flash-srt -e PORT=30010 \
   -e SGLANG_MXFP4_FLYDSL=1 -e SGLANG_OPT_USE_OLD_COMPRESSOR=false \
+  -e SGLANG_TRITON_SPARSE_DECODE=0 \
+  -e SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
   rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129 \
-  bash /flydsl_setup/launch_with_flydsl.sh   # see flydsl_setup/launch_with_flydsl.sh in this tree
+  bash /flydsl_setup/launch_with_flydsl.sh
 ```
+
+Note: **`SGLANG_HIP_SPARSE_MLA_DECODE_FP8` is intentionally NOT set** — see the Sparse MLA section above for why CK V32 is currently broken on Flash mxfp4 e2e inference.
+
+The launcher pre-flight checks (in `flydsl_setup/launch_with_flydsl.sh`):
+- `/flydsl_setup` mount has the wheel (else: clear error)
+- `/flydsl_src` mount exists (else: clear error)
+- Installed wheel version == `_REQUIRED_FLYDSL_VERSION` in `/flydsl_src/__init__.py`
+  (else: clear error before model load — saves the 1-2 min boot-then-crash cycle)
 
 Greedy probe:
 
@@ -192,14 +229,24 @@ Greedy probe:
 
 Bench (c=1 OSL=1024 num=10 warmup=2, greedy):
 
-| Metric | cktile (old) | **FlyDSL (new)** | improvement |
-|---|---:|---:|---:|
-| Output throughput | 3.95 tok/s | **19.40 tok/s** | **4.91×** |
-| Per-GPU (TP=4) | 1.00 | **4.85 tok/s/GPU** | 4.85× |
-| TPOT | 250.7 ms | **50.94 ms** | 4.92× |
-| TTFT | 712 ms | 427 ms | 1.67× |
+| Metric | cktile (old) | FlyDSL (initial) | **FlyDSL + R5 stack (current)** | improvement |
+|---|---:|---:|---:|---:|
+| Output throughput | 3.95 tok/s | 19.40 tok/s | **25.66 tok/s** | **6.50×** vs cktile |
+| Per-GPU (TP=4) | 1.00 | 4.85 tok/s/GPU | **6.42 tok/s/GPU** | 6.42× |
+| TPOT | 250.7 ms | 50.94 ms* | **38.96 ms** | 6.43× |
 
-**FlyDSL Flash mxfp4 (50.94 ms TPOT) is 2.27× faster than Flash-Base FP8 (115.4 ms TPOT)** on identical hardware — finally realizes the bandwidth advantage of 4-bit weights at c=1 decode.
+\*The 50.94 ms FlyDSL number was measured with `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1`
+(CK V32 sparse MLA decode), but that path actually returned garbage tokens for
+e2e inference (the microbench at `microbench_ck_v32_512.py` reports 0.999998
+cos-sim vs FP32 oracle, but uses TOPK=64 / num_splits=1 — production decode
+hits TOPK ≥ 256 and the multi-split reduce path, which produces wrong output).
+**Disable CK V32 with `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0`** until that path
+is fixed. With CK V32 off + R5 stack (gather-first FP8 dequant P0-c, Triton
+dequant kernel P1-a, fused index gather P1-c, bf16 inner BMM P1-e, skip
+nan_to_num P1-b — all default-on once the patch is in tree), TPOT lands at
+38.96 ms with correct output.
+
+**FlyDSL Flash mxfp4 + R5 (38.96 ms TPOT) is ~3× faster than Flash-Base FP8 (115.4 ms TPOT)** on identical hardware — finally realizes the bandwidth advantage of 4-bit weights at c=1 decode.
 
 Implementation notes (see [`mxfp4.py:_use_flydsl_mxfp4`](python/sglang/srt/layers/quantization/mxfp4.py)):
 - Pre-shuffle weights at load: `shuffle_weight((16,16))` for w13, `shuffle_weight_a16w4(_,16,False)` for w2; `e8m0_shuffle` for w13 scale, `shuffle_scale_a16w4` for w2 scale.

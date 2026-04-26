@@ -5,12 +5,23 @@ import torch
 
 from .lib import KVScope, Testcase, TestcaseForDecode, TestParam
 
+# R5 P1-b: historically this code called torch.nan_to_num on every attention
+# call to scrub NaNs produced by the pre-FP8_MAX-fix quantize_k_cache bug
+# (FNUZ overflow clamped to byte 0x80). Now that the quantizer uses the actual
+# FP8 max, there shouldn't be any NaN; this flag re-enables the defensive
+# mask for debugging / A/B only.
+_KV_NAN_DEFENSE = os.environ.get("SGLANG_SKIP_KV_NAN_TO_NUM", "1") != "1"
 # torch.compile wrap for the hot sparse-attn inner loop on AMD.
 # Disabled if SGLANG_DISABLE_REF_ATTN_COMPILE=1.
 _USE_COMPILE = os.environ.get("SGLANG_DISABLE_REF_ATTN_COMPILE", "0") != "1"
 # Opt-in Triton sparse-decode kernel (AMD MI355X / gfx950).
 # Takes precedence over torch.compile when set to "1".
 _USE_TRITON = os.environ.get("SGLANG_TRITON_SPARSE_DECODE", "0") == "1"
+# R5 P1-e: pass bf16 Q/K directly to _sparse_attn_decode_inner instead of
+# up-casting to fp32 outside, saving a ~30 ms/prefill bf16→f32 copy
+# (torch.compile's BMM still accumulates in fp32 internally, so numerics
+# are equivalent). Set SGLANG_FORCE_FP32_ATTN_INNER=1 to restore old path.
+_FORCE_FP32_INNER = os.environ.get("SGLANG_FORCE_FP32_ATTN_INNER", "0") == "1"
 
 
 def _sparse_attn_decode_inner(
@@ -54,9 +65,10 @@ def _sparse_attn_decode_inner_triton(
     ``(output[B*Sq, Hq, dv] bf16, lse[B*Sq, Hq] fp32)`` tuple.
 
     The Triton kernel operates on bf16 Q/K; sglang callers pass fp32, so we
-    cast on the boundary. Invalid rows inside ``gathered_kv_f32`` may contain
-    NaN (sglang already runs ``nan_to_num`` upstream, but we defend here too
-    because the Triton kernel will poison the accumulator on NaN loads).
+    cast on the boundary. The kernel itself masks invalid rows on K/V loads
+    (`other=0.0`, see triton_sparse_decode_kernel.py:76-79, 99-101) and
+    handles all-masked rows in the online softmax (lines 84, 88-92, 109),
+    so an outer ``nan_to_num`` guard is redundant.
     """
     # Cast to bf16 (kernel contract).
     q_bf = (
@@ -69,7 +81,6 @@ def _sparse_attn_decode_inner_triton(
         if gathered_kv_f32.dtype != torch.bfloat16
         else gathered_kv_f32.contiguous()
     )
-    kv_bf = torch.nan_to_num(kv_bf, nan=0.0)
 
     from .triton_sparse_decode_kernel import triton_sparse_attn_decode
 
@@ -162,11 +173,34 @@ def ref_sparse_attn_decode(
         indices_in_kv_cache_fixed = torch.clamp_min(
             kv_scope.indices_in_kvcache, 0
         )  # Otherwise torch.index_select will complain
-        gathered_kv = (
-            kv_scope.blocked_k.view(-1, p.d_qk)
-            .index_select(0, indices_in_kv_cache_fixed.view(-1))
-            .view(b, p.s_q, topk, p.d_qk)
-        )  # [b, s_q, topk, d]
+        if (
+            getattr(kv_scope, "blocked_k", None) is None
+            and getattr(kv_scope, "blocked_k_quantized", None) is not None
+        ):
+            # P0-c gather-first FP8 dequant: only dequant the topk rows we
+            # actually keep. Cuts per-layer HBM traffic by
+            # `num_blocks*block_size / (b*s_q*topk)` (typically 30-100× on DSv4).
+            from . import quant as _quant  # local import to avoid cycles
+            bytes_per_token = kv_scope.blocked_k_quantized.shape[-1]
+            # MODEL1_FP8Sparse (MI300): bytes_per_token = block_size*(d_nope+2*d_rope) + 8*block_size = 584
+            # V32_FP8Sparse   (SM90)  : bytes_per_token = d_nope + num_tiles*4 + 2*d_rope        = 464
+            fp8_layout = (
+                _quant.FP8KVCacheLayout.MODEL1_FP8Sparse
+                if bytes_per_token == 584
+                else _quant.FP8KVCacheLayout.V32_FP8Sparse
+            )
+            gathered_flat = _quant.dequantize_k_cache_gather(
+                kv_scope.blocked_k_quantized.view(_quant.FP8_DTYPE),
+                indices_in_kv_cache_fixed.view(-1),
+                fp8_layout,
+            )  # [b*s_q*topk, d]
+            gathered_kv = gathered_flat.view(b, p.s_q, topk, p.d_qk)
+        else:
+            gathered_kv = (
+                kv_scope.blocked_k.view(-1, p.d_qk)
+                .index_select(0, indices_in_kv_cache_fixed.view(-1))
+                .view(b, p.s_q, topk, p.d_qk)
+            )  # [b, s_q, topk, d]
         invalid_mask = kv_scope.indices_in_kvcache == -1
         if kv_scope.topk_length is not None:
             invalid_mask |= torch.arange(0, topk, device=invalid_mask.device).view(
@@ -186,9 +220,26 @@ def ref_sparse_attn_decode(
 
     # may use more advanced approach
 
-    gathered_kv = gathered_kv.view(b * p.s_q, -1, p.d_qk).float()
-    gathered_kv = torch.nan_to_num(gathered_kv, nan=0.0)
-    q = t.q.float().view(b * p.s_q, p.h_q, p.d_qk)
+    # R5 P1-e: drop fp32 upcast by default (saves ~30 ms/prefill in bf16→f32
+    # copy + lets the inner BMM run on bf16 v_mfma which is faster on gfx950
+    # than fp32 rocBLAS). torch.compile's BMM and the Triton kernel both
+    # accumulate in fp32 internally so numerics are preserved.
+    if _FORCE_FP32_INNER:
+        gathered_kv = gathered_kv.view(b * p.s_q, -1, p.d_qk).float()
+    else:
+        gathered_kv = gathered_kv.view(b * p.s_q, -1, p.d_qk)
+    # Triton sparse-decode kernel masks invalid rows on K/V load (`other=0.0`),
+    # so the outer NaN-scrub is a redundant launch on that path. The pure-tensor
+    # / torch.compile path computes `attn_weight @ gathered_kv` directly and
+    # would propagate NaN, so it still needs the guard. R5 P1-b disables this
+    # by default since the FP8_MAX fix in quantize_k_cache prevents the NaN
+    # at the source.
+    if not _USE_TRITON and _KV_NAN_DEFENSE:
+        gathered_kv = torch.nan_to_num(gathered_kv, nan=0.0)
+    if _FORCE_FP32_INNER:
+        q = t.q.float().view(b * p.s_q, p.h_q, p.d_qk)
+    else:
+        q = t.q.view(b * p.s_q, p.h_q, p.d_qk)
     invalid_mask_2d = invalid_mask.view(b * p.s_q, -1)
 
     output, lse = _sparse_attn_decode_inner(
