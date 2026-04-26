@@ -26,6 +26,44 @@ Recommended production targets:
 - 4-GPU node, high concurrency: **Flash-Base FP8** (mxfp4 c≥4 prefill hits a pre-existing compressor IMA, orthogonal to mxfp4)
 - 8-GPU node: **Pro-Base** (Pro-mxfp4 is functional but slower; use Pro-Base unless you specifically need the mxfp4 ckpt)
 
+## Sparse MLA decode kernel — IMPORTANT for accuracy
+
+The CK V32 sparse MLA decode kernel (enabled via `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1`)
+had a silent **2× scaling bug** before commit `eb373f796`:
+
+- The kernel was designed assuming KV cache is stored as `torch.float8_e4m3fnuz`
+  (MI300X / gfx942 default, exponent bias=8).
+- On MI355X (gfx950) sglang stores KV as `torch.float8_e4m3fn` (OCP standard, bias=7).
+- The hardcoded `kFnuzBiasFix = 0.5f` halved every KV value → attention output was
+  silently 0.5× the reference (microbench-confirmed: ratio=0.5000 at both
+  qk_head_dim=512 and 576).
+- Cosine similarity stayed high (0.9997 — softmax is invariant under uniform
+  scaling) but the absolute scale shift broke residual addition + downstream
+  RMSnorm.
+- **Symptom**: Flash mxfp4 + CK V32 returned "London" instead of "Paris".
+  Pro V32 produced sensible-but-not-quite-right text (less sensitive).
+
+**Fix**: the kernel now takes a runtime `fp8_decode_scale` parameter, and the
+Python wrapper picks the right value from `k_cache.dtype`:
+- `torch.float8_e4m3fn` → 1.0  (MI355X / OCP standard)
+- `torch.float8_e4m3fnuz` → 0.5 (MI300X / legacy)
+- `torch.uint8` view → 1.0 (assume MI355X-style fn storage)
+
+After the fix:
+- CK V32 numerically matches reference (max_diff 1.34e-3 vs 1.82e-2 before).
+- **Pro V32 attention is now correct** — was running with halved output.
+- **Flash mxfp4 + CK V32 is now selectable** (was unusable due to the bug).
+
+CK V32 is **roughly at parity** with the existing Triton sparse_attn_decode at c=1
+(both ~50 ms TPOT). Use whichever your model needs:
+- Pro V32 (qk_head_dim=576): use CK V32 (`SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1`)
+- Flash 2604 (qk_head_dim=512): either CK V32 OR Triton sparse — pick by env
+
+Microbench: [`microbench_ck_v32_512.py`](microbench_ck_v32_512.py) — A/B test for
+fn vs fnuz storage at D=512 and D=576. Also [`_fp8_decode_probe2.py`](_fp8_decode_probe2.py)
+proves the gfx950 HW intrinsic decodes with fn semantics (0/256 byte mismatches
+vs 252/256 for fnuz).
+
 ## Common docker run prefix
 
 All examples below assume this docker invocation. Set `GPUS` to the device list you want.
