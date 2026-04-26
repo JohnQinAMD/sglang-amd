@@ -12,13 +12,17 @@ Single launcher per model. All assume:
 
 | Model | Params | Quant scheme | TP / EP | Launcher | Per-GPU best |
 |---|---:|---|---:|---|---:|
+| Model | Params | Quant scheme | TP / EP | Launcher | Per-GPU best (measured) |
+|---|---:|---|---:|---|---:|
 | DeepSeek-V4-Flash-Base | ~285 B | FP8 attn + FP8 experts | TP=4 | [`launch_dsv4.sh`](launch_dsv4.sh) | see RUN_ON_AMD_MI355X.md |
-| DeepSeek-V4-Flash (mxfp4) | ~285 B | FP8 attn + mxfp4 experts | TP=4 | `launch_dsv4.sh stacked-aiter-moe` | see RUN_ON_AMD_MI355X.md |
+| DeepSeek-V4-Flash (mxfp4) | ~285 B | FP8 attn + mxfp4 experts | TP=4 | [`launch_dsv4.sh`](launch_dsv4.sh) + 2 env knobs | 1.00 tok/s/GPU (c=1 OSL=1024) † |
 | DeepSeek-V4-Pro-Base | ~671 B | FP8 attn + FP8 experts | TP=8 | [`launch_dsv4_pro_base.sh`](launch_dsv4_pro_base.sh) | **6.51 tok/s/GPU** (c=8 OSL=1024) |
 | DeepSeek-V4-Pro (mxfp4) | ~671 B | FP8 attn + mxfp4 experts | TP=8 EP=8 | [`launch_dsv4_pro_mxfp4.sh`](launch_dsv4_pro_mxfp4.sh) | 4.45 tok/s/GPU (c=8 OSL=1024) |
 
+† Flash mxfp4 c=1 only. c≥4 prefill batches (M ≥ 2048 tokens to MoE) hit a pre-existing HIP IMA in `compress_state.__getitem__` (compressor metadata path) — orthogonal to mxfp4. See "Flash mxfp4" section below.
+
 Recommended production targets:
-- 4-GPU node: **Flash-Base** (fastest, smallest footprint)
+- 4-GPU node: **Flash-Base** (fastest, smallest footprint, no compressor IMA)
 - 8-GPU node: **Pro-Base** (Pro-mxfp4 is functional but slower; use Pro-Base unless you specifically need the mxfp4 ckpt)
 
 ## Common docker run prefix
@@ -58,11 +62,46 @@ curl -s http://127.0.0.1:30010/v1/completions -H "Content-Type: application/json
 
 ## DeepSeek-V4-Flash (mxfp4)
 
-Same launcher with the `stacked-aiter-moe` preset (`SGLANG_FORCE_TRITON_MOE_FP8=0`). The mxfp4 routed experts use `aiter.fmoe_g1u1` directly (the 1-stage CK ASM kernel) — different code path than Pro mxfp4.
+Tested 2026-04-26: the default `Mxfp4MoEMethod` BF16-upcast path on this PR tree produces **garbage tokens** (` No! The? The? The?`) on Flash mxfp4. The fix is the same `SGLANG_MXFP4_AITER=1` packed-runtime path used for Pro mxfp4 — Flash's per-rank shapes (E=256, ipp=512, K=16) satisfy the cktile a16w4 shuffle constraints at TP=4 with no EP needed.
+
+Required env:
+- `SGLANG_MXFP4_AITER=1` — skip BF16 upcast, use aiter cktile a16w4 path with weight + scale shuffle and Swiglu activation. See [PRO_MXFP4_BRINGUP.md](PRO_MXFP4_BRINGUP.md) for the underlying mechanism.
+- `SGLANG_OPT_USE_OLD_COMPRESSOR=false` — the old compressor's `compress_extend_old` path has a known HIP IMA at `kv_and_score_states[req_pool_indices[i]]` (line 1070 of `models/deepseek_v4.py`).
+- `MODEL=/hf/DeepSeek-V4-Flash-srt` — `launch_dsv4.sh` accepts a `MODEL` env override (defaults to `/model` for backwards compat).
+
+Mount the parent HF dir so the relative symlinks in the `-srt` sibling resolve:
 
 ```bash
-GPUS=0,1,2,3 ... bash /sgl-pr/launch_dsv4.sh stacked-aiter-moe
+docker run -d --name sglang \
+  --device=/dev/kfd --device=/dev/dri --ipc=host --network=host --shm-size 64g \
+  --security-opt seccomp=unconfined --group-add video --group-add render --cap-add SYS_PTRACE \
+  -v /mnt/vast/john/huggingface:/hf \
+  -v /mnt/vast/john/sglang_v4_pr:/sgl-pr \
+  -v /mnt/vast/john/sglang_v4_pr_jitcache:/sgl-workspace/aiter/aiter/jit \
+  -e CUDA_VISIBLE_DEVICES=0,1,2,3 -e MODEL=/hf/DeepSeek-V4-Flash-srt \
+  -e SGLANG_MXFP4_AITER=1 -e SGLANG_OPT_USE_OLD_COMPRESSOR=false \
+  rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129 \
+  bash /sgl-pr/launch_dsv4.sh
 ```
+
+Greedy probe:
+
+```bash
+curl -s http://127.0.0.1:30010/v1/completions -H "Content-Type: application/json" \
+  -d '{"model":"DeepSeek-V4-Flash-srt","prompt":"Q: What is the capital of France? A:","max_tokens":15,"temperature":0}'
+# → " Paris. Q: What is the capital of Germany? A: Berlin."
+```
+
+Bench (c=1 OSL=1024, 4 prompts, greedy):
+
+| Metric | Value |
+|---|---:|
+| Output throughput | 4.02 tok/s |
+| Per-GPU (TP=4) | **1.00 tok/s/GPU** |
+| TPOT | 247.6 ms |
+| TTFT | 1208 ms |
+
+**Known limitation**: c≥4 (or any prefill batch with M ≥ 2048 tokens reaching MoE) crashes with HIP IMA at `compress_state.py:32` (`KVAndScoreOld.__getitem__`). The IMA fires inside the compressor's metadata gather, not the MoE — a separate, pre-existing PR-tree issue. Until that's fixed, run Flash mxfp4 at c=1 only or use Flash-Base for higher concurrency.
 
 ## DeepSeek-V4-Pro-Base (FP8 + FP8)
 

@@ -40,6 +40,7 @@ ulimit -c 0
 PRESET="${1:-stacked-best}"
 PORT="${PORT:-30010}"
 GPUS="${GPUS:-0,1,2,3}"
+MODEL="${MODEL:-/model}"
 
 # ───── Common (never changes) ────────────────────────────────────────────────
 export PYTHONPATH=/sgl-pr/python:${PYTHONPATH:-}
@@ -65,6 +66,10 @@ export SGLANG_DSV4_FP4_EXPERTS=false
 export SGLANG_OPT_DPSK_V4_RADIX=0
 export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=false
 export SGLANG_OPT_USE_FUSED_STORE_CACHE=false
+# Sparse MLA decode kernel.
+#   DSv4-Flash-Base (qk_head_dim=512): use Triton fallback in flashmla_tests/triton_sparse_decode_kernel.py
+#   DSv4-Pro V32 (qk_head_dim=576): use CK Tile FP8 (SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1, commit 6e86d00f2)
+# The CK V32 kernel hardcodes QK_HEAD_DIM=576 → asserts at runtime on Flash.
 export SGLANG_TRITON_SPARSE_DECODE=1
 
 export TORCHINDUCTOR_CACHE_DIR=/mnt/vast/john/rocm-dynamo/sglang/.inductor_cache_dsv4
@@ -157,7 +162,7 @@ export SGLANG_OPT_USE_TILELANG_MHC_POST="${SGLANG_OPT_USE_TILELANG_MHC_POST:-$_M
 # ───── Build CLI ─────────────────────────────────────────────────────────────
 CLI=(
   python3 -m sglang.launch_server
-  --model-path /model
+  --model-path "$MODEL"
   --trust-remote-code
   --tp 4
   --disable-radix-cache
