@@ -65,38 +65,44 @@ lds_load_bf16x8(const __bf16* p)
     return r;
 }
 
-// Decode 8 packed fp8_e4m3fnuz bytes (in two uint32_t lanes) to 8 bf16 values.
+// Decode 8 packed fp8 bytes (in two uint32_t lanes) to 8 bf16 values.
 // Uses the gfx950 native fp8->f32 hardware converter (`v_cvt_pk_f32_fp8`).
 //
-// CALIBRATION (verified by /tmp/_fp8_decode_probe.py on this gfx950 +
-// ROCm 7.0.0 + clang 20 stack): the HW intrinsic decodes the byte stream
-// with the e4m3*fn* exponent bias (=7), producing exactly 2x the value that
-// `torch.float8_e4m3fnuz.float()` returns (which uses bias=8). To match the
-// PyTorch native fnuz cast — which is what the FP32 oracle and the wrapper's
-// fp8 quantization agree on — we post-multiply by 0.5. Single VALU op per
-// 8 fp8 lanes; routed into the bf16 narrow as `f[i] * 0.5f`.
+// CALIBRATION (verified by `_fp8_decode_probe2.py` on gfx950):
+// `cvt_pk_f32_fp8` reads bytes with the **e4m3fn exponent bias (7)**,
+// matching `torch.float8_e4m3fn` exactly (0/256 mismatches). Bytes
+// representing `2^N` decode as `2^(N+1)` from the perspective of
+// `torch.float8_e4m3fnuz` (bias=8), i.e. 2× the fnuz value (252/256
+// mismatches).
 //
-// This is the SAME upstream-decoder bug TileLang's V32 port found and
-// documented (see `feedback_flydsl_mfma32_layout` peers and the V32 wrapper
-// SCALE_ONE_U8=126 workaround). Source-of-truth fix would be in LLVM's gfx950
-// fp8 codegen / hipcc routing; for the kernel-side workaround a 0.5 fold is
-// simplest and lossless because the compensation is in f32 before bf16
-// narrowing.
+// Caller-supplied `decode_scale` reconciles the storage format vs the
+// HW interpretation:
+//   * KV stored as `torch.float8_e4m3fn` (MI355X gfx950 default,
+//     `is_fp8_fnuz()=False`)         → decode_scale = **1.0** (no fold).
+//   * KV stored as `torch.float8_e4m3fnuz` (MI300X gfx942 default, or
+//     legacy testing setup that quantized as fnuz)
+//                                       → decode_scale = **0.5** (legacy
+//     value of `kFnuzBiasFix`; HW gives 2× fnuz, fold halves it).
+//
+// Symptom of using the wrong scale: kernel output has uniform magnitude
+// error (cos_sim still high but absolute scale 0.5× or 2× off). On
+// Flash 2604 (qk_head_dim=512) this surfaced as "London" instead of
+// "Paris" greedy probes — the residual addition + downstream RMSnorm
+// is sensitive to the absolute scale even though softmax is invariant.
 struct fp8x8_t { uint32_t v[2]; };  // 8 fp8 bytes
 __device__ __forceinline__ bf16x8_t
-fp8x8_decode_to_bf16x8(fp8x8_t in)
+fp8x8_decode_to_bf16x8(fp8x8_t in, float decode_scale)
 {
     float2_native lo0 = __builtin_amdgcn_cvt_pk_f32_fp8(in.v[0], false);
     float2_native hi0 = __builtin_amdgcn_cvt_pk_f32_fp8(in.v[0], true);
     float2_native lo1 = __builtin_amdgcn_cvt_pk_f32_fp8(in.v[1], false);
     float2_native hi1 = __builtin_amdgcn_cvt_pk_f32_fp8(in.v[1], true);
 
-    constexpr float kFnuzBiasFix = 0.5f;  // compensates HW bias=7 vs torch fnuz bias=8
     float f[8];
-    f[0] = lo0[0] * kFnuzBiasFix; f[1] = lo0[1] * kFnuzBiasFix;
-    f[2] = hi0[0] * kFnuzBiasFix; f[3] = hi0[1] * kFnuzBiasFix;
-    f[4] = lo1[0] * kFnuzBiasFix; f[5] = lo1[1] * kFnuzBiasFix;
-    f[6] = hi1[0] * kFnuzBiasFix; f[7] = hi1[1] * kFnuzBiasFix;
+    f[0] = lo0[0] * decode_scale; f[1] = lo0[1] * decode_scale;
+    f[2] = hi0[0] * decode_scale; f[3] = hi0[1] * decode_scale;
+    f[4] = lo1[0] * decode_scale; f[5] = lo1[1] * decode_scale;
+    f[6] = hi1[0] * decode_scale; f[7] = hi1[1] * decode_scale;
 
     bf16x8_t out;
     __bf16* outp = reinterpret_cast<__bf16*>(&out);
@@ -108,13 +114,17 @@ fp8x8_decode_to_bf16x8(fp8x8_t in)
 }
 
 struct MlaDecodeArgs {
-    const void* q_ptr; const void* kv_ptr;          // q: bf16, kv: fp8_e4m3fnuz
+    const void* q_ptr; const void* kv_ptr;          // q: bf16, kv: fp8_e4m3fn (gfx950) or fp8_e4m3fnuz (gfx942)
     float* split_data_ptr; float* split_lse_ptr;
     const int32_t* qo_indptr; const int32_t* kv_indptr; const int32_t* kv_indices;
     float sm_scale; int nhead; int num_kv_splits;
     int64_t stride_q_s, stride_q_h, stride_kv;       // stride_kv counted in fp8 bytes (per-row stride in bytes)
     int64_t stride_sd_s, stride_sd_split, stride_sd_h;
     int64_t stride_lse_s, stride_lse_split, stride_lse_h;
+    // FP8 decode scale: 1.0 if KV stored as torch.float8_e4m3fn (HW intrinsic
+    // matches storage, no fold needed); 0.5 if stored as fnuz (HW gives 2×
+    // fnuz value, fold halves it). See `fp8x8_decode_to_bf16x8` comment.
+    float fp8_decode_scale;
 };
 
 static constexpr int MFMA_HEADS  = 16;
@@ -197,6 +207,7 @@ load_kv_tile_fp8_to_lds(const MlaDecodeArgs& args, int tid, int kv_start, int s_
         // QK_HEAD_DIM=576 fp8 bytes per row).
         const uint32_t* src_row_fp8 = reinterpret_cast<const uint32_t*>(
             kv_base_fp8 + pidx * args.stride_kv);
+        const float decode_scale = args.fp8_decode_scale;
         #pragma unroll
         for (int k = 0; k < VECS_PER_THREAD; ++k) {
             int vc = ld_col_group + k * THREADS_PER_ROW;  // 0..71 bf16x8 column index
@@ -204,7 +215,7 @@ load_kv_tile_fp8_to_lds(const MlaDecodeArgs& args, int tid, int kv_start, int s_
             fp8x8_t fp8_in;
             fp8_in.v[0] = src_row_fp8[vc * 2 + 0];
             fp8_in.v[1] = src_row_fp8[vc * 2 + 1];
-            bf16x8_t bf = fp8x8_decode_to_bf16x8(fp8_in);
+            bf16x8_t bf = fp8x8_decode_to_bf16x8(fp8_in, decode_scale);
             dst_row[vc] = *reinterpret_cast<uint4*>(&bf);
         }
     } else {

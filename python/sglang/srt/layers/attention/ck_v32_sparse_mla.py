@@ -279,27 +279,29 @@ def ck_sparse_mla_decode_fp8_v32(
     device = q.device
     total_q = B * S_q
 
-    # Normalize KV pool to [num_pages, 1, 1, D] FP8 — accepts 2D, 3D, or 4D
-    # depending on how the caller materialized the cache. D matches q's last
-    # dim and the templated kernel dispatches on it inside the launcher.
+    # Normalize KV pool to a 2D view [num_slots, slot_stride] where slot_stride
+    # is the per-token stored stride. Production K cache stores 584 B/slot
+    # (nope=512 + rope=64 + scale=8) regardless of d_qk; the kernel reads only
+    # the first QK_HEAD_DIM bytes of each slot and walks rows via args.stride_kv.
+    # So slot_stride may exceed D (e.g., 584 ≥ 576 V32, 584 ≥ 512 Flash 2604).
     if k_cache.dim() == 2:
-        n_kv = k_cache.shape[0]
-        kv_view = k_cache.view(n_kv, 1, 1, D)
+        n_kv, slot_stride = k_cache.shape
+        kv_view = k_cache
     elif k_cache.dim() == 3:
         n_kv = k_cache.shape[0] * k_cache.shape[1]
-        kv_view = k_cache.view(n_kv, 1, 1, D)
+        slot_stride = k_cache.shape[-1]
+        kv_view = k_cache.reshape(n_kv, slot_stride)
     elif k_cache.dim() == 4:
-        if k_cache.shape[-1] == D:
-            kv_view = k_cache
-        else:
-            num_pages, page_size, h_kv, d = k_cache.shape
-            assert h_kv == 1 and d == D, (
-                f"k_cache last-2 dims {(h_kv, d)} mismatch q's d_qk={D}"
-            )
-            kv_view = k_cache.view(num_pages * page_size, 1, 1, D)
+        num_pages, page_size, h_kv, slot_stride = k_cache.shape
+        assert h_kv == 1, f"expected h_kv=1, got k_cache shape {tuple(k_cache.shape)}"
+        n_kv = num_pages * page_size
+        kv_view = k_cache.reshape(n_kv, slot_stride)
     else:
         raise AssertionError(f"unexpected k_cache shape: {tuple(k_cache.shape)}")
 
+    assert slot_stride >= D, (
+        f"k_cache slot stride {slot_stride} < q's d_qk={D}; kernel would read OOB"
+    )
     if not kv_view.is_contiguous():
         kv_view = kv_view.contiguous()
 
@@ -323,10 +325,30 @@ def ck_sparse_mla_decode_fp8_v32(
     )
 
     ck = _get_ck_mod()
+    # FP8 decode scale: the gfx950 `cvt_pk_f32_fp8` HW intrinsic decodes bytes
+    # with e4m3fn semantics (bias=7). When KV is stored as torch.float8_e4m3fn
+    # (the MI355X default — `is_fp8_fnuz()=False` on gfx950) the HW reading
+    # matches storage exactly, no fold needed → scale=1.0. When stored as
+    # fnuz (MI300X gfx942 default, bias=8), the HW gives 2× the fnuz value →
+    # scale=0.5 to fold back. Inspect the original-dtype tensor (k_cache may
+    # be reinterpreted as uint8 for the kernel call but k_cache_orig keeps
+    # the dtype info).
+    _kv_dtype = k_cache.dtype
+    if _kv_dtype == torch.uint8:
+        # Caller already reinterpreted as uint8; assume fn (MI355X / OCP standard).
+        # Pro V32 / Flash 2604 on MI355X both store as fp8_e4m3fn upstream.
+        fp8_decode_scale = 1.0
+    elif _kv_dtype == torch.float8_e4m3fn:
+        fp8_decode_scale = 1.0
+    elif hasattr(torch, "float8_e4m3fnuz") and _kv_dtype == torch.float8_e4m3fnuz:
+        fp8_decode_scale = 0.5
+    else:
+        # Unknown dtype — fall back to legacy 0.5 for backward compat.
+        fp8_decode_scale = 0.5
     ck.mla_decode_fwd_ck_sparse_fp8(
         q_2d, kv_view, split_data, split_lse,
         qo_indptr, kv_indptr, idx_flat,
-        float(sm_scale), int(num_splits),
+        float(sm_scale), int(num_splits), float(fp8_decode_scale),
     )
 
     if num_splits == 1:
