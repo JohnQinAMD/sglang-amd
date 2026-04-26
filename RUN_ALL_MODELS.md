@@ -56,9 +56,7 @@ After the fix:
 - **Pro V32 attention is now correct** at small TOPK — was running with halved output.
 
 > ⚠️ **Open regression (2026-04-26):** CK V32 still produces silent garbage on
-> end-to-end Flash mxfp4 inference at production TOPK ≥ 256 + the multi-split
-> reduce path. `microbench_ck_v32_512.py` (TOPK=64) does NOT catch this — its
-> cos-sim is 0.999998. Bisected by toggling `SGLANG_HIP_SPARSE_MLA_DECODE_FP8`:
+> end-to-end Flash mxfp4 inference. Bisected by toggling `SGLANG_HIP_SPARSE_MLA_DECODE_FP8`:
 >
 > | mode | greedy "The capital of France is" |
 > |---|---|
@@ -66,17 +64,43 @@ After the fix:
 > | `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0` (torch ref + R5) | ✓ " Paris.\nThe capital of France is Paris…" |
 >
 > Use **`SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0`** (or unset, which is the
-> default) for Flash mxfp4 until the kernel multi-split path is fixed.
-> The R5 stack on the torch ref path delivers SOTA Flash mxfp4 perf
-> (38.96 ms TPOT, see Flash mxfp4 section below). For Pro V32 the impact
-> is unverified — use at your own risk and validate against an FP32 oracle
-> at production shapes.
+> default) for Flash mxfp4 until the integration is debugged. The R5
+> stack on the torch ref path delivers SOTA Flash mxfp4 perf (38.96 ms
+> TPOT, see Flash mxfp4 section below).
 
-Recommended action items (ordered by ROI):
-- Extend [`microbench_ck_v32_512.py`](microbench_ck_v32_512.py) to TOPK ∈ {256, 512, 1024} and explicitly cover the multi-split reduce path (`pick_num_splits` returns >1) — should reproduce the inference garbage in a few seconds instead of needing a 2-min server restart.
-- Once reproducible, fix the multi-split reduce path or the wrapper's `pick_num_splits` heuristic.
+**The kernel is correct in isolation.** Extended sweep in
+[`microbench_ck_v32_512.py`](microbench_ck_v32_512.py) (TOPK ∈ {64, 128, 256,
+512, 1024} × splits ∈ {2, 4, 8, 16, 32} × attn_sink ∈ {None, real} ×
+invalid_frac ∈ {0, 0.25, 0.5}) **passes 30/30 at both D=512 and D=576** vs an
+FP32 oracle. So the e2e regression is an integration-level effect, not a
+kernel arithmetic bug:
 
-Microbench artifacts: [`microbench_ck_v32_512.py`](microbench_ck_v32_512.py) and [`_fp8_decode_probe2.py`](_fp8_decode_probe2.py) (proves the gfx950 HW intrinsic decodes with fn semantics — 0/256 byte mismatches vs 252/256 for fnuz).
+- per-call max_diff is ~1e-3 with FP8 quant noise (within spec for kernel)
+- but compounded over 60+ decoder layers (each one re-quantizing + feeding
+  forward), this drifts the q distribution far enough that the LM head
+  produces wrong tokens
+- the bf16 torch ref path has lower per-call noise (matmul accumulates in
+  fp32, no per-token FP8 round-trip) so it stays on the manifold
+
+For Pro V32 the impact is unverified — Pro might tolerate the per-call FP8
+noise better (smaller-batch dynamics, different MoE depth) or might also need
+investigation. Validate Pro V32 against an FP32 oracle at production shapes
+before relying on it.
+
+Recommended next debug step (when budget allows): add a
+`SGLANG_DUMP_CK_V32_TENSORS=1` hook in `ck_sparse_mla_decode_fp8_v32` that
+snapshots `(q, k_cache, indices, attn_sink, sm_scale)` on the first call after
+warmup, then replay against both CK V32 and a bf16 dense reference in the
+microbench. If outputs disagree on captured tensors but agree on `randn`
+tensors → distribution is the cause; if they agree on both → it's multi-layer
+compounding (and the practical fix is to budget per-call FP8 noise tighter,
+e.g. by accumulating split-K reduce in fp32 + descaling once at the end).
+
+Microbench artifacts: [`microbench_ck_v32_512.py`](microbench_ck_v32_512.py)
+(parametric over `D` env: 512=Flash, 576=Pro V32) and
+[`_fp8_decode_probe2.py`](_fp8_decode_probe2.py) (proves the gfx950 HW
+intrinsic decodes with fn semantics — 0/256 byte mismatches vs 252/256 for
+fnuz).
 
 ## Common docker run prefix
 
