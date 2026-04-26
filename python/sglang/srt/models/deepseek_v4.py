@@ -327,6 +327,13 @@ class Compressor(nn.Module):
             self.ape.data.copy_(ape.view(self.ratio, -1))
             # ============================================================================
 
+    # Pre-allocated cap for eager scratch (covers chunked_prefill_size + slack).
+    # Setting this larger than any expected prefill batch ensures the eager
+    # scratch never grows after first alloc — preventing the freed-storage
+    # reuse race with captured-graph slabs (HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION)
+    # described at lines 280-292.
+    _EAGER_SCRATCH_MAX_ROWS = 16384
+
     def _ensure_scratch(
         self, name, shape, dtype, device, grow_dim_0_only=True,
     ) -> torch.Tensor:
@@ -334,7 +341,12 @@ class Compressor(nn.Module):
 
         Capture phase (`is_current_stream_capturing()`) → `_scratch_captured`,
         which is allocated lazily and never reassigned thereafter. Eager
-        calls → `_scratch_eager`, free to grow.
+        calls → `_scratch_eager`, **preallocated at `_EAGER_SCRATCH_MAX_ROWS`
+        on first alloc** so it never grows afterward. Without this cap, the
+        first eager prefill after capture could grow the scratch and free
+        its old storage back into the caching allocator, where it can
+        collide with addresses captured graphs are still using → IMA on
+        replay (compress_extend_old:1070 fancy-index symptom).
 
         `grow_dim_0_only=True` (default): the backing tensor's dim 0 is the
         only one allowed to grow; trailing dims must match exactly. The
@@ -367,6 +379,11 @@ class Compressor(nn.Module):
                     new_rows = max(cur.shape[0], target[0])
                 else:
                     new_rows = target[0]
+                # Eager scratch: pre-pay the max size so we never realloc
+                # after the first call. Captured scratch keeps lazy growth
+                # since capture happens at fixed bs.
+                if scratch is self._scratch_eager:
+                    new_rows = max(new_rows, self._EAGER_SCRATCH_MAX_ROWS)
                 scratch[name] = torch.empty(
                     (new_rows,) + target[1:], dtype=dtype, device=device,
                 )

@@ -67,9 +67,21 @@ export SGLANG_OPT_DPSK_V4_RADIX=0
 export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=false
 export SGLANG_OPT_USE_FUSED_STORE_CACHE=false
 # Sparse MLA decode kernel.
-#   DSv4-Flash-Base (qk_head_dim=512): use Triton fallback in flashmla_tests/triton_sparse_decode_kernel.py
-#   DSv4-Pro V32 (qk_head_dim=576): use CK Tile FP8 (SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1, commit 6e86d00f2)
-# The CK V32 kernel hardcodes QK_HEAD_DIM=576 → asserts at runtime on Flash.
+#   DSv4-Flash-Base (qk_head_dim=512): use torch ref + R5 stack (gather-first
+#     dequant + Triton fusion + bf16 inner BMM); enable
+#     `SGLANG_TRITON_SPARSE_DECODE=1` to route through the Triton sparse-decode
+#     kernel, otherwise the torch-compile path runs.
+#   DSv4-Pro V32 (qk_head_dim=576): use CK Tile FP8 via
+#     `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1` (commit 6e86d00f2).
+#
+# WARNING: as of 2026-04-26 the CK V32 kernel produces garbage on end-to-end
+# Flash mxfp4 inference at production TOPK ≥ 256 + multi-split reduce path
+# (microbench_ck_v32_512.py uses TOPK=64 / num_splits=1 and reports cos-sim
+# 0.999998, which masks the bug). Until that's fixed, DO NOT set
+# `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1` for Flash mxfp4 — the launcher leaves
+# it unset by default; the working SOTA path (38.96 ms TPOT) is
+# `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0` (or unset) + the R5 + HIP-routing
+# patches in this commit.
 export SGLANG_TRITON_SPARSE_DECODE=1
 
 export TORCHINDUCTOR_CACHE_DIR=/mnt/vast/john/rocm-dynamo/sglang/.inductor_cache_dsv4
