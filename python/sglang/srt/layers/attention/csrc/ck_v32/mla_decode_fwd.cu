@@ -20,13 +20,23 @@ static void launch_one(
     torch::Tensor kv_indptr,
     torch::Tensor kv_indices,
     float sm_scale,
-    int num_kv_splits)
+    int num_kv_splits,
+    float fp8_decode_scale)
 {
     const int batch = qo_indptr.size(0) - 1;
     const int nhead = q.size(1);
     const int num_head_groups = (nhead + TILE_HEADS - 1) / TILE_HEADS;
 
-    auto kv_flat = kv_buffer.reshape({-1, QK_HEAD_DIM_T});
+    // Reshape KV buffer to 2D [num_slots, slot_stride]. slot_stride is the
+    // per-token stored width (may exceed QK_HEAD_DIM_T — production stores
+    // 584 B/slot for nope+rope+scale). The kernel reads only the first
+    // QK_HEAD_DIM_T fp8 bytes per slot and walks slots via stride_kv.
+    const int64_t slot_stride = kv_buffer.size(-1);
+    TORCH_CHECK(slot_stride >= QK_HEAD_DIM_T,
+                "kv_buffer slot stride ", slot_stride,
+                " < QK_HEAD_DIM=", QK_HEAD_DIM_T);
+    const int64_t n_slots = kv_buffer.numel() / slot_stride;
+    auto kv_flat = kv_buffer.reshape({n_slots, slot_stride});
 
     MlaDecodeArgs args;
     args.q_ptr           = q.data_ptr();
@@ -50,6 +60,7 @@ static void launch_one(
     args.stride_lse_s    = split_lse.stride(0);
     args.stride_lse_split = split_lse.stride(1);
     args.stride_lse_h    = split_lse.stride(2);
+    args.fp8_decode_scale = fp8_decode_scale;
 
     dim3 grid(batch, num_head_groups, num_kv_splits);
     dim3 block(BLOCK_SIZE);
@@ -64,14 +75,15 @@ static void launch_one(
 
 void mla_decode_fwd_launch(
     torch::Tensor q,            // bf16 [total_q, nhead, qk_head_dim]
-    torch::Tensor kv_buffer,    // fp8_e4m3fnuz [num_page, ..., qk_head_dim]
+    torch::Tensor kv_buffer,    // fp8 (e4m3fn on gfx950, e4m3fnuz on gfx942)
     torch::Tensor split_data,
     torch::Tensor split_lse,
     torch::Tensor qo_indptr,
     torch::Tensor kv_indptr,
     torch::Tensor kv_indices,
     float sm_scale,
-    int num_kv_splits)
+    int num_kv_splits,
+    float fp8_decode_scale = 0.5f)
 {
     // Runtime dispatch on q's last dim. Both DSv4 attention shapes are
     // bundled in the same kernel module — V32 (576) and Flash-Base 2604
@@ -81,11 +93,11 @@ void mla_decode_fwd_launch(
     if (qk_head_dim == 576) {
         launch_one<576>(q, kv_buffer, split_data, split_lse,
                         qo_indptr, kv_indptr, kv_indices,
-                        sm_scale, num_kv_splits);
+                        sm_scale, num_kv_splits, fp8_decode_scale);
     } else if (qk_head_dim == 512) {
         launch_one<512>(q, kv_buffer, split_data, split_lse,
                         qo_indptr, kv_indptr, kv_indices,
-                        sm_scale, num_kv_splits);
+                        sm_scale, num_kv_splits, fp8_decode_scale);
     } else {
         TORCH_CHECK(false,
             "CK V32 sparse MLA: unsupported q_head_dim ", qk_head_dim,
@@ -102,5 +114,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("q"), py::arg("kv_buffer"),
           py::arg("split_data"), py::arg("split_lse"),
           py::arg("qo_indptr"), py::arg("kv_indptr"), py::arg("kv_indices"),
-          py::arg("sm_scale"), py::arg("num_kv_splits"));
+          py::arg("sm_scale"), py::arg("num_kv_splits"),
+          py::arg("fp8_decode_scale") = 0.5f);
 }
