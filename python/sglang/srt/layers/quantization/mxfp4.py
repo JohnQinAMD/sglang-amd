@@ -66,7 +66,18 @@ def _use_aiter_mxfp4_packed() -> bool:
     Packed footprint is ~97 GB / rank.
     """
     import os
-    return os.environ.get("SGLANG_MXFP4_AITER", "0") == "1"
+    return os.environ.get("SGLANG_MXFP4_AITER", "0") == "1" or _use_flydsl_mxfp4()
+
+
+def _use_flydsl_mxfp4() -> bool:
+    """Route apply() to FlyDSL mxfp4 stage1+stage2 (bypasses aiter wrapper chain).
+
+    Requires the FlyDSL wheel and aiter.ops.flydsl module installed in the
+    container. Microbench at M=1 hidden=4096 ipp=512 E=256 topk=6 gives
+    cos=0.96 vs bf16 ref and ~124 us per call (vs ~5 ms/layer for cktile).
+    """
+    import os
+    return os.environ.get("SGLANG_MXFP4_FLYDSL", "0") == "1"
 
 
 if is_flashinfer_available():
@@ -591,6 +602,51 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.w2_weight_triton_tensor = w2_weight
             del layer.w13_weight
             del layer.w2_weight
+        elif _use_flydsl_mxfp4():
+            # FlyDSL packed mxfp4 path. Differs from cktile a16w4 layout:
+            #   w13: shuffle_weight((16,16))  + e8m0_shuffle scale
+            #   w2:  shuffle_weight_a16w4(_, 16, False) + shuffle_scale_a16w4
+            # apply() routes to flydsl_moe_stage1+stage2 directly (no aiter wrapper).
+            from aiter.ops.shuffle import (
+                shuffle_scale_a16w4,
+                shuffle_weight,
+                shuffle_weight_a16w4,
+            )
+            from aiter.utility.fp4_utils import e8m0_shuffle
+            from aiter.utility import dtypes as aiter_dtypes
+
+            E, w13_N, _ = layer.w13_weight.shape
+            _, _, w13_K_blocks = layer.w13_weight_scale.shape
+            _, w2_N, _ = layer.w2_weight.shape
+            _, _, w2_K_blocks = layer.w2_weight_scale.shape
+
+            w13 = shuffle_weight(layer.w13_weight.data.contiguous(), (16, 16))
+            w13.is_shuffled = True
+            w13_s_2d = layer.w13_weight_scale.data.contiguous().view(
+                E * w13_N, w13_K_blocks
+            )
+            w13_scale = e8m0_shuffle(w13_s_2d).view(E, w13_N, w13_K_blocks)
+
+            w2 = shuffle_weight_a16w4(
+                layer.w2_weight.data.contiguous(), 16, gate_up=False
+            )
+            w2.is_shuffled = True
+            w2_scale = shuffle_scale_a16w4(
+                layer.w2_weight_scale.data.contiguous().view(E * w2_N, w2_K_blocks),
+                E,
+                gate_up=False,
+            )
+
+            layer.w13_weight = Parameter(w13.view(aiter_dtypes.fp4x2), requires_grad=False)
+            layer.w2_weight = Parameter(w2.view(aiter_dtypes.fp4x2), requires_grad=False)
+            layer.w13_weight_scale = Parameter(
+                w13_scale.view(aiter_dtypes.fp8_e8m0), requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                w2_scale.view(aiter_dtypes.fp8_e8m0), requires_grad=False
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
         elif _use_aiter_mxfp4_packed():
             # Microbench-validated: a16w4 shuffle (weights + scales) +
             # Swiglu activation hits cos=0.97 vs bf16 reference. The other
@@ -751,6 +807,75 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 output=symm_output,
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
+
+        if _use_flydsl_mxfp4():
+            from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+                deepseek_v4_moe_code_path_checker,
+            )
+            from aiter.fused_moe import moe_sorting as aiter_moe_sorting
+            from aiter.utility.fp4_utils import moe_mxfp4_sort
+            from aiter.ops.triton.quant import dynamic_mxfp4_quant as triton_mxfp4_quant
+            from aiter.ops.flydsl.moe_kernels import (
+                flydsl_moe_stage1,
+                flydsl_moe_stage2,
+            )
+
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "SGLANG_MXFP4_FLYDSL requires Standard TopK output format"
+            )
+            topk_weights = topk_output.topk_weights.to(torch.float32)
+            topk_ids = topk_output.topk_ids
+            disp = getattr(layer, "dispatcher", None)
+            if disp is not None and getattr(disp, "local_expert_mapping", None) is not None:
+                lem = disp.local_expert_mapping
+                local_ids = lem[topk_ids]
+                non_local = local_ids < 0
+                topk_weights = torch.where(
+                    non_local, torch.zeros_like(topk_weights), topk_weights
+                )
+                topk_ids = torch.where(
+                    non_local, torch.zeros_like(local_ids), local_ids
+                )
+
+            E = layer.w13_weight.shape[0]
+            tokens, hidden = x.shape
+            top_k = topk_ids.shape[1]
+
+            # Triton dynamic mxfp4 quant is capture-safe (no host sync).
+            a1_qt, a1_scale = triton_mxfp4_quant(x)
+            sid, sw, sei, nvi, _ = aiter_moe_sorting(
+                topk_ids, topk_weights, E, hidden, x.dtype, 32
+            )
+            a1_scale_sort = moe_mxfp4_sort(
+                a1_scale[:tokens].view(tokens, 1, -1),
+                sorted_ids=sid, num_valid_ids=nvi,
+                token_num=tokens, block_size=32,
+            )
+
+            stage1_ret = flydsl_moe_stage1(
+                a1_qt, layer.w13_weight, sid, sei, nvi, None, top_k,
+                tile_m=32, tile_n=64, tile_k=256,
+                a_dtype="fp4", b_dtype="fp4", out_dtype="fp4",
+                act="silu",
+                w1_scale=layer.w13_weight_scale,
+                a1_scale=a1_scale_sort,
+                sorted_weights=None,
+                persist_m=0, waves_per_eu=3, b_nt=2,
+            )
+            a2_qt, a2_scale_sort = stage1_ret
+
+            out_buf = torch.zeros((tokens, hidden), dtype=x.dtype, device=x.device)
+            output = flydsl_moe_stage2(
+                a2_qt, layer.w2_weight, sid, sei, nvi, out_buf, top_k,
+                tile_m=32, tile_n=256, tile_k=256,
+                a_dtype="fp4", b_dtype="fp4", out_dtype="bf16",
+                mode="atomic", persist=True,
+                w2_scale=layer.w2_weight_scale,
+                a2_scale=a2_scale_sort,
+                sorted_weights=sw,
+            )
+            deepseek_v4_moe_code_path_checker.observed += 1
+            return StandardCombineInput(hidden_states=output)
 
         if _use_aiter_mxfp4_packed():
             from sglang.srt.debug_utils.deepseek_v4_debug_utils import (

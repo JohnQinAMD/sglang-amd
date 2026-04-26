@@ -10,19 +10,20 @@ Single launcher per model. All assume:
 
 ## Quick reference
 
-| Model | Params | Quant scheme | TP / EP | Launcher | Per-GPU best |
-|---|---:|---|---:|---|---:|
 | Model | Params | Quant scheme | TP / EP | Launcher | Per-GPU best (measured) |
 |---|---:|---|---:|---|---:|
-| DeepSeek-V4-Flash-Base | ~285 B | FP8 attn + FP8 experts | TP=4 | [`launch_dsv4.sh`](launch_dsv4.sh) | see RUN_ON_AMD_MI355X.md |
-| DeepSeek-V4-Flash (mxfp4) | ~285 B | FP8 attn + mxfp4 experts | TP=4 | [`launch_dsv4.sh`](launch_dsv4.sh) + 2 env knobs | 1.00 tok/s/GPU (c=1 OSL=1024) † |
+| DeepSeek-V4-Flash-Base | ~285 B | FP8 attn + FP8 experts | TP=4 | [`launch_dsv4.sh`](launch_dsv4.sh) | 2.15 tok/s/GPU (c=1 OSL=1024) |
+| DeepSeek-V4-Flash (mxfp4 cktile) | ~285 B | FP8 attn + mxfp4 experts | TP=4 | [`launch_dsv4.sh`](launch_dsv4.sh) + `SGLANG_MXFP4_AITER=1` | 1.00 tok/s/GPU (c=1 OSL=1024) |
+| **DeepSeek-V4-Flash (mxfp4 FlyDSL)** | ~285 B | FP8 attn + mxfp4 experts | TP=4 | + `SGLANG_MXFP4_FLYDSL=1` (needs FlyDSL wheel) | **4.85 tok/s/GPU** (c=1 OSL=1024) |
 | DeepSeek-V4-Pro-Base | ~671 B | FP8 attn + FP8 experts | TP=8 | [`launch_dsv4_pro_base.sh`](launch_dsv4_pro_base.sh) | **6.51 tok/s/GPU** (c=8 OSL=1024) |
 | DeepSeek-V4-Pro (mxfp4) | ~671 B | FP8 attn + mxfp4 experts | TP=8 EP=8 | [`launch_dsv4_pro_mxfp4.sh`](launch_dsv4_pro_mxfp4.sh) | 4.45 tok/s/GPU (c=8 OSL=1024) |
 
-† Flash mxfp4 c=1 only. c≥4 prefill batches (M ≥ 2048 tokens to MoE) hit a pre-existing HIP IMA in `compress_state.__getitem__` (compressor metadata path) — orthogonal to mxfp4. See "Flash mxfp4" section below.
+c=1 OSL=1024 num_prompts=10 warmup=2, ISL=1024 random, greedy.
+**Flash mxfp4 FlyDSL is currently the fastest per-GPU AMD path for the Flash family** — 2.27× faster than the FP8 baseline on the same hardware, because mxfp4's 4-bit weights halve the HBM read at decode time and FlyDSL is hand-tuned for gfx950.
 
 Recommended production targets:
-- 4-GPU node: **Flash-Base** (fastest, smallest footprint, no compressor IMA)
+- 4-GPU node, low concurrency: **Flash mxfp4 FlyDSL** (fastest path, beats FP8 at c=1)
+- 4-GPU node, high concurrency: **Flash-Base FP8** (mxfp4 c≥4 prefill hits a pre-existing compressor IMA, orthogonal to mxfp4)
 - 8-GPU node: **Pro-Base** (Pro-mxfp4 is functional but slower; use Pro-Base unless you specifically need the mxfp4 ckpt)
 
 ## Common docker run prefix
@@ -102,6 +103,70 @@ Bench (c=1 OSL=1024, 4 prompts, greedy):
 | TTFT | 1208 ms |
 
 **Known limitation**: c≥4 (or any prefill batch with M ≥ 2048 tokens reaching MoE) crashes with HIP IMA at `compress_state.py:32` (`KVAndScoreOld.__getitem__`). The IMA fires inside the compressor's metadata gather, not the MoE — a separate, pre-existing PR-tree issue. Until that's fixed, run Flash mxfp4 at c=1 only or use Flash-Base for higher concurrency.
+
+### FlyDSL (much faster — 4.86× over cktile, 2.27× over FP8)
+
+`SGLANG_MXFP4_FLYDSL=1` replaces the cktile `aiter.fused_moe` wrapper chain with a direct call to `flydsl_moe_stage1` + `flydsl_moe_stage2` (gfx950-tuned FP4 GEMM kernels). Bypasses the `fused_moe_2stages` Python overhead entirely. Fused-quant in stage1 outputs FP4 + sorted scale ready for stage2, so no intermediate dequant.
+
+Setup (one-time):
+
+```bash
+# 1. Install FlyDSL wheel (must be exactly 0.1.3.1 — version check is strict)
+docker exec sglang bash -c '
+  curl -fSL -o /tmp/flydsl-0.1.3.1+20260418.68f5725-cp310-cp310-manylinux_2_35_x86_64.whl \
+    https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/flydsl-0.1.3.1%2B20260418.68f5725-cp310-cp310-manylinux_2_35_x86_64.whl
+  pip install /tmp/flydsl-0.1.3.1+20260418.68f5725-cp310-cp310-manylinux_2_35_x86_64.whl
+'
+
+# 2. Drop in aiter.ops.flydsl module from the rocm-dynamo aiter-amd workspace
+docker exec sglang cp -r /flydsl_src /sgl-workspace/aiter/aiter/ops/flydsl
+# (mount /mnt/vast/john/rocm-dynamo/aiter-amd/aiter/ops/flydsl as /flydsl_src in docker run)
+
+# 3. Verify
+docker exec sglang python3 -c "
+from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+print('available:', is_flydsl_available())
+"
+```
+
+Run with `SGLANG_MXFP4_FLYDSL=1`:
+
+```bash
+docker run -d --name sglang \
+  --device=/dev/kfd --device=/dev/dri --ipc=host --network=host --shm-size 64g \
+  --security-opt seccomp=unconfined --group-add video --group-add render --cap-add SYS_PTRACE \
+  -v /mnt/vast/john/huggingface:/hf \
+  -v /mnt/vast/john/sglang_v4_pr:/sgl-pr \
+  -v /mnt/vast/john/sglang_v4_pr_jitcache:/sgl-workspace/aiter/aiter/jit \
+  -v /mnt/vast/john/rocm-dynamo/aiter-amd/aiter/ops/flydsl:/flydsl_src \
+  -e CUDA_VISIBLE_DEVICES=0,1,2,3 -e MODEL=/hf/DeepSeek-V4-Flash-srt \
+  -e SGLANG_MXFP4_FLYDSL=1 -e SGLANG_OPT_USE_OLD_COMPRESSOR=false \
+  rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129 \
+  bash /flydsl_setup/launch_with_flydsl.sh   # see flydsl_setup/launch_with_flydsl.sh in this tree
+```
+
+Greedy probe:
+
+```bash
+# → " Paris. Q: What is the capital of Germany? A: Berlin."
+```
+
+Bench (c=1 OSL=1024 num=10 warmup=2, greedy):
+
+| Metric | cktile (old) | **FlyDSL (new)** | improvement |
+|---|---:|---:|---:|
+| Output throughput | 3.95 tok/s | **19.40 tok/s** | **4.91×** |
+| Per-GPU (TP=4) | 1.00 | **4.85 tok/s/GPU** | 4.85× |
+| TPOT | 250.7 ms | **50.94 ms** | 4.92× |
+| TTFT | 712 ms | 427 ms | 1.67× |
+
+**FlyDSL Flash mxfp4 (50.94 ms TPOT) is 2.27× faster than Flash-Base FP8 (115.4 ms TPOT)** on identical hardware — finally realizes the bandwidth advantage of 4-bit weights at c=1 decode.
+
+Implementation notes (see [`mxfp4.py:_use_flydsl_mxfp4`](python/sglang/srt/layers/quantization/mxfp4.py)):
+- Pre-shuffle weights at load: `shuffle_weight((16,16))` for w13, `shuffle_weight_a16w4(_,16,False)` for w2; `e8m0_shuffle` for w13 scale, `shuffle_scale_a16w4` for w2 scale.
+- A-side mxfp4 quant per call: `aiter.ops.triton.quant.dynamic_mxfp4_quant` (capture-safe; the `aiter.get_torch_quant` `.f32_to_e8m0` path uses an indexed assign that fails under cuda graph capture).
+- Microbench-validated cos=0.96 vs BF16 reference at M=1.
 
 ## DeepSeek-V4-Pro-Base (FP8 + FP8)
 
