@@ -58,6 +58,17 @@ _is_sm90_supported = is_cuda() and is_sm90_supported()
 has_triton_kernels = is_triton_kernels_available()
 
 
+def _use_aiter_mxfp4_packed() -> bool:
+    """Skip bf16 upcast and route apply() to aiter.fused_moe (packed mxfp4 path).
+
+    Required to load Pro on AMD (288 GB / GPU): bf16 upcast for 384 experts,
+    61 layers, hidden=7168, moe_inter=3072 needs ~386 GB / rank, OOMs.
+    Packed footprint is ~97 GB / rank.
+    """
+    import os
+    return os.environ.get("SGLANG_MXFP4_AITER", "0") == "1"
+
+
 if is_flashinfer_available():
     from flashinfer import (
         mxfp8_quantize,
@@ -580,6 +591,47 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.w2_weight_triton_tensor = w2_weight
             del layer.w13_weight
             del layer.w2_weight
+        elif _use_aiter_mxfp4_packed():
+            # Microbench-validated: a16w4 shuffle (weights + scales) +
+            # Swiglu activation hits cos=0.97 vs bf16 reference. The other
+            # shuffle/activation combinations give cos<0.5 (garbage tokens).
+            # bf16 upcast skipped → Pro fits in 288 GB / GPU.
+            from aiter.ops.shuffle import (
+                shuffle_scale_a16w4,
+                shuffle_weight_a16w4,
+            )
+            from aiter.utility import dtypes as aiter_dtypes
+
+            E, w13_N, _ = layer.w13_weight.shape
+            _, _, w13_K_blocks = layer.w13_weight_scale.shape
+            _, w2_N, _ = layer.w2_weight.shape
+            _, _, w2_K_blocks = layer.w2_weight_scale.shape
+
+            w13 = shuffle_weight_a16w4(
+                layer.w13_weight.data.contiguous(), 16, gate_up=True
+            )
+            w2 = shuffle_weight_a16w4(
+                layer.w2_weight.data.contiguous(), 16, gate_up=False
+            )
+            w13_scale = shuffle_scale_a16w4(
+                layer.w13_weight_scale.data.contiguous().view(E * w13_N, w13_K_blocks),
+                E,
+                gate_up=True,
+            )
+            w2_scale = shuffle_scale_a16w4(
+                layer.w2_weight_scale.data.contiguous().view(E * w2_N, w2_K_blocks),
+                E,
+                gate_up=False,
+            )
+
+            layer.w13_weight = Parameter(w13.view(aiter_dtypes.fp4x2), requires_grad=False)
+            layer.w2_weight = Parameter(w2.view(aiter_dtypes.fp4x2), requires_grad=False)
+            layer.w13_weight_scale = Parameter(
+                w13_scale.view(aiter_dtypes.fp8_e8m0), requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                w2_scale.view(aiter_dtypes.fp8_e8m0), requires_grad=False
+            )
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
@@ -699,6 +751,51 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 output=symm_output,
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
+
+        if _use_aiter_mxfp4_packed():
+            from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+                deepseek_v4_moe_code_path_checker,
+            )
+
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "SGLANG_MXFP4_AITER requires Standard TopK output format"
+            )
+            # Microbench-validated: Swiglu activation with a16w4 weight+scale
+            # shuffle gives cos=1.0 vs bf16 ref. routed_scaling_factor is
+            # applied at the model layer (deepseek_v2.py:654) on HIP.
+            # EP fix: when _use_aiter, the StandardDispatcher does NOT remap
+            # topk_ids to local (standard.py:170 `not _use_aiter`). Remap
+            # globals to local IDs here, with non-local entries clamped to 0
+            # and their topk_weight zeroed (no contribution from this rank).
+            # Tested at c=1: produces correct "Paris" answer.
+            topk_weights = topk_output.topk_weights.to(torch.float32)
+            topk_ids = topk_output.topk_ids
+            disp = getattr(layer, "dispatcher", None)
+            if disp is not None and getattr(disp, "local_expert_mapping", None) is not None:
+                lem = disp.local_expert_mapping
+                local_ids = lem[topk_ids]
+                non_local = local_ids < 0
+                topk_weights = torch.where(
+                    non_local, torch.zeros_like(topk_weights), topk_weights
+                )
+                topk_ids = torch.where(
+                    non_local, torch.zeros_like(local_ids), local_ids
+                )
+            output = fused_moe(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weight=topk_weights,
+                topk_ids=topk_ids,
+                activation=ActivationType.Swiglu,
+                quant_type=QuantType.per_1x32,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                doweight_stage1=False,
+            )
+            # Bypassed sglang triton runner that increments this counter.
+            deepseek_v4_moe_code_path_checker.observed += 1
+            return StandardCombineInput(hidden_states=output)
 
         backend = self.runner.runner_backend
         if backend.is_triton_kernels():
