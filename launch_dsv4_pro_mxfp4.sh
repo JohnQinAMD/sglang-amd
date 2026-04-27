@@ -93,4 +93,5 @@ exec python3 -m sglang.launch_server \
   --skip-server-warmup --watchdog-timeout 1800 \
   --tp 8 --ep-size 8 --cuda-graph-bs $CUDA_GRAPH_BS \
   --num-continuous-decode-steps "${NUM_DECODE_STEPS:-1}" \
+  ${ENABLE_PIECEWISE_CG:+--enable-piecewise-cuda-graph} \
   --context-length "$CONTEXT_LEN" --port "$PORT"

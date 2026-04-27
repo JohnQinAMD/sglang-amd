@@ -27,6 +27,28 @@ _PRO_BASE_ROUTER_OVERRIDE = {
     "matrix_instr_nonkdim": 32,
     "kpack": 1,
 }
+
+# Hand-tuned config for Pro-Base routed-MoE router gemm at PREFILL shape
+# (M>256 → goes through gemm_a16w16, NOT atomic). aiter default
+# (BLOCK_M=256, BLOCK_N=256) over-tiles N=384; microbench shows 2.41×
+# speedup with (BLOCK_M=128, BLOCK_N=128, GROUP_M=4) for the
+# (M=8192, N=384, K=7168) shape.
+_PRO_PREFILL_ROUTER_OVERRIDE = {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 4,
+    "cache_modifier": None,
+    "num_warps": 8,
+    "num_stages": 2,
+    "waves_per_eu": 2,
+    "matrix_instr_nonkdim": 32,
+    "kpack": 1,
+    "NUM_KSPLIT": 1,
+    "SPLITK_BLOCK_SIZE": 7168,
+}
+
+
 def aiter_dsv3_router_gemm(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -58,7 +80,15 @@ def aiter_dsv3_router_gemm(
             hidden_states, weight, y=y, config=cfg
         ).to(hidden_states.dtype)
     else:
-        logits = gemm_a16w16(hidden_states, weight)
+        # Prefill router gemm (M > 256). Same Pro shape (N=384, K=7168). aiter
+        # default config (BLOCK_M=256, BLOCK_N=256) over-tiles N=384; the
+        # microbench-tuned override below is 2.41× faster on (M=8192, N=384, K=7168).
+        cfg = (
+            _PRO_PREFILL_ROUTER_OVERRIDE
+            if (N == 384 and K == 7168)
+            else None
+        )
+        logits = gemm_a16w16(hidden_states, weight, config=cfg)
 
     return logits
 
