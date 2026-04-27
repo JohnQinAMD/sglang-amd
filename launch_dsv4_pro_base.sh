@@ -59,6 +59,10 @@ export SGLANG_TOPK_TRANSFORM_512_TORCH=0
 # R3 aiter MQA logits wrapper.
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=0
 export SGLANG_FP8_PAGED_MQA_LOGITS_AITER=1
+# Opt out of the fused-triton default — on Pro-Base shapes the aiter
+# `_deepgemm_fp8_paged_mqa_logits` (240 ms / call) beats fused-triton
+# (876 ms / call). See profile compare in dsv4-bottleneck-analysis.md.
+export SGLANG_FP8_PAGED_MQA_LOGITS_FUSED_TRITON=0
 export SGLANG_DSV4_FP4_EXPERTS=false
 export SGLANG_OPT_DPSK_V4_RADIX=0
 export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=false
@@ -84,5 +88,6 @@ exec python3 -m sglang.launch_server \
   --host 0.0.0.0 --disable-shared-experts-fusion \
   --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
   --skip-server-warmup --watchdog-timeout 1800 \
-  --tp 8 --cuda-graph-bs $CUDA_GRAPH_BS \
+  --tp 8 ${EP_SIZE:+--ep-size $EP_SIZE} --cuda-graph-bs $CUDA_GRAPH_BS \
+  --num-continuous-decode-steps "${NUM_DECODE_STEPS:-1}" \
   --context-length "$CONTEXT_LEN" --port "$PORT"
