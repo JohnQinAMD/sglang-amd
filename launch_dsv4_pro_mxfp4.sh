@@ -62,6 +62,10 @@ export SGLANG_USE_ROCM700A=1
 export SGLANG_TOPK_TRANSFORM_512_TORCH=0
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=0
 export SGLANG_FP8_PAGED_MQA_LOGITS_AITER=1
+# Opt out of the fused-triton default — on Pro shapes the aiter
+# `_deepgemm_fp8_paged_mqa_logits` (240 ms / call) beats fused-triton
+# (876 ms / call). See dsv4-bottleneck-analysis.md.
+export SGLANG_FP8_PAGED_MQA_LOGITS_FUSED_TRITON=0
 export SGLANG_DSV4_FP4_EXPERTS=false
 export SGLANG_OPT_DPSK_V4_RADIX=0
 export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=false
@@ -88,4 +92,6 @@ exec python3 -m sglang.launch_server \
   --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
   --skip-server-warmup --watchdog-timeout 1800 \
   --tp 8 --ep-size 8 --cuda-graph-bs $CUDA_GRAPH_BS \
+  --num-continuous-decode-steps "${NUM_DECODE_STEPS:-1}" \
+  ${ENABLE_PIECEWISE_CG:+--enable-piecewise-cuda-graph} \
   --context-length "$CONTEXT_LEN" --port "$PORT"
