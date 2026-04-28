@@ -2,7 +2,7 @@
 
 Single launcher per model. All assume:
 
-- Container: `rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129`
+- Container: `rocm/sgl-dev:rocm720-deepseek-v4-mi35x`
 - PR tree: `/mnt/vast/john/sglang_v4_pr` (branch `rocm-deepseek-v4`)
 - HF root: `/mnt/vast/john/huggingface`
 - JIT cache: `/mnt/vast/john/sglang_v4_pr_jitcache`
@@ -55,32 +55,44 @@ After the fix:
 - CK V32 numerically matches reference at TOPK=64 / num_splits=1 (max_diff 1.34e-3 vs 1.82e-2 before).
 - **Pro V32 attention is now correct** at small TOPK — was running with halved output.
 
-> ⚠️ **Open regression (2026-04-26):** CK V32 still produces silent garbage on
-> end-to-end Flash mxfp4 inference. Bisected by toggling `SGLANG_HIP_SPARSE_MLA_DECODE_FP8`:
+> ⚠️ **Flash-mxfp4-specific regression (2026-04-26):** CK V32 produces silent
+> garbage on end-to-end **Flash mxfp4** inference. Bisected by toggling
+> `SGLANG_HIP_SPARSE_MLA_DECODE_FP8`:
 >
 > | mode | greedy "The capital of France is" |
 > |---|---|
 > | `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1` (CK V32) | garbage tokens |
 > | `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0` (torch ref + R5) | ✓ " Paris.\nThe capital of France is Paris…" |
 >
-> Use **`SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0`** (or unset, which is the
-> default) for Flash mxfp4 until the integration is debugged. The R5
-> stack on the torch ref path delivers SOTA Flash mxfp4 perf (38.96 ms
-> TPOT, see Flash mxfp4 section below).
+> **Flash-Base FP8 is unaffected** — iter19 measured CK V32 stable at
+> c=8 / 40 prompts. In fact `launch_dsv4.sh` now defaults
+> `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1` because the Triton sparse-decode
+> kernel allocates ~4.5 GB temp `gathered_kv` per layer × 43 layers at
+> chunked-prefill `s_q=8192`, which churns the caching allocator and
+> crashes Flash-Base at c≥8. Routing prefill (s_q > 1) to CK V32 + the
+> two-shot patch (`SGLANG_HIP_CK_V32_TWO_SHOT=auto`) avoids that.
+>
+> For **Flash mxfp4 specifically, override the launcher default** by
+> passing `-e SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0` in the docker run.
+> The R5 stack on the torch ref path delivers SOTA Flash mxfp4 perf
+> (38.96 ms TPOT, see Flash mxfp4 section below).
 
 **The kernel is correct in isolation.** Extended sweep in
 [`microbench_ck_v32_512.py`](microbench_ck_v32_512.py) (TOPK ∈ {64, 128, 256,
 512, 1024} × splits ∈ {2, 4, 8, 16, 32} × attn_sink ∈ {None, real} ×
 invalid_frac ∈ {0, 0.25, 0.5}) **passes 30/30 at both D=512 and D=576** vs an
-FP32 oracle. So the e2e regression is an integration-level effect, not a
-kernel arithmetic bug:
+FP32 oracle. So the Flash-mxfp4 e2e regression is an integration-level effect,
+not a kernel arithmetic bug:
 
 - per-call max_diff is ~1e-3 with FP8 quant noise (within spec for kernel)
 - but compounded over 60+ decoder layers (each one re-quantizing + feeding
-  forward), this drifts the q distribution far enough that the LM head
-  produces wrong tokens
+  forward through residual + RMSnorm + MoE), this drifts the q distribution
+  far enough that the LM head produces wrong tokens
 - the bf16 torch ref path has lower per-call noise (matmul accumulates in
   fp32, no per-token FP8 round-trip) so it stays on the manifold
+- Flash-Base FP8 doesn't hit this because its attention shape and per-layer
+  numerics differ from Flash mxfp4 (different activation distribution feeding
+  the FP8 quant)
 
 For Pro V32 the impact is unverified — Pro might tolerate the per-call FP8
 noise better (smaller-batch dynamics, different MoE depth) or might also need
@@ -117,7 +129,7 @@ docker run -d --name sglang \
   -v /mnt/vast/john/sglang_v4_pr:/sgl-pr \
   -v /mnt/vast/john/sglang_v4_pr_jitcache:/sgl-workspace/aiter/aiter/jit \
   -e CUDA_VISIBLE_DEVICES="$GPUS" \
-  rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129 \
+  rocm/sgl-dev:rocm720-deepseek-v4-mi35x \
   bash /sgl-pr/<launcher>.sh
 ```
 
@@ -128,6 +140,14 @@ Smallest, fastest, default. 4-GPU node. See [RUN_ON_AMD_MI355X.md](RUN_ON_AMD_MI
 ```bash
 GPUS=0,1,2,3 ... bash /sgl-pr/launch_dsv4.sh stacked-best
 ```
+
+The launcher defaults `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1` +
+`SGLANG_HIP_CK_V32_TWO_SHOT=auto` for Flash-Base FP8: at chunked-prefill
+`s_q=8192` the Triton sparse-decode kernel allocates ~4.5 GB of temp
+`gathered_kv` per layer × 43 layers, churning the caching allocator and
+crashing the server at c≥8. Routing prefill (s_q > 1) through CK V32 + the
+two-shot online-softmax merge avoids that. Decode (s_q=1) auto-falls back to
+the Triton + R5 path. iter19 measured this stable at c=8 / 40 prompts.
 
 Greedy probe:
 
@@ -157,7 +177,7 @@ docker run -d --name sglang \
   -v /mnt/vast/john/sglang_v4_pr_jitcache:/sgl-workspace/aiter/aiter/jit \
   -e CUDA_VISIBLE_DEVICES=0,1,2,3 -e MODEL=/hf/DeepSeek-V4-Flash-srt \
   -e SGLANG_MXFP4_AITER=1 -e SGLANG_OPT_USE_OLD_COMPRESSOR=false \
-  rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129 \
+  rocm/sgl-dev:rocm720-deepseek-v4-mi35x \
   bash /sgl-pr/launch_dsv4.sh
 ```
 
@@ -232,12 +252,13 @@ docker run -d --name sglang_flash \
   -e CUDA_VISIBLE_DEVICES=0,1,2,3 -e MODEL=/hf/DeepSeek-V4-Flash-srt -e PORT=30010 \
   -e SGLANG_MXFP4_FLYDSL=1 -e SGLANG_OPT_USE_OLD_COMPRESSOR=false \
   -e SGLANG_TRITON_SPARSE_DECODE=0 \
+  -e SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0 \
   -e SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
-  rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129 \
+  rocm/sgl-dev:rocm720-deepseek-v4-mi35x \
   bash /flydsl_setup/launch_with_flydsl.sh
 ```
 
-Note: **`SGLANG_HIP_SPARSE_MLA_DECODE_FP8` is intentionally NOT set** — see the Sparse MLA section above for why CK V32 is currently broken on Flash mxfp4 e2e inference.
+Note: **`SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0` is mandatory for Flash mxfp4** — the launcher (`launch_dsv4.sh`) defaults it to `1` for Flash-Base FP8 stability (CK V32 prevents a 4.5 GB-per-layer Triton sparse-decode crash at c≥8 chunked prefill), but Flash mxfp4 hits the integration regression described in the Sparse MLA section above. The explicit `-e` overrides the launcher default.
 
 The launcher pre-flight checks (in `flydsl_setup/launch_with_flydsl.sh`):
 - `/flydsl_setup` mount has the wheel (else: clear error)
