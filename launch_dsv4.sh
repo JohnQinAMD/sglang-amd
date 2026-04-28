@@ -99,14 +99,29 @@ export SGLANG_OPT_USE_FUSED_STORE_CACHE=false
 #   DSv4-Pro V32 (qk_head_dim=576): use CK Tile FP8 via
 #     `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1` (commit 6e86d00f2).
 #
-# WARNING: as of 2026-04-26 the CK V32 kernel produces garbage on end-to-end
-# Flash mxfp4 inference at production TOPK ≥ 256 + multi-split reduce path
-# (microbench_ck_v32_512.py uses TOPK=64 / num_splits=1 and reports cos-sim
-# 0.999998, which masks the bug). Until that's fixed, DO NOT set
-# `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1` for Flash mxfp4 — the launcher leaves
-# it unset by default; the working SOTA path (38.96 ms TPOT) is
-# `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0` (or unset) + the R5 + HIP-routing
-# patches in this commit.
+# UPDATE 2026-04-28: bug from 2026-04-26 ("garbage tokens at TOPK ≥ 256 +
+# multi-split reduce") appears to be FIXED by Phase A+B+ commit 80b51a16d
+# which added native 4D padded pool support to the CK V32 kernel. Root cause
+# was the OLD launcher's `pidx * stride_kv` address calc reading PAD bytes as
+# fp8 (c4/c128 pools allocate padded rows: 9344 B used + 448 B pad = 9792 B/row).
+# At TOPK ≥ 256 with num_splits ≥ 8, more cross-row gather → more pad-byte
+# reads → garbage. The new 4D-aware address `(pidx/pages_per_row)*pool_outer_stride
+# + (pidx%pages_per_row)*stride_kv` reads correct fp8 bytes.
+#
+# Kernel-level microbench evidence (2026-04-28, chi2866 MI355X):
+#   * single-shot @ H=128 TOPK=64-1024:        30/30 PASS (cos_sim 1.0)
+#   * single-shot @ Flash H=16 TOPK=128-512:   12/12 PASS (4D padded pool)
+#   * two-shot multi-split reduce @ TOPK=256/512: 8/8 PASS (the bug warning case)
+#   * microbench_ck_v32_padded_pool.py:        5/5 PASS bit-exact
+#
+# E2E COHERENCE CHECK STILL RECOMMENDED before flipping the Flash mxfp4
+# default. Use the `phasee_flash_mxfp4_ck_v32` variant in launch_flash_base_fp8.sh
+# (or set SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1 manually) and verify the model
+# generates coherent text on a few prompts before relying on it.
+#
+# Until E2E verified, the launcher's auto-default at line 130 only enables
+# CK V32 for Flash-Base FP8; Flash mxfp4 callers must opt in explicitly via
+# `export SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1`.
 export SGLANG_TRITON_SPARSE_DECODE=1
 
 # Flash-Base FP8 c=8+ stability: at chunked prefill s_q=8192 the Triton
