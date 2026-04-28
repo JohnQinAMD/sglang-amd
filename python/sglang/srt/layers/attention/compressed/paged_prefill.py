@@ -59,7 +59,26 @@ def make_swa_ring_buffer_indices(
     SWA_WINDOW = swa_window_size
     extend_num_tokens = forward_batch.extend_num_tokens
     assert extend_num_tokens is not None
+    if envs.SGLANG_HIP_SWA_PREPARE.get():
+        from sglang.srt.layers.swa_indices_hip import hip_make_swa_prefill_indices
+
+        seq_lens = forward_batch.seq_lens
+        extend_lens = forward_batch.extend_seq_lens
+        assert extend_lens is not None
+        seq_lens_k = seq_lens.to(torch.int32)
+        seq_lens_q = extend_lens.to(torch.int32)
+        swa_indices = torch.empty(
+            (extend_num_tokens, SWA_WINDOW), device=device, dtype=torch.int32
+        )
+        return hip_make_swa_prefill_indices(
+            seq_lens_k=seq_lens_k,
+            seq_lens_q=seq_lens_q,
+            swa_indices=swa_indices,
+        )
     if envs.SGLANG_OPT_USE_TILELANG_SWA_PREPARE.get():
+        # NOTE: broken on this gfx950/TVM stack — TileLang miscompiles to an
+        # empty kernel body. See feedback_tilelang_codegen_bugs_gfx950 memory
+        # entry. Kept opt-in for non-AMD or future-fixed TileLang builds.
         seq_lens = forward_batch.seq_lens
         extend_lens = forward_batch.extend_seq_lens
         assert extend_lens is not None
