@@ -1,6 +1,6 @@
 # DSv4-Pro mxfp4 bring-up on AMD MI355X
 
-Date: 2026-04-26 · Container `rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129` · branch `rocm-deepseek-v4`
+Date: 2026-04-26 · Container `rocm/sgl-dev:rocm720-deepseek-v4-mi35x` · branch `rocm-deepseek-v4`
 
 ## TL;DR
 
@@ -94,7 +94,7 @@ docker run -d --name sglang_pro \
   -v /mnt/vast/john/sglang_v4_pr:/sgl-pr \
   -v /mnt/vast/john/sglang_v4_pr_jitcache:/sgl-workspace/aiter/aiter/jit \
   -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-  rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129 \
+  rocm/sgl-dev:rocm720-deepseek-v4-mi35x \
   bash /sgl-pr/launch_dsv4_pro_mxfp4.sh
 
 # Greedy probe

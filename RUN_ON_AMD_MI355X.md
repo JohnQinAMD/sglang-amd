@@ -33,7 +33,7 @@ The two checkpoints have **identical `config.json`** — there's no auto-detect.
 ## Step 1 — Pull the docker image
 
 ```bash
-docker pull docker.io/rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129
+docker pull docker.io/rocm/sgl-dev:rocm720-deepseek-v4-mi35x
 ```
 
 This is the PR's stated base image. It already contains ROCm 7.0.0, AITER, sglang main (pre-V4). The PR source gets overlaid via PYTHONPATH below.
@@ -124,7 +124,7 @@ aiter's first-run JIT compiles 1361 cpp variants for `module_rmsnorm`. At the de
 ```bash
 mkdir -p /mnt/vast/john/sglang_v4_pr_jitcache
 docker run --rm -v /mnt/vast/john/sglang_v4_pr_jitcache:/cache \
-  rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129 \
+  rocm/sgl-dev:rocm720-deepseek-v4-mi35x \
   bash -c 'cp -a /sgl-workspace/aiter/aiter/jit/. /cache/ && rm -rf /cache/build/lock_*'
 ```
 
@@ -155,7 +155,7 @@ docker run -d --name sglang_v4_flash \
   -v /mnt/vast/john/huggingface:/models:ro \
   -v /mnt/vast/john/sglang_v4_pr:/sgl-pr:ro \
   -v /mnt/vast/john/sglang_v4_pr_jitcache:/sgl-workspace/aiter/aiter/jit \
-  rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129 \
+  rocm/sgl-dev:rocm720-deepseek-v4-mi35x \
   bash /sgl-pr/launch_dsv4.sh stacked-best
 ```
 

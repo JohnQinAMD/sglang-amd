@@ -1,7 +1,7 @@
 # Aiter upstream patches for piecewise CG correctness
 
 These three files are patched copies of `aiter/` source from inside the
-`rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129` container, fixing the
+`rocm/sgl-dev:rocm720-deepseek-v4-mi35x` container, fixing the
 `mutates_args="unknown"` schema bug documented in
 [ROCm/aiter issue #2780](https://github.com/ROCm/aiter/issues/2780). The bug
 makes `torch.library.infer_schema` mark every tensor input as mutated

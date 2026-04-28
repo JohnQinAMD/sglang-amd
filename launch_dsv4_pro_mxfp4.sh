@@ -23,7 +23,7 @@
 #     --shm-size 64g --security-opt seccomp=unconfined --group-add video --group-add render \
 #     --cap-add SYS_PTRACE -v /path/to/hf:/hf -v /path/to/sglang_v4_pr:/sgl-pr \
 #     -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-#     rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129 \
+#     rocm/sgl-dev:rocm720-deepseek-v4-mi35x \
 #     bash /sgl-pr/launch_dsv4_pro_mxfp4.sh
 #
 # Bench (chi2761, 2026-04-26, c=8 OSL=1024):
