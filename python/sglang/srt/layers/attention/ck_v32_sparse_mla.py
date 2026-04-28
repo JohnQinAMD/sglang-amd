@@ -279,31 +279,36 @@ def ck_sparse_mla_decode_fp8_v32(
     device = q.device
     total_q = B * S_q
 
-    # Normalize KV pool to a 2D view [num_slots, slot_stride] where slot_stride
-    # is the per-token stored stride. Production K cache stores 584 B/slot
-    # (nope=512 + rope=64 + scale=8) regardless of d_qk; the kernel reads only
-    # the first QK_HEAD_DIM bytes of each slot and walks rows via args.stride_kv.
-    # So slot_stride may exceed D (e.g., 584 ≥ 576 V32, 584 ≥ 512 Flash 2604).
+    # KV pool layout — Phase B+ (Apr 2026): the CK launcher now accepts the 4D
+    # tensor directly with native (possibly padded) strides, so we no longer
+    # `.reshape()`/`.contiguous()` here for the 4D case. The previous code
+    # silently copied the whole fp8 pool (~131 ms / dispatch) because c4/c128
+    # caches pad each row to a 576-B multiple, making the slice-then-view
+    # output non-contiguous.
     if k_cache.dim() == 2:
         n_kv, slot_stride = k_cache.shape
         kv_view = k_cache
+        if not kv_view.is_contiguous():
+            kv_view = kv_view.contiguous()
     elif k_cache.dim() == 3:
         n_kv = k_cache.shape[0] * k_cache.shape[1]
         slot_stride = k_cache.shape[-1]
         kv_view = k_cache.reshape(n_kv, slot_stride)
+        if not kv_view.is_contiguous():
+            kv_view = kv_view.contiguous()
     elif k_cache.dim() == 4:
         num_pages, page_size, h_kv, slot_stride = k_cache.shape
         assert h_kv == 1, f"expected h_kv=1, got k_cache shape {tuple(k_cache.shape)}"
         n_kv = num_pages * page_size
-        kv_view = k_cache.reshape(n_kv, slot_stride)
+        # Pass the 4D tensor as-is; the launcher reads .stride(0)/.stride(1)
+        # and supports padded pool rows natively.
+        kv_view = k_cache
     else:
         raise AssertionError(f"unexpected k_cache shape: {tuple(k_cache.shape)}")
 
     assert slot_stride >= D, (
         f"k_cache slot stride {slot_stride} < q's d_qk={D}; kernel would read OOB"
     )
-    if not kv_view.is_contiguous():
-        kv_view = kv_view.contiguous()
 
     # The CK kernel handles `pidx < 0` natively — invalid rows zero-fill in
     # the LDS tile loader, so we don't need to clamp / masked_fill here.
@@ -380,3 +385,159 @@ def ck_sparse_mla_decode_fp8_v32(
     out_bf16 = out_bf16.view(B, S_q, H, V_HEAD_DIM)
     lse_bhs = lse.view(B, S_q, H).transpose(1, 2).contiguous()  # [B, H, S_q]
     return out_bf16, lse_bhs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase A two-source combine helpers (2026-04-28)
+# ─────────────────────────────────────────────────────────────────────────────
+# Replaces the (2× ck_sparse_mla_decode_fp8_v32 + 2× aiter.mla_reduce_v1 +
+# Triton merge_two_sparse_attn_outputs + Triton _sink_fold_inplace_kernel)
+# pipeline with (2× ck_sparse_mla_decode_fp8_v32_to_split + 1× CK combine).
+#
+# Compared to the pre-Phase-A pipeline:
+#   * Skips the 2× per-source `aiter.mla_reduce_v1` calls — the new combine
+#     consumes both sources' raw split tensors directly and does the N-way
+#     merge in one launch.
+#   * Skips the Triton merge kernel + 4× `.contiguous()` reshape work in
+#     `debug_flash_mla_adapter.py` — combine reads strided split tensors.
+#   * Optionally fuses the `_sink_fold_inplace_kernel` into the same launch
+#     (toggle via the `attn_sink` arg).
+#   * Net: 8+ Triton/aiter launches per layer-pass → 1 CK launch + 2 splitkv
+#     launches. Eliminates the cuda-graph re-record + small-launch dispatch
+#     overhead that caused the +131 ms elementwise regression in Phase B.
+
+
+def ck_sparse_mla_decode_fp8_v32_to_split(
+    q: torch.Tensor,                  # [B, S_q, H, D] bf16
+    k_cache: torch.Tensor,            # FP8 KV pool
+    indices: torch.Tensor,            # [B, S_q, topk] int32
+    invalid_mask: torch.Tensor,       # [B*S_q, topk] bool — unused (kernel masks)
+    sm_scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run CK V32 splitkv ONLY — return raw split tensors without reduce.
+
+    Used by the Phase A two-shot path. The caller will pass split_data /
+    split_lse from BOTH sources (main + extra) into the new ``mla_combine_fwd_ck``
+    which does the N-way online-softmax merge in one launch.
+
+    Returns (split_data [total_q, num_splits, H, V] fp32,
+             split_lse  [total_q, num_splits, H, 1] fp32).
+
+    Both tensors live in the per-shape `_split_buf_cache`; the caller MUST
+    consume them before issuing another `..._to_split` call at the same
+    (total_q, num_splits, H, V) signature, otherwise the buffer will be
+    overwritten by the next splitkv pass. For the two-shot path (main + extra
+    have different num_splits typically) this is naturally avoided because
+    `pick_num_splits(B, topk_main) != pick_num_splits(B, topk_extra)` keys the
+    cache to different buffers.
+    """
+    assert q.dim() == 4
+    B, S_q, H, D = q.shape
+    assert D in SUPPORTED_QK_DIMS, (
+        f"expected qk_head_dim in {SUPPORTED_QK_DIMS}, got {D}"
+    )
+
+    topk = indices.shape[-1]
+    device = q.device
+    total_q = B * S_q
+
+    # (KV-buffer normalization mirrors `ck_sparse_mla_decode_fp8_v32` — keep
+    # the two helpers in sync.) Phase B+ (Apr 2026): pass 4D padded pool
+    # tensors as-is — the C++ launcher reads .stride(0)/.stride(1) and
+    # handles pool-row padding natively, eliminating a 131 ms float8_copy
+    # that previously fired on every two-shot dispatch.
+    if k_cache.dim() == 2:
+        n_kv, slot_stride = k_cache.shape
+        kv_view = k_cache
+        if not kv_view.is_contiguous():
+            kv_view = kv_view.contiguous()
+    elif k_cache.dim() == 3:
+        n_kv = k_cache.shape[0] * k_cache.shape[1]
+        slot_stride = k_cache.shape[-1]
+        kv_view = k_cache.reshape(n_kv, slot_stride)
+        if not kv_view.is_contiguous():
+            kv_view = kv_view.contiguous()
+    elif k_cache.dim() == 4:
+        num_pages, page_size, h_kv, slot_stride = k_cache.shape
+        assert h_kv == 1
+        n_kv = num_pages * page_size
+        kv_view = k_cache
+    else:
+        raise AssertionError(f"unexpected k_cache shape: {tuple(k_cache.shape)}")
+    assert slot_stride >= D
+
+    idx_flat = indices.to(torch.int32).reshape(B * topk)
+    if not idx_flat.is_contiguous():
+        idx_flat = idx_flat.contiguous()
+
+    qo_indptr, kv_indptr = _get_uniform_indptrs(B, topk, device)
+    num_splits = pick_num_splits(B, topk)
+    split_data, split_lse = _get_split_buffers(
+        total_q, num_splits, H, V_HEAD_DIM, device,
+    )
+
+    q_2d = (
+        q.view(total_q, H, D).contiguous()
+        if q.is_contiguous()
+        else q.reshape(total_q, H, D)
+    )
+
+    # FP8 decode scale dispatch (kept identical to the reduce-fused path).
+    _kv_dtype = k_cache.dtype
+    if _kv_dtype == torch.uint8 or _kv_dtype == torch.float8_e4m3fn:
+        fp8_decode_scale = 1.0
+    elif hasattr(torch, "float8_e4m3fnuz") and _kv_dtype == torch.float8_e4m3fnuz:
+        fp8_decode_scale = 0.5
+    else:
+        fp8_decode_scale = 0.5
+
+    ck = _get_ck_mod()
+    ck.mla_decode_fwd_ck_sparse_fp8(
+        q_2d, kv_view, split_data, split_lse,
+        qo_indptr, kv_indptr, idx_flat,
+        float(sm_scale), int(num_splits), float(fp8_decode_scale),
+    )
+    return split_data, split_lse
+
+
+def ck_combine_two_splits(
+    split_data_a: torch.Tensor,       # [total_q, S_a, H, V] fp32
+    split_lse_a: torch.Tensor,        # [total_q, S_a, H, 1] fp32
+    split_data_b: Optional[torch.Tensor] = None,  # [total_q, S_b, H, V] fp32
+    split_lse_b: Optional[torch.Tensor] = None,   # [total_q, S_b, H, 1] fp32
+    attn_sink: Optional[torch.Tensor] = None,     # [H] fp32 or None
+    out: Optional[torch.Tensor] = None,           # [total_q, H, V] bf16
+    lse: Optional[torch.Tensor] = None,           # [total_q, H]    fp32
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Single-launch CK Tile combine of one or two split-K sources.
+
+    For the two-source case (Phase A two-shot decode), pass split_data_b /
+    split_lse_b from the second CK splitkv. For single-source N-way reduce,
+    leave them as None (kernel reduces over source-A splits only — equivalent
+    to ``aiter.mla_reduce_v1`` without the metadata buffer overhead).
+
+    Output tensors are caller-allocated when provided (saves the per-call
+    allocation that churns the caching allocator and helps cuda-graph capture).
+
+    Returns (out [total_q, H, V] bf16, lse [total_q, H] fp32).
+    """
+    total_q, S_a, H, V = split_data_a.shape
+    device = split_data_a.device
+    if out is None:
+        out = torch.empty((total_q, H, V), dtype=torch.bfloat16, device=device)
+    else:
+        assert out.shape == (total_q, H, V) and out.dtype == torch.bfloat16
+        assert out.stride(-1) == 1
+    if lse is None:
+        lse = torch.empty((total_q, H), dtype=torch.float32, device=device)
+    else:
+        assert lse.shape == (total_q, H) and lse.dtype == torch.float32
+
+    ck = _get_ck_mod()
+    ck.mla_combine_fwd_ck(
+        split_data_a, split_lse_a,
+        split_data_b, split_lse_b,
+        attn_sink,
+        out, lse,
+    )
+    return out, lse

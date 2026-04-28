@@ -47,13 +47,17 @@ export PYTHONPATH=/sgl-pr/python:${PYTHONPATH:-}
 export CUDA_VISIBLE_DEVICES="$GPUS"
 export MAX_JOBS=128 NINJA_MAX_JOBS=128
 
-export SGLANG_OPT_USE_FUSED_COMPRESS=false
-export SGLANG_OPT_USE_OLD_COMPRESSOR=true
-export SGLANG_OPT_USE_TILELANG_SWA_PREPARE=false
-export SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=false
-export SGLANG_OPT_USE_FUSED_HASH_TOPK=false
-export SGLANG_HACK_FLASHMLA_BACKEND=torch
-export SGLANG_OPT_DEEPGEMM_HC_PRENORM=false
+# Allow caller env overrides (use `${X:-default}` instead of plain `=default`).
+# Phase 4 host-side optimization needs to flip these via env without editing the script.
+export SGLANG_OPT_USE_FUSED_COMPRESS="${SGLANG_OPT_USE_FUSED_COMPRESS:-false}"
+export SGLANG_OPT_USE_OLD_COMPRESSOR="${SGLANG_OPT_USE_OLD_COMPRESSOR:-true}"
+export SGLANG_OPT_USE_TILELANG_SWA_PREPARE="${SGLANG_OPT_USE_TILELANG_SWA_PREPARE:-false}"
+export SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK="${SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK:-false}"
+export SGLANG_OPT_USE_FUSED_HASH_TOPK="${SGLANG_OPT_USE_FUSED_HASH_TOPK:-false}"
+export SGLANG_HACK_FLASHMLA_BACKEND="${SGLANG_HACK_FLASHMLA_BACKEND:-torch}"
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM="${SGLANG_OPT_DEEPGEMM_HC_PRENORM:-false}"
+# Allow Phase 4 / B200-aligned envs to be set via caller. Defaults match prior behavior.
+export SGLANG_OPT_DPSK_V4_RADIX="${SGLANG_OPT_DPSK_V4_RADIX:-0}"
 # SGLANG_OPT_USE_TILELANG_MHC_PRE / _POST default per preset (see case block).
 # Env override wins; otherwise preset default (1 for stacked-* on MI355X — Xiaobo
 # measured +9% prefill on MI300X, replicated as +2-4% throughput / -6 to -7% TTFT
@@ -61,9 +65,30 @@ export SGLANG_OPT_DEEPGEMM_HC_PRENORM=false
 export SGLANG_ENABLE_THINKING=1
 export SGLANG_USE_AITER=1
 export SGLANG_USE_ROCM700A=1
-export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
+# L1 fp8_paged_mqa_logits dispatch knobs. Default keeps the proven torch path
+# (45.23 ms TPOT). Two opt-in alternatives:
+#   SGLANG_FP8_PAGED_MQA_LOGITS_FUSED_TRITON=1 — Triton fused (32 us microbench
+#     but cuda-graph regression on Flash-Base, see L1 history).
+#   SGLANG_FP8_PAGED_MQA_LOGITS_HIP=1 — gfx950 HIP kernel, 4-30 us microbench
+#     across b=1..6 (vs torch 132, B200 sm100 8.7); E2E A/B in progress. JIT
+#     compiles via cpp_extension on first server boot (~30 s extra startup).
+export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH="${SGLANG_FP8_PAGED_MQA_LOGITS_TORCH:-1}"
+export SGLANG_FP8_PAGED_MQA_LOGITS_FUSED_TRITON="${SGLANG_FP8_PAGED_MQA_LOGITS_FUSED_TRITON:-0}"
+export SGLANG_FP8_PAGED_MQA_LOGITS_HIP="${SGLANG_FP8_PAGED_MQA_LOGITS_HIP:-0}"
+# E2E A/B (chi2811 c=4 max=6, ISL=OSL=1024 num=16, 16/16 successful):
+#   torch (default):       TPOT 45.25 ms   throughput 85.95 tok/s
+#   FUSED_TRITON:          TPOT 49.81 ms   throughput 78.25 tok/s   (+4.6 ms)
+#   HIP v1 (no scratch):   TPOT 46.44 ms   throughput 84.06 tok/s   (+1.2 ms)
+#   HIP v2 (+persistent scratch): TPOT 45.46 / 45.53 ms   throughput 85.52 / 87.03 tok/s
+#                          (parity with torch — within bench noise)
+# Persistent output scratch in the HIP loader (mirrors the torch path's
+# _FP8_PAGED_SCRATCH_CAPTURED pattern) closed ~0.95 ms vs naive HIP. The
+# remaining torch-vs-HIP delta is at the noise floor; either path is shippable.
+# Microbench (eager) numbers:  HIP 4-30 us  /  fused 32 us  /  torch 132 us.
+# Microbench wins do not always predict cuda-graph E2E wins because graph
+# replay amortizes torch's 14 small launches.
 export SGLANG_DSV4_FP4_EXPERTS=false
-export SGLANG_OPT_DPSK_V4_RADIX=0
+export SGLANG_OPT_DPSK_V4_RADIX="${SGLANG_OPT_DPSK_V4_RADIX:-0}"
 export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=false
 export SGLANG_OPT_USE_FUSED_STORE_CACHE=false
 # Sparse MLA decode kernel.
@@ -83,6 +108,29 @@ export SGLANG_OPT_USE_FUSED_STORE_CACHE=false
 # `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0` (or unset) + the R5 + HIP-routing
 # patches in this commit.
 export SGLANG_TRITON_SPARSE_DECODE=1
+
+# Flash-Base FP8 c=8+ stability: at chunked prefill s_q=8192 the Triton
+# sparse-decode kernel allocates ~4.5 GB temp gathered_kv per layer × 43
+# layers, which churns the caching allocator and produces server crashes /
+# graph-pool aperture violations. Routing prefill (s_q > 1) to the CK V32
+# kernel via `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1` + the two-shot patch
+# avoids this — measured stable at c=8 / 40 prompts in iter19_c8_bench.
+# (The Flash mxfp4 CK V32 bug noted above does NOT affect Flash-Base FP8;
+# the bug is at TOPK≥256 + multi-split reduce specifically for the mxfp4
+# attention shape. Flash-Base FP8 uses CK V32 successfully in iter19.)
+# At decode (s_q=1) the auto gate falls back to the Triton path so the
+# decode kernel still benefits from R5 stack.
+if [ "${SGLANG_HIP_SPARSE_MLA_DECODE_FP8:-}" = "" ]; then
+    # default-on for Flash-Base FP8 to fix c≥8 stability; opt-out by setting
+    # SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0 explicitly.
+    export SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1
+fi
+if [ "${SGLANG_HIP_CK_V32_TWO_SHOT:-}" = "" ]; then
+    # `auto` = CK V32 only at prefill (s_q > 1). Decode (s_q=1) keeps the
+    # Triton path because CK V32 underperforms at the small extra-KV shape
+    # (page_size=2 for compress_ratio=128). See iter3 / iter14 measurements.
+    export SGLANG_HIP_CK_V32_TWO_SHOT=auto
+fi
 
 export TORCHINDUCTOR_CACHE_DIR=/mnt/vast/john/rocm-dynamo/sglang/.inductor_cache_dsv4
 export TRITON_CACHE_DIR=/mnt/vast/john/rocm-dynamo/sglang/.triton_cache_dsv4
@@ -179,7 +227,7 @@ CLI=(
   --tp 4
   --disable-radix-cache
   --attention-backend compressed
-  --max-running-request 256
+  --max-running-request 6
   --page-size 256
   --chunked-prefill-size 8192
   --disable-shared-experts-fusion
