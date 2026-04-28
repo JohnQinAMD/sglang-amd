@@ -33,69 +33,249 @@ import triton
 import triton.language as tl
 
 
-# Single-launch sink fold: out *= 1 / (1 + exp(sink - lse))
+# Single-launch sink fold + lse transpose:
 #
-# Replaces the previous 3-4-launch torch chain (broadcast sub → exp → add → div
-# → mul → cast) with one Triton kernel that streams `out` and writes it back in
-# place. Kernel is launched per (total_q, head, V-tile); each program reads one
-# (q, h)'s lse + sink scalar, broadcasts the resulting scale across the V tile.
+#     out_bf16[q, h, v] *= 1 / (1 + exp(sink[h] - lse[q, h]))
+#     lse_bhs[b, h, s_q] = lse_qh[b * S_q + s_q, h]                  (transpose view)
 #
-# `total_q` is small (B*S_q, e.g. 1-8 in decode), `H=128`, `V=512` for V32
-# DSv4-Pro — so a single 1D launch over (total_q*H) with 512 lanes per
-# program is well-sized for MI355X (~5 µs typical → ~1-2 µs after fusion).
+# Replaces the (3-4-launch torch chain → 1 sink-fold launch → 1 strided-copy
+# launch) pre-Phase-E pipeline with a SINGLE Triton kernel. The original
+# `_sink_fold_inplace_kernel` only handled the sink path; the strided lse
+# transpose `lse_bhs.copy_(lse_qh.view(B,S_q,H).transpose(1,2))` was a
+# separate launch (~3-5 µs). Folding them halves post-kernel launches.
+#
+# Phase E Lever 1 (2026-04-28): renamed and extended. Backward-compatible
+# `_apply_sink_fold_inplace` is preserved as a thin wrapper for the no-sink
+# decode path that doesn't need the lse transpose either.
 @triton.jit
-def _sink_fold_inplace_kernel(
-    out_ptr,      # [total_q, H, V] bf16, modified in place
-    lse_ptr,      # [total_q, H]    fp32
-    sink_ptr,     # [H]             fp32
+def _sink_fold_and_lse_transpose_kernel(
+    out_ptr,        # [total_q, H, V] bf16, modified in place
+    lse_qh_ptr,     # [total_q, H]    fp32, source lse in (q, h) layout
+    sink_ptr,       # [H]             fp32  (or null when HAS_SINK=0)
+    lse_bhs_ptr,    # [B, H, S_q]     fp32  output (transposed)
+    stride_lse_bhs_b, stride_lse_bhs_h, stride_lse_bhs_s,
+    B: tl.constexpr,
+    S_q: tl.constexpr,
     H: tl.constexpr,
     V: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+    HAS_LSE_TRANSPOSE: tl.constexpr,
 ):
-    pid = tl.program_id(0)            # 0 .. total_q*H
-    qh_id = pid                        # row index in flattened (total_q, H)
-    h_id = qh_id % H
+    """One program per (q, h) row. Streams V in BLOCK_V tiles in-place.
 
-    # Per-row scale: 1 / (1 + exp(sink[h] - lse[q, h])).
-    sink = tl.load(sink_ptr + h_id).to(tl.float32)
-    lse = tl.load(lse_ptr + qh_id).to(tl.float32)
-    scale = 1.0 / (1.0 + tl.exp(sink - lse))
+    At V=512, BLOCK_V=512: single iter; the kernel is functionally one fused
+    pass over the (q, h, V) row + one fp32 lse store at v_block==0.
+    """
+    qh_id = tl.program_id(0)
+    h_id = qh_id % H
+    q_id = qh_id // H
+
+    lse = tl.load(lse_qh_ptr + qh_id).to(tl.float32)
+
+    if HAS_SINK:
+        sink = tl.load(sink_ptr + h_id).to(tl.float32)
+        scale = 1.0 / (1.0 + tl.exp(sink - lse))
+    else:
+        scale = 1.0  # no-op; loop body skipped if scale is constant 1 — but we
+        # still need to keep the loop for the fp32→bf16 cast path; eager
+        # decode (num_splits=1, no sink) uses a different `out_bf16_cached.copy_`
+        # path which is already a fp32→bf16 cast in the dispatcher.
+
+    if HAS_SINK:
+        offs = tl.arange(0, BLOCK_V)
+        base = qh_id * V
+        for v_start in tl.static_range(0, V, BLOCK_V):
+            cur = offs + v_start
+            mask = cur < V
+            x = tl.load(out_ptr + base + cur, mask=mask, other=0.0).to(tl.float32)
+            x = x * scale
+            tl.store(out_ptr + base + cur, x.to(tl.bfloat16), mask=mask)
+
+    # Transposed lse store: lse_bhs[b, h, s_q] = lse_qh[q_id=b*S_q+s_q, h]
+    if HAS_LSE_TRANSPOSE:
+        b_id = q_id // S_q
+        s_id = q_id % S_q
+        tl.store(
+            lse_bhs_ptr
+            + b_id * stride_lse_bhs_b
+            + h_id * stride_lse_bhs_h
+            + s_id * stride_lse_bhs_s,
+            lse,
+        )
+
+
+@triton.jit
+def _split0_to_bf16_with_sink_and_lse_transpose_kernel(
+    split_data_ptr,   # [total_q, num_splits, H, V] fp32 — only [:, 0, ...] is read
+    out_ptr,          # [total_q, H, V] bf16 — written
+    lse_qh_ptr,       # [total_q, H] fp32 — read
+    sink_ptr,         # [H] fp32 (or null when HAS_SINK=0)
+    lse_bhs_ptr,      # [B, H, S_q] fp32 — written when HAS_LSE_TRANSPOSE=1
+    stride_sd_q, stride_sd_s, stride_sd_h,
+    stride_lse_bhs_b, stride_lse_bhs_h, stride_lse_bhs_s,
+    B: tl.constexpr,
+    S_q: tl.constexpr,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+    HAS_LSE_TRANSPOSE: tl.constexpr,
+):
+    """Phase E Lever 1 part 2 — fuse 3 launches into 1.
+
+    Reads split_data[q, 0, h, v] fp32, writes out_bf16[q, h, v] = bf16(x * scale)
+    where scale = 1/(1+exp(sink[h]-lse[q,h])) (or 1.0 if no sink), and writes
+    lse_bhs[b, h, s_q] = lse[q, h] in the same launch.
+
+    Replaces (out_bf16.copy_(split[:,0]) + _apply_sink_fold_inplace) when
+    num_splits==1 and sink is present.
+    """
+    qh_id = tl.program_id(0)
+    h_id = qh_id % H
+    q_id = qh_id // H
+
+    lse = tl.load(lse_qh_ptr + qh_id).to(tl.float32)
+
+    if HAS_SINK:
+        sink = tl.load(sink_ptr + h_id).to(tl.float32)
+        scale = 1.0 / (1.0 + tl.exp(sink - lse))
+    else:
+        scale = 1.0
 
     offs = tl.arange(0, BLOCK_V)
-    base = qh_id * V
+    sd_base = q_id * stride_sd_q + 0 * stride_sd_s + h_id * stride_sd_h
+    out_base = qh_id * V
     for v_start in tl.static_range(0, V, BLOCK_V):
         cur = offs + v_start
         mask = cur < V
-        x = tl.load(out_ptr + base + cur, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(split_data_ptr + sd_base + cur, mask=mask, other=0.0)
         x = x * scale
-        tl.store(out_ptr + base + cur, x.to(tl.bfloat16), mask=mask)
+        tl.store(out_ptr + out_base + cur, x.to(tl.bfloat16), mask=mask)
+
+    if HAS_LSE_TRANSPOSE:
+        b_id = q_id // S_q
+        s_id = q_id % S_q
+        tl.store(
+            lse_bhs_ptr
+            + b_id * stride_lse_bhs_b
+            + h_id * stride_lse_bhs_h
+            + s_id * stride_lse_bhs_s,
+            lse,
+        )
 
 
-def _apply_sink_fold_inplace(out_bf16: torch.Tensor, lse: torch.Tensor,
-                              sink: torch.Tensor) -> None:
-    """In-place: out_bf16[q, h, :] *= 1 / (1 + exp(sink[h] - lse[q, h]))."""
+def _apply_split0_cast_with_sink_and_lse_transpose(
+    split_data: torch.Tensor,
+    out_bf16: torch.Tensor,
+    lse_qh: torch.Tensor,
+    sink: Optional[torch.Tensor],
+    lse_bhs_out: torch.Tensor,
+    B: int,
+    S_q: int,
+) -> None:
+    """Phase E Lever 1 part 2 — single-launch fused fp32→bf16 cast + sink + lse transpose.
+
+    Args:
+        split_data:   [total_q, num_splits, H, V] fp32 — kernel writes only [:, 0, ...]
+        out_bf16:     [total_q, H, V] bf16 — written directly by this kernel
+        lse_qh:       [total_q, H] fp32
+        sink:         [H] fp32 or None
+        lse_bhs_out:  [B, H, S_q] fp32 — written
+        B, S_q:       transpose split (q_id = b * S_q + s_q)
+    """
+    total_q, H, V = out_bf16.shape
+    assert split_data.shape[0] == total_q
+    assert split_data.shape[2] == H
+    assert split_data.shape[3] == V
+    assert lse_qh.shape == (total_q, H)
+    assert lse_bhs_out.shape == (B, H, S_q)
+    assert B * S_q == total_q
+
+    has_sink = sink is not None
+    if has_sink:
+        if sink.dtype != torch.float32:
+            sink = sink.float()
+        if not sink.is_contiguous():
+            sink = sink.contiguous()
+
+    BLOCK_V = min(512, V)
+    grid = (total_q * H,)
+    _split0_to_bf16_with_sink_and_lse_transpose_kernel[grid](
+        split_data, out_bf16, lse_qh,
+        sink if has_sink else lse_qh,
+        lse_bhs_out,
+        split_data.stride(0), split_data.stride(1), split_data.stride(2),
+        lse_bhs_out.stride(0), lse_bhs_out.stride(1), lse_bhs_out.stride(2),
+        B=B, S_q=S_q, H=H, V=V, BLOCK_V=BLOCK_V,
+        HAS_SINK=has_sink,
+        HAS_LSE_TRANSPOSE=True,
+    )
+
+
+def _apply_sink_fold_inplace(
+    out_bf16: torch.Tensor,
+    lse: torch.Tensor,
+    sink: torch.Tensor,
+    lse_bhs_out: Optional[torch.Tensor] = None,
+    B: Optional[int] = None,
+    S_q: Optional[int] = None,
+) -> None:
+    """In-place sink fold + (optional) lse-transpose write.
+
+    Args:
+        out_bf16: [total_q, H, V] bf16, modified in place: out *= 1/(1+exp(sink-lse))
+        lse:      [total_q, H] fp32 source.
+        sink:     [H] fp32. May be None to skip sink fold.
+        lse_bhs_out: optional [B, H, S_q] fp32 output. When provided, the
+                     transposed lse is written in the same kernel launch
+                     (Phase E Lever 1 fusion).
+        B, S_q:   required when lse_bhs_out is provided (used for the
+                  transpose index split q_id=b*S_q+s_q).
+    """
     assert out_bf16.dtype == torch.bfloat16
     total_q, H, V = out_bf16.shape
     assert lse.shape == (total_q, H), f"lse shape {tuple(lse.shape)} vs ({total_q},{H})"
-    assert sink.shape == (H,), f"sink shape {tuple(sink.shape)} vs ({H},)"
+    has_sink = sink is not None
+    if has_sink:
+        assert sink.shape == (H,), f"sink shape {tuple(sink.shape)} vs ({H},)"
+    has_lse_t = lse_bhs_out is not None
+    if has_lse_t:
+        assert B is not None and S_q is not None, \
+            "B and S_q required when lse_bhs_out is provided"
+        assert B * S_q == total_q, \
+            f"B*S_q={B*S_q} vs total_q={total_q}"
+        assert lse_bhs_out.shape == (B, H, S_q), \
+            f"lse_bhs_out shape {tuple(lse_bhs_out.shape)} vs ({B},{H},{S_q})"
     if not out_bf16.is_contiguous():
         out_bf16 = out_bf16.contiguous()
     if lse.dtype != torch.float32:
         lse = lse.float()
-    if sink.dtype != torch.float32:
-        sink = sink.float()
     if not lse.is_contiguous():
         lse = lse.contiguous()
-    if not sink.is_contiguous():
-        sink = sink.contiguous()
+    if has_sink:
+        if sink.dtype != torch.float32:
+            sink = sink.float()
+        if not sink.is_contiguous():
+            sink = sink.contiguous()
 
-    # BLOCK_V=512 covers the full V dim in one program for V32 (V=512), so the
-    # static_range loop is single-iter — single 512-wide vector load+store per
-    # (q, h) row. For larger V the loop tiles automatically.
+    if not has_sink and not has_lse_t:
+        return  # nothing to do
+
     BLOCK_V = min(512, V)
     grid = (total_q * H,)
-    _sink_fold_inplace_kernel[grid](
-        out_bf16, lse, sink, H=H, V=V, BLOCK_V=BLOCK_V,
+    _sink_fold_and_lse_transpose_kernel[grid](
+        out_bf16, lse,
+        sink if has_sink else lse,            # placeholder when HAS_SINK=0
+        lse_bhs_out if has_lse_t else lse,    # placeholder when HAS_LSE_TRANSPOSE=0
+        lse_bhs_out.stride(0) if has_lse_t else 0,
+        lse_bhs_out.stride(1) if has_lse_t else 0,
+        lse_bhs_out.stride(2) if has_lse_t else 0,
+        B=B if B is not None else 1,
+        S_q=S_q if S_q is not None else 1,
+        H=H, V=V, BLOCK_V=BLOCK_V,
+        HAS_SINK=has_sink,
+        HAS_LSE_TRANSPOSE=has_lse_t,
     )
 
 # V32 (DSv4-Pro) head dimensions; these define the V32 reference. The kernel
@@ -417,9 +597,27 @@ def ck_sparse_mla_decode_fp8_v32(
     )
 
     if num_splits == 1:
-        # Kernel pre-normalizes for single-split case — no reduce needed.
-        out_bf16_cached.copy_(split_data[:, 0, :, :])  # fp32→bf16 in place
         lse_2d = split_lse[:, 0, :, 0]
+        # Phase E Lever 1: fused fp32→bf16-cast + sink + lse-transpose Triton
+        # kernel WINS only when sink is present (1 launch vs 3).
+        #
+        # MICROBENCH on chi2866 MI355X (V32 V=512 H=16 num_splits=1):
+        #   sink:    ref 33.5 us → fused 29.0 us  (+4.5 us/call WIN)
+        #   nosink:  ref 10.3 us → fused 29.0 us  (-18.7 us/call REGRESSION)
+        #
+        # Triton has ~30us constant overhead. torch's .copy_() (fp32→bf16) +
+        # .transpose().contiguous() are HIP-fused at ~5us each — Triton can't
+        # beat them without enough work to amortize launch overhead.
+        # Only fuse when sink fold is actually needed.
+        if attn_sink is not None:
+            _apply_split0_cast_with_sink_and_lse_transpose(
+                split_data, out_bf16_cached, lse_2d, attn_sink,
+                lse_bhs_cached, B=B, S_q=S_q,
+            )
+        else:
+            # No sink: 2-launch torch path beats single-Triton-launch.
+            out_bf16_cached.copy_(split_data[:, 0, :, :])
+            lse_bhs_cached.copy_(lse_2d.view(B, S_q, H).transpose(1, 2))
     else:
         # Multi-split: reduce path still allocates internally; copy result
         # into our cached buffer so the captured graph reads stable address.
@@ -428,21 +626,19 @@ def ck_sparse_mla_decode_fp8_v32(
         )
         out_bf16_cached.view_as(out_reduced).copy_(out_reduced)
 
-    # Attention sink correction: out *= 1 / (1 + exp(sink - lse)).
-    # Fused into a single Triton kernel (`_sink_fold_inplace_kernel`) — one
-    # launch instead of the previous 3-4-kernel torch chain. Kernel streams
-    # out_bf16_cached in place; no fresh allocation.
-    if attn_sink is not None:
-        _apply_sink_fold_inplace(out_bf16_cached, lse_2d, attn_sink)
+        # For multi-split path: only fuse sink+transpose when sink is present.
+        # When no sink, torch's strided .copy_() (5 us) beats Triton's launch
+        # overhead (23 us). See bench_lever1_multisplit.py.
+        if attn_sink is not None:
+            _apply_sink_fold_inplace(
+                out_bf16_cached, lse_2d, attn_sink,
+                lse_bhs_out=lse_bhs_cached, B=B, S_q=S_q,
+            )
+        else:
+            lse_bhs_cached.copy_(lse_2d.view(B, S_q, H).transpose(1, 2))
 
     # Reshape views (no allocation) into the public output shapes.
     out_bf16 = out_bf16_cached.view(B, S_q, H, V_HEAD_DIM)
-    # lse: [total_q, H] → [B, S_q, H] → [B, H, S_q] in cached buffer.
-    # transpose+contiguous would allocate; instead we hand-write the
-    # transpose into lse_bhs_cached via a copy_ from the strided view.
-    lse_bhs_cached.copy_(
-        lse_2d.view(B, S_q, H).transpose(1, 2)
-    )
     return out_bf16, lse_bhs_cached
 
 
@@ -592,24 +788,62 @@ def ck_combine_two_splits(
     else:
         assert lse.shape == (total_q, H) and lse.dtype == torch.float32
 
-    # Phase C3: small-S Triton fast-path. CK combine is launch-overhead-bound at
-    # B*H = 96 blocks × 256 threads = ~1.5 waves/CU on MI355X (~107 µs/call). At
-    # S_a == 1 (forced via SGLANG_CK_V32_FORCE_SPLITS=1, or pick_num_splits when
-    # topk allows), the merge is a 2-way softmax which a Triton (B*H, V/64) grid
-    # handles at much higher CU saturation. Falls back to CK for the general
-    # N-way case (S_a > 1) where the broadcast-LSE design is the better fit.
+    # Phase C3 / Phase E Lever 3: Triton fast-path for combine.
+    #
+    # MICROBENCH on chi2866 MI355X (V32, V=512, H=16):
+    #   shape                CK us   Triton us   speedup
+    #   DEC q=1 S_a=1          2.9      40.5      0.07x   ← Triton REGRESSES
+    #   DEC q=6 S_a=8          4.4      45.1      0.10x   ← Triton REGRESSES
+    #   PFL q=1024 S_a=8      79.5      45.8      1.73x   ← Triton wins
+    #   PFL q=4096 S_a=4     194.4     130.7      1.49x   ← Triton wins
+    #   PFL q=16384 S_a=8   1279.0     818.3      1.56x   ← Triton wins
+    #
+    # Triton has ~40 us constant launch overhead. CK has ~3 us. Triton only
+    # wins when there's enough work to amortize. Gate: use Triton iff
+    # `total_q * (S_a + S_b) >= 8192` (empirically tuned crossover).
+    # Disable Triton path entirely with SGLANG_CK_V32_TRITON_COMBINE=0.
+    # Force-enable regardless of work score with SGLANG_CK_V32_TRITON_COMBINE=force.
     S_a = split_data_a.size(1)
     S_b = split_data_b.size(1) if split_data_b is not None else 0
-    if (
-        os.environ.get("SGLANG_CK_V32_TRITON_COMBINE", "1") == "1"
-        and S_a == 1 and S_b <= 1
-    ):
-        from sglang.jit_kernel.mla_combine_triton import mla_combine_two_splits_triton
-        return mla_combine_two_splits_triton(
-            split_data_a, split_lse_a,
-            split_data_b, split_lse_b,
-            attn_sink, out, lse,
-        )
+    triton_env = os.environ.get("SGLANG_CK_V32_TRITON_COMBINE", "1")
+    use_triton = False
+    if triton_env != "0" and S_b <= 1:
+        work = total_q * (S_a + max(S_b, 1))
+        threshold = int(os.environ.get("SGLANG_CK_V32_TRITON_COMBINE_MIN_WORK", "8192"))
+        use_triton = (triton_env == "force") or (work >= threshold)
+
+    if use_triton:
+        if S_a == 1:
+            from sglang.jit_kernel.mla_combine_triton import (
+                mla_combine_two_splits_triton,
+            )
+            return mla_combine_two_splits_triton(
+                split_data_a, split_lse_a,
+                split_data_b, split_lse_b,
+                attn_sink, out, lse,
+            )
+        # PREFILL N-way path. **ON by default** — chi2811 E2E A/B aligned with
+        # shipping config (2026-04-28, dsv4-flash-base-fp8-shipping-state.md)
+        # showed:
+        #   median TPOT  41.59 → 41.45 ms (-0.3%, neutral)
+        #   median TTFT 251.72 → 250.50 ms (-0.5%, neutral)
+        #   mean   TTFT 520.28 → 441.88 ms (-15.1%, improvement)
+        #   P99    TTFT 2275   → 1533    ms (-32.6%, improvement)
+        #   output tput 92.54 → 93.00 tok/s (+0.5%)
+        # The earlier "P99 TTFT regression" finding was an artifact of an
+        # un-aligned baseline (missing TWO_SHOT=1 / TORCH=1 / 8-request warmup);
+        # with shipping-aligned warmup the cold-compile tail amortizes cleanly.
+        # Disable via SGLANG_CK_V32_TRITON_COMBINE_NWAY=0 if a deployment is
+        # tail-sensitive and unable to do an 8-request warmup at startup.
+        if os.environ.get("SGLANG_CK_V32_TRITON_COMBINE_NWAY", "1") == "1":
+            from sglang.jit_kernel.mla_combine_triton import (
+                mla_combine_n_way_triton,
+            )
+            return mla_combine_n_way_triton(
+                split_data_a, split_lse_a,
+                split_data_b, split_lse_b,
+                attn_sink, out, lse,
+            )
 
     ck = _get_ck_mod()
     ck.mla_combine_fwd_ck(
