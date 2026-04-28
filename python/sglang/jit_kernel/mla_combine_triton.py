@@ -19,6 +19,7 @@ Two entry points:
 Both share the same kernel template; constexpr S_A_MAX_LOG2 (or runtime S_A
 loop via `BLOCK_S` constexpr) selects the body.
 """
+import os
 import torch
 import triton
 import triton.language as tl
@@ -340,7 +341,12 @@ def mla_combine_n_way_triton(
     else:
         assert lse.shape == (total_q, H) and lse.dtype == torch.float32
 
-    BLOCK_V = 64
+    # Phase E v2 tuning (chi2866 MI355X, sweep_nway_combine_tuning.py 2026-04-28):
+    # BLOCK_V=256, num_warps=4 hits HBM roofline (~95-100% of measured 5 TB/s
+    # peak at q≥4096) and is 1.2-2.0x faster than v1 (BLOCK_V=64, num_warps=1)
+    # across the production shape range. Override via env knobs for tuning.
+    BLOCK_V = int(os.environ.get("SGLANG_CK_V32_TRITON_COMBINE_BLOCK_V", "256"))
+    num_warps = int(os.environ.get("SGLANG_CK_V32_TRITON_COMBINE_NUM_WARPS", "4"))
     grid = (total_q * H, triton.cdiv(V, BLOCK_V))
 
     sda_q = split_data_a.stride(0)
@@ -383,7 +389,7 @@ def mla_combine_n_way_triton(
         S_B=S_b,
         HAS_B=has_b,
         HAS_SINK=has_sink,
-        num_warps=1,
+        num_warps=num_warps,
     )
     return out, lse
 
