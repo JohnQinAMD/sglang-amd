@@ -40,6 +40,32 @@ else:
     FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 
+# Per-forward-pass cache for `int(seq_lens.max().item())`. Multiple indexer
+# layers in one forward pass share the same `seq_lens` tensor, but each call
+# to `int(seq_lens.max().item())` forces a D2H sync (~360 us each on AMD —
+# waits for all pending GPU work to drain). Cache by tensor identity to fold
+# ~13 syncs per decode step → 1.
+_SEQ_LENS_MAX_CACHE: "dict[tuple[int, int, int], int]" = {}
+
+
+def _seq_lens_max_cached(seq_lens: torch.Tensor) -> int:
+    """Return `int(seq_lens.max().item())` with single-step caching.
+
+    Cache key combines `id()` and `data_ptr()` to defeat object reuse after
+    GC. Cache is bounded — cleared when it grows beyond a few entries (well
+    above the steady-state 1-2 active forward passes).
+    """
+    key = (id(seq_lens), seq_lens.data_ptr(), seq_lens.numel())
+    cached = _SEQ_LENS_MAX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    val = int(seq_lens.max().item())
+    if len(_SEQ_LENS_MAX_CACHE) > 8:
+        _SEQ_LENS_MAX_CACHE.clear()
+    _SEQ_LENS_MAX_CACHE[key] = val
+    return val
+
+
 def _ensure_scratch(scratch_dict, name, shape, dtype, device):
     """Lazily allocate a persistent scratch tensor and return a contiguous
     EXACT-shape tensor. Reallocates on any shape mismatch — by design, since
@@ -137,7 +163,7 @@ def fp8_paged_mqa_logits_torch(
     if torch.cuda.is_current_stream_capturing():
         effective_max_seq_len = base_cap
     else:
-        effective_max_seq_len = min(int(seq_lens.max().item()), base_cap)
+        effective_max_seq_len = min(_seq_lens_max_cached(seq_lens), base_cap)
         # Round up to block_size so max_num_pages * block_size == padded len.
         effective_max_seq_len = max(
             block_size,
@@ -274,7 +300,7 @@ def fp8_paged_mqa_logits_aiter(
     if torch.cuda.is_current_stream_capturing():
         effective_max_seq_len = base_cap
     else:
-        eff = min(int(seq_lens.max().item()), base_cap)
+        eff = min(_seq_lens_max_cached(seq_lens), base_cap)
         effective_max_seq_len = max(
             block_size,
             ((eff + block_size - 1) // block_size) * block_size,

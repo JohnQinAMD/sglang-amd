@@ -666,6 +666,13 @@ class Compressor(nn.Module):
 
         bs = forward_batch.batch_size
         pt = 0
+        # Pre-host req_pool_indices once. PyTorch's advanced-indexing fast path
+        # calls .item() on a 0-dim CUDA index tensor (~366 us GPU sync each)
+        # when the index is `cuda_tensor[python_int]`. One D2H of bs ints up
+        # front saves `bs * N_use_sites` syncs across this prefill batch.
+        # Sync-reduction hygiene: even if GPU is idle now (host-bound at
+        # baseline), this future-proofs against busier GPU regimes.
+        req_pool_indices_cpu = req_pool_indices.tolist()
         for i in range(bs):
             kv_and_score = kv_and_scores[pt : pt + extend_lens[i]]
             pre_state_indices = self.compute_state_len_indices(
@@ -674,7 +681,7 @@ class Compressor(nn.Module):
             raw_loc = torch.where(
                 pre_state_indices < 0,
                 -1,
-                req_to_token[req_pool_indices[i], pre_state_indices],
+                req_to_token[req_pool_indices_cpu[i], pre_state_indices],
             )
             swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(raw_loc)
             state_loc = state_pool.translate_from_swa_loc_to_state_loc(swa_loc)
@@ -692,7 +699,7 @@ class Compressor(nn.Module):
             post_raw_loc = torch.where(
                 post_state_indices < 0,
                 -1,
-                req_to_token[req_pool_indices[i], post_state_indices],
+                req_to_token[req_pool_indices_cpu[i], post_state_indices],
             )
             post_swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(post_raw_loc)
             post_state_loc = state_pool.translate_from_swa_loc_to_state_loc(
@@ -911,6 +918,11 @@ class Compressor(nn.Module):
 
         bs = forward_batch.batch_size
         pt = 0
+        # Pre-host req_pool_indices once. PyTorch's advanced-indexing fast path
+        # calls .item() on a 0-dim CUDA index tensor (~366 us GPU sync each)
+        # when the index is `cuda_tensor[python_int]`. One D2H of bs ints up
+        # front saves `bs * 2 * N_compressor_layers` syncs per prefill batch.
+        req_pool_indices_cpu = req_pool_indices.tolist()
         for i in range(bs):
             # Definitions of variables
             #
@@ -921,7 +933,7 @@ class Compressor(nn.Module):
             #     content is cat(kv_and_score_state[:old_valid_state_len], kv_and_score)
 
             kv_and_score = kv_and_scores[pt : pt + extend_lens[i]]
-            kv_and_score_state = kv_and_score_states[req_pool_indices[i]]
+            kv_and_score_state = kv_and_score_states[req_pool_indices_cpu[i]]
             if prefix_lens[i] == 0:
                 # NOTE: padding with default values for overlap
                 kv_and_score_state.clear()
@@ -1242,6 +1254,11 @@ class Compressor(nn.Module):
 
         bs = forward_batch.batch_size
         pt = 0
+        # Pre-host req_pool_indices once. PyTorch's advanced-indexing fast path
+        # calls .item() on a 0-dim CUDA index tensor (~366 us GPU sync each)
+        # when the index is `cuda_tensor[python_int]`. One D2H of bs ints up
+        # front saves `bs * 2 * N_compressor_layers` syncs per prefill batch.
+        req_pool_indices_cpu = req_pool_indices.tolist()
         for i in range(bs):
             # Definitions of variables
             #
@@ -1252,7 +1269,7 @@ class Compressor(nn.Module):
             #     content is cat(kv_and_score_state[:old_valid_state_len], kv_and_score)
 
             kv_and_score = kv_and_scores[pt : pt + extend_lens[i]]
-            kv_and_score_state = kv_and_score_states[req_pool_indices[i]]
+            kv_and_score_state = kv_and_score_states[req_pool_indices_cpu[i]]
             if prefix_lens[i] == 0:
                 # NOTE: padding with default values for overlap
                 kv_and_score_state.clear()
