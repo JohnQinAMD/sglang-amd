@@ -100,28 +100,35 @@ export SGLANG_OPT_USE_FUSED_STORE_CACHE=false
 #     `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1` (commit 6e86d00f2).
 #
 # UPDATE 2026-04-28: bug from 2026-04-26 ("garbage tokens at TOPK ≥ 256 +
-# multi-split reduce") appears to be FIXED by Phase A+B+ commit 80b51a16d
-# which added native 4D padded pool support to the CK V32 kernel. Root cause
-# was the OLD launcher's `pidx * stride_kv` address calc reading PAD bytes as
-# fp8 (c4/c128 pools allocate padded rows: 9344 B used + 448 B pad = 9792 B/row).
-# At TOPK ≥ 256 with num_splits ≥ 8, more cross-row gather → more pad-byte
-# reads → garbage. The new 4D-aware address `(pidx/pages_per_row)*pool_outer_stride
-# + (pidx%pages_per_row)*stride_kv` reads correct fp8 bytes.
+# multi-split reduce") was hypothesized fixed by Phase A+B+ commit 80b51a16d
+# (4D padded pool support — root cause was OLD launcher's pidx*stride_kv
+# reading PAD bytes from c4/c128 padded pool rows: 9344 B used + 448 B pad
+# per row).
 #
-# Kernel-level microbench evidence (2026-04-28, chi2866 MI355X):
+# Kernel-level microbench evidence (chi2866 MI355X):
 #   * single-shot @ H=128 TOPK=64-1024:        30/30 PASS (cos_sim 1.0)
 #   * single-shot @ Flash H=16 TOPK=128-512:   12/12 PASS (4D padded pool)
-#   * two-shot multi-split reduce @ TOPK=256/512: 8/8 PASS (the bug warning case)
+#   * two-shot multi-split reduce @ TOPK=256/512: 8/8 PASS
 #   * microbench_ck_v32_padded_pool.py:        5/5 PASS bit-exact
 #
-# E2E COHERENCE CHECK STILL RECOMMENDED before flipping the Flash mxfp4
-# default. Use the `phasee_flash_mxfp4_ck_v32` variant in launch_flash_base_fp8.sh
-# (or set SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1 manually) and verify the model
-# generates coherent text on a few prompts before relying on it.
+# E2E COHERENCE CHECK 2026-04-28 EOD (chi2811, rocm700, Flash mxfp4 with
+# SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1): **STILL GARBAGE TOKENS**. Examples:
+#   "What is the capital of France?" → "f'd/g \r\n# 结  : 1- 1 1 "
+#   "1 + 1 ="                       → " 1 1. 1. 1.2.1. 1.1."
+#   "Largest planet…"               → "the cause of death. The a- - …"
 #
-# Until E2E verified, the launcher's auto-default at line 130 only enables
-# CK V32 for Flash-Base FP8; Flash mxfp4 callers must opt in explicitly via
-# `export SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1`.
+# **Root cause is multi-layer drift, not single-call cos_sim.** Per-call FP8
+# noise (~1e-3 max_diff) compounds over 43 decoder layers of (residual +
+# RMSnorm + MoE re-quantization), drifting the q distribution far enough that
+# the LM head produces wrong tokens. Flash-Base FP8 doesn't hit this because
+# its activation distribution feeding the FP8 quant differs from Flash mxfp4.
+# The bf16 torch ref path stays on the manifold (matmul accumulates in fp32,
+# no per-token FP8 round-trip).
+#
+# **Until a tighter per-call noise floor is engineered (e.g., split-K reduce
+# in fp32 + descale once at end, per flash-base-fp8-uplift-plan.md §6 risk
+# #1), Flash mxfp4 MUST stay on SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0.** The
+# auto-default at line 130 already only enables CK V32 for Flash-Base FP8.
 export SGLANG_TRITON_SPARSE_DECODE=1
 
 # Flash-Base FP8 c=8+ stability: at chunked prefill s_q=8192 the Triton

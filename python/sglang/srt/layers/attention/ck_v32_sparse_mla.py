@@ -318,11 +318,21 @@ def _get_ck_mod():
 
     old_arch = os.environ.get("PYTORCH_ROCM_ARCH", None)
     os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"
+    # Compile-time flag: when SGLANG_CK_V32_FP32_PV=1, build the kernel
+    # with fp32 PV mfma (mfma_f32_16x16x4_f32) instead of the default fp16
+    # mfma. ~8x more MFMA invocations per PV step but matches the bf16
+    # ref path's fp32 softmax-output precision. Required to ship Lever 1's
+    # perf gain on Flash mxfp4 — fp16's 10-bit mantissa wasn't enough.
+    extra_flags = ["-O3", "-std=c++20"]
+    name_suffix = ""
+    if os.environ.get("SGLANG_CK_V32_FP32_PV", "0") == "1":
+        extra_flags.append("-DSGLANG_CK_V32_FP32_PV=1")
+        name_suffix = "_FP32_PV"
     _ck_mod = load(
-        name="ck_mla_decode_sparse_fp8",
+        name=f"ck_mla_decode_sparse_fp8{name_suffix}",
         sources=[os.path.join(src_dir, "mla_decode_fwd.cu")],
         extra_include_paths=[src_dir],
-        extra_cuda_cflags=["-O3", "-std=c++20"],
+        extra_cuda_cflags=extra_flags,
         verbose=False,
     )
     if old_arch is not None:
@@ -333,6 +343,155 @@ def _get_ck_mod():
 
 
 _PICK_NUM_SPLITS_LOGGED = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Production-tensor dump hook for CK V32 garbage-tokens debug
+# ─────────────────────────────────────────────────────────────────────────────
+# Microbench (microbench_ck_v32_512.py) passes 30/30 vs FP32 oracle at random
+# data, but Flash mxfp4 e2e produces garbage tokens at production TOPK ≥ 256
+# with multi-split reduce. The microbench is missing one or more of:
+#   1) production KV distribution (heavy tails / FP8_MAX outliers)
+#   2) production index distribution from indexer + topk_transform_512
+#   3) multi-layer compounding (60+ layers of dependent FP8 quant noise)
+#   4) cuda-graph + multi-stream interactions
+#
+# This hook captures (q, k_cache, indices, attn_sink, sm_scale, num_splits)
+# on a configurable production call, so the replay script
+# `microbench/microbench_ck_v32_replay.py` can run them through both:
+#   - the actual CK V32 path
+#   - a bf16 dense reference (re-quantized FP8 read, matches kernel arithmetic)
+# Disagreement on captured tensors → distribution is the cause; agreement →
+# multi-layer compounding (and the fix shifts to per-call FP8 noise budgeting).
+#
+# Activation:
+#   SGLANG_CK_V32_DUMP_DIR=<path>         ← required to enable
+#   SGLANG_CK_V32_DUMP_SKIP=<int=200>     ← skip N calls (warmup) before first dump
+#   SGLANG_CK_V32_DUMP_COUNT=<int=4>      ← dump this many calls then disable
+#   SGLANG_CK_V32_DUMP_LAYER=<int=-1>     ← only dump on this layer's calls
+#                                            (-1 = any layer; layer counter is
+#                                            the in-process call index modulo
+#                                            num-layers, set via SGLANG_CK_V32_DUMP_NUM_LAYERS)
+#   SGLANG_CK_V32_DUMP_NUM_LAYERS=<int=61>
+#
+# Each dumped file is a single torch.save dict — see _maybe_dump_inputs.
+_DUMP_CALL_COUNT = 0
+_DUMP_FILES_WRITTEN = 0
+_DUMP_HEADER_LOGGED = False
+
+
+def _maybe_dump_inputs(
+    *,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    sm_scale: float,
+    num_splits: int,
+    fp8_decode_scale: float,
+    path_label: str,  # "single_shot" or "two_shot_split"
+) -> None:
+    """Snapshot the first N production calls' inputs to disk.
+
+    No-op when SGLANG_CK_V32_DUMP_DIR is unset. Cheap to keep wired in even
+    when disabled — the env-var check is the only cost on the hot path.
+    """
+    dump_dir = os.environ.get("SGLANG_CK_V32_DUMP_DIR", "")
+    if not dump_dir:
+        return
+
+    global _DUMP_CALL_COUNT, _DUMP_FILES_WRITTEN, _DUMP_HEADER_LOGGED
+    _DUMP_CALL_COUNT += 1
+
+    # DEBUG: per-worker call counter file (atomic append). Helps diagnose
+    # whether the hook is being reached at all in production.
+    try:
+        if _DUMP_CALL_COUNT % 500 == 1:
+            os.makedirs(dump_dir, exist_ok=True)
+            with open(os.path.join(dump_dir, f"_call_counter_pid{os.getpid()}_{path_label}.log"), "a") as _cf:
+                _cf.write(f"call={_DUMP_CALL_COUNT} q={tuple(q.shape)} idx={tuple(indices.shape)} sink={'Y' if attn_sink is not None else 'N'} splits={num_splits}\n")
+    except Exception:
+        pass
+
+    skip = int(os.environ.get("SGLANG_CK_V32_DUMP_SKIP", "10"))
+    count = int(os.environ.get("SGLANG_CK_V32_DUMP_COUNT", "8"))
+    if _DUMP_FILES_WRITTEN >= count:
+        return
+    if _DUMP_CALL_COUNT <= skip:
+        return
+
+    layer_filter = int(os.environ.get("SGLANG_CK_V32_DUMP_LAYER", "-1"))
+    num_layers = int(os.environ.get("SGLANG_CK_V32_DUMP_NUM_LAYERS", "61"))
+    layer_id = (_DUMP_CALL_COUNT - 1) % max(num_layers, 1)
+    if layer_filter >= 0 and layer_id != layer_filter:
+        return
+
+    if not _DUMP_HEADER_LOGGED:
+        os.makedirs(dump_dir, exist_ok=True)
+        print(
+            f"[ck_v32_sparse_mla] DUMP active: dir={dump_dir} "
+            f"skip={skip} count={count} layer_filter={layer_filter} "
+            f"num_layers={num_layers}",
+            flush=True,
+        )
+        _DUMP_HEADER_LOGGED = True
+
+    # Skip cuda-graph-capture placeholder tensors (q is all zeros + indices
+    # are mostly -1). Only dump real production tensors.
+    try:
+        if q.detach().abs().max().item() == 0.0:
+            return
+    except Exception:
+        return  # if even .max() fails (capture context), skip silently
+
+    out_path = os.path.join(
+        dump_dir,
+        f"ck_v32_call_{_DUMP_CALL_COUNT:06d}_layer_{layer_id:03d}_{path_label}.pt",
+    )
+    try:
+        # uint8-viewed FP8 tensors don't .cpu().clone() cleanly in some
+        # configurations — view back to FP8 explicitly when needed.
+        kv_for_dump = k_cache.detach()
+        if kv_for_dump.dtype == torch.uint8:
+            kv_for_dump = kv_for_dump.contiguous()
+        else:
+            kv_for_dump = kv_for_dump.contiguous()
+        kv_cpu = kv_for_dump.cpu().clone()
+        payload = {
+            "call_idx": _DUMP_CALL_COUNT,
+            "layer_id": layer_id,
+            "path_label": path_label,
+            "q": q.detach().contiguous().cpu().clone(),
+            "k_cache": kv_cpu,
+            "k_cache_dtype": str(k_cache.dtype),
+            "indices": indices.detach().contiguous().cpu().clone(),
+            "attn_sink": (None if attn_sink is None else attn_sink.detach().contiguous().cpu().clone()),
+            "sm_scale": float(sm_scale),
+            "num_splits": int(num_splits),
+            "fp8_decode_scale": float(fp8_decode_scale),
+        }
+        torch.save(payload, out_path)
+    except Exception as _dump_exc:
+        # Surface the failure to a sibling file so we can diagnose; don't crash the server.
+        try:
+            with open(os.path.join(dump_dir, f"_DUMP_ERROR_{_DUMP_CALL_COUNT:06d}.txt"), "w") as _ef:
+                import traceback as _tb
+                _ef.write(f"call={_DUMP_CALL_COUNT} layer={layer_id} path={path_label}\n")
+                _ef.write(f"q.shape={tuple(q.shape)} q.dtype={q.dtype}\n")
+                _ef.write(f"k_cache.shape={tuple(k_cache.shape)} k_cache.dtype={k_cache.dtype}\n")
+                _ef.write(f"indices.shape={tuple(indices.shape)} indices.dtype={indices.dtype}\n")
+                _ef.write(f"sink={'present' if attn_sink is not None else 'None'}\n")
+                _ef.write(_tb.format_exc())
+        except Exception:
+            pass
+        return
+    _DUMP_FILES_WRITTEN += 1
+    print(
+        f"[ck_v32_sparse_mla] dumped {out_path} "
+        f"(q={tuple(q.shape)} kv={tuple(k_cache.shape)} idx={tuple(indices.shape)} "
+        f"sink={'Y' if attn_sink is not None else 'N'} splits={num_splits})",
+        flush=True,
+    )
 
 
 def pick_num_splits(B: int, topk: int) -> int:
@@ -436,6 +595,32 @@ def _get_out_buffers(total_q: int, B: int, S_q: int, H: int, V: int,
     return out_bf16, lse_bhs
 
 
+# Cache for reduce/combine output buffers used by `_ck_native_reduce` and
+# `ck_combine_two_splits`. Without this, each of 61 transformer layers
+# allocates fresh ([total_q, H, V] bf16) + ([total_q, H] fp32) per call,
+# pinning ~16 MiB/layer × 61 layers × ~4 captured BS bins ≈ 4 GiB in the
+# cuda-graph private mempool. Sharing per-shape cache reclaims that.
+# Sequential pipeline within each layer guarantees write-before-read ordering.
+_REDUCE_OUT_CACHE: dict = {}
+
+
+def _get_reduce_out_buffers(total_q: int, H: int, V: int,
+                            device: torch.device):
+    """Return (final_output [total_q, H, V] bf16, final_lse [total_q, H] fp32)
+    cached per shape — used by both `_ck_native_reduce` and
+    `ck_combine_two_splits`."""
+    key = (total_q, H, V, str(device))
+    cached = _REDUCE_OUT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    final_output = torch.empty((total_q, H, V), dtype=torch.bfloat16, device=device)
+    final_lse = torch.empty((total_q, H), dtype=torch.float32, device=device)
+    if len(_REDUCE_OUT_CACHE) > 32:
+        _REDUCE_OUT_CACHE.clear()
+    _REDUCE_OUT_CACHE[key] = (final_output, final_lse)
+    return final_output, final_lse
+
+
 def _build_uniform_reduce_meta(total_q: int, num_splits: int, device: torch.device):
     """Build (reduce_indptr, reduce_final_map, reduce_partial_map) for our
     uniform decode split-K scheme. Cached per (total_q, num_splits, device).
@@ -480,8 +665,8 @@ def _ck_native_reduce(split_data: torch.Tensor, split_lse: torch.Tensor,
     partial_output = split_data.view(total_q * num_splits, 1, H, V)
     partial_lse = split_lse.view(total_q * num_splits, 1, H, 1)
 
-    final_output = torch.empty((total_q, H, V), dtype=torch.bfloat16, device=device)
-    final_lse = torch.empty((total_q, H), dtype=torch.float32, device=device)
+    # Hoisted into _REDUCE_OUT_CACHE: shared across 61 layers' reduce calls.
+    final_output, final_lse = _get_reduce_out_buffers(total_q, H, V, device)
 
     _aiter.mla_reduce_v1(
         partial_output, partial_lse,
@@ -581,6 +766,22 @@ def ck_sparse_mla_decode_fp8_v32(
     else:
         # Unknown dtype — fall back to legacy 0.5 for backward compat.
         fp8_decode_scale = 0.5
+    _maybe_dump_inputs(
+        q=q, k_cache=k_cache, indices=indices,
+        attn_sink=attn_sink, sm_scale=sm_scale,
+        num_splits=num_splits, fp8_decode_scale=fp8_decode_scale,
+        path_label="single_shot",
+    )
+    # MARKER: prove ck_sparse_mla_decode_fp8_v32 is reached in production.
+    # No-op on subsequent calls (atomic file create).
+    try:
+        _marker_path = "/sgl-pr/_ck_v32_dumps_flash_mxfp4/_REACHED_single_shot"
+        if not os.path.exists(_marker_path):
+            os.makedirs(os.path.dirname(_marker_path), exist_ok=True)
+            with open(_marker_path, "w") as _mf:
+                _mf.write(f"reached single_shot at call {os.getpid()}\n")
+    except Exception:
+        pass
     ck.mla_decode_fwd_ck_sparse_fp8(
         q_2d, kv_view, split_data, split_lse,
         qo_indptr, kv_indptr, idx_flat,
@@ -746,6 +947,20 @@ def ck_sparse_mla_decode_fp8_v32_to_split(
     else:
         fp8_decode_scale = 0.5
 
+    _maybe_dump_inputs(
+        q=q, k_cache=k_cache, indices=indices,
+        attn_sink=None, sm_scale=sm_scale,
+        num_splits=num_splits, fp8_decode_scale=fp8_decode_scale,
+        path_label="two_shot_split",
+    )
+    try:
+        _marker_path = "/sgl-pr/_ck_v32_dumps_flash_mxfp4/_REACHED_two_shot_split"
+        if not os.path.exists(_marker_path):
+            os.makedirs(os.path.dirname(_marker_path), exist_ok=True)
+            with open(_marker_path, "w") as _mf:
+                _mf.write(f"reached two_shot_split at pid {os.getpid()}\n")
+    except Exception:
+        pass
     ck = _get_ck_mod()
     ck.mla_decode_fwd_ck_sparse_fp8(
         q_2d, kv_view, split_data, split_lse,
@@ -778,14 +993,22 @@ def ck_combine_two_splits(
     """
     total_q, S_a, H, V = split_data_a.shape
     device = split_data_a.device
-    if out is None:
-        out = torch.empty((total_q, H, V), dtype=torch.bfloat16, device=device)
+    if out is None or lse is None:
+        # Hoisted into _REDUCE_OUT_CACHE: shared across 61 layers' combine
+        # calls and with `_ck_native_reduce` (same shape contract).
+        cached_out, cached_lse = _get_reduce_out_buffers(total_q, H, V, device)
+        if out is None:
+            out = cached_out
+        else:
+            assert out.shape == (total_q, H, V) and out.dtype == torch.bfloat16
+            assert out.stride(-1) == 1
+        if lse is None:
+            lse = cached_lse
+        else:
+            assert lse.shape == (total_q, H) and lse.dtype == torch.float32
     else:
         assert out.shape == (total_q, H, V) and out.dtype == torch.bfloat16
         assert out.stride(-1) == 1
-    if lse is None:
-        lse = torch.empty((total_q, H), dtype=torch.float32, device=device)
-    else:
         assert lse.shape == (total_q, H) and lse.dtype == torch.float32
 
     # Phase C3 / Phase E Lever 3: Triton fast-path for combine.

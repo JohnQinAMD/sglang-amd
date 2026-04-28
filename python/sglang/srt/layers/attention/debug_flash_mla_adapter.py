@@ -22,19 +22,29 @@ _invalid_mask_cache: dict = {}
 
 
 def _get_invalid_mask(indices, topk_length, b, s_q, topk):
+    """Item #5 (revised after E2E regression): keep the data_ptr cache for the
+    HIT path (zero-launch fast path), use Triton fusion only on MISS.
+
+    Original observation: removing the cache and using Triton on every call
+    caused +20 ms TPOT regression on chi2811 — under cuda-graph capture the
+    page_table data_ptr is stable, the cache hits reliably, and torch did 0
+    work on the hit path.
+
+    Trade-off: the cache is keyed on `data_ptr() + id(topk_length)` plus
+    `id(indices)` verification, which is documented as unsafe under the caching
+    allocator (per `feedback_data_ptr_caching_unsafe`). On cuda-graph captured
+    decode where the buffers are persistent, hits are correct; on eager calls
+    with allocator churn the indices id check disambiguates.
+    """
     key = (indices.data_ptr(), id(topk_length), b, s_q, topk)
     cached = _invalid_mask_cache.get(key)
     if cached is not None:
         cached_mask, cached_indices_id = cached
         if cached_indices_id == id(indices):
             return cached_mask
-    mask = indices < 0
-    if topk_length is not None:
-        arange_topk = torch.arange(
-            topk, device=indices.device, dtype=topk_length.dtype
-        ).view(1, 1, topk)
-        mask = mask | (arange_topk >= topk_length.view(b, 1, 1))
-    mask_2d = mask.view(b * s_q, topk)
+    # MISS path: fused Triton kernel (was 3 separate ewise launches before).
+    from sglang.jit_kernel.invalid_mask_triton import get_invalid_mask_triton
+    mask_2d = get_invalid_mask_triton(indices, topk_length, b, s_q, topk)
     if len(_invalid_mask_cache) > 16:
         _invalid_mask_cache.clear()
     _invalid_mask_cache[key] = (mask_2d, id(indices))
@@ -134,10 +144,489 @@ def flash_mla_with_kvcache_torch(
         _two_shot_enabled = _two_shot_env == "1"
     # Default-on; opt out with SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0.
     _ck_v32_enabled = _os.environ.get("SGLANG_HIP_SPARSE_MLA_DECODE_FP8", "1") != "0"
+
+    # DEBUG: branch counter — which of the 5 paths (ck_v32_single, ck_v32_two_shot,
+    # ck_v32_model1, fallthrough_ref, _ck_v32_disabled) is the production hot path?
+    # No-op when SGLANG_FLASH_MLA_BRANCH_DUMP unset.
+    _branch_dump_dir = _os.environ.get("SGLANG_FLASH_MLA_BRANCH_DUMP", "")
+    def _bump_branch(_label):
+        if not _branch_dump_dir:
+            return
+        try:
+            import os as __os
+            __os.makedirs(_branch_dump_dir, exist_ok=True)
+            _p = __os.path.join(_branch_dump_dir, f"_branch_pid{__os.getpid()}_{_label}")
+            # File-based atomic counter: append one byte per call.
+            with open(_p, "ab") as _bf:
+                _bf.write(b".")
+        except Exception:
+            pass
+
+    # SHADOW-REF: lightweight per-call hook that, when enabled, runs ref attention
+    # on the SAME tensors the kernel just consumed and appends one CSV line
+    # (call_idx, B, valid_pct, cos_sim, max_diff, ck_amax, rf_amax, rel_diff).
+    # This answers the question "is the e2e drift from a small number of
+    # outlier calls, or from cumulative bf16-floor noise across all calls?"
+    # The 8-capture saved-tensor test sampled 0.7% of production call space;
+    # this hook samples 100% of single_shot calls during a live e2e run.
+    # Enable via SGLANG_FLASH_MLA_SHADOW_REF=<dir>. Optional cap on lines via
+    # SGLANG_FLASH_MLA_SHADOW_REF_MAX (default 5000).
+    _shadow_dir = _os.environ.get("SGLANG_FLASH_MLA_SHADOW_REF", "")
+    _shadow_max = int(_os.environ.get("SGLANG_FLASH_MLA_SHADOW_REF_MAX", "5000"))
+    if not hasattr(flash_mla_with_kvcache_torch, "_shadow_state"):
+        flash_mla_with_kvcache_torch._shadow_state = {"call": 0, "written": 0}
+
+    def _shadow_diff(label, q_in, k_cache_in, indices_in, attn_sink_in,
+                     sm_scale_in, ck_out_in):
+        if not _shadow_dir:
+            return
+        st = flash_mla_with_kvcache_torch._shadow_state
+        st["call"] += 1
+        if st["written"] >= _shadow_max:
+            return
+        try:
+            if q_in.detach().abs().max().item() == 0.0:
+                return  # warmup placeholder
+        except Exception:
+            return
+        try:
+            import os as __os
+            B_, S_, H_, D_ = q_in.shape
+            V_ = ck_out_in.shape[-1]
+            if k_cache_in.dim() == 4:
+                npg, ps, _, slot = k_cache_in.shape
+                kv2d = k_cache_in.reshape(npg * ps, slot)
+            elif k_cache_in.dim() == 3:
+                kv2d = k_cache_in.reshape(-1, k_cache_in.shape[-1])
+            else:
+                kv2d = k_cache_in
+            if kv2d.dtype == torch.uint8:
+                kv2d = kv2d.view(torch.float8_e4m3fn)
+            k_pool_bf = kv2d.to(torch.bfloat16)
+
+            ref_out = torch.zeros(B_, S_, H_, V_, dtype=torch.bfloat16, device=q_in.device)
+            ref_lse = torch.full((B_, H_, S_), float("-inf"),
+                                  dtype=torch.float32, device=q_in.device)
+            for b in range(B_):
+                for s in range(S_):
+                    idx_raw = indices_in[b, s].long()
+                    invalid = idx_raw < 0
+                    if invalid.all():
+                        continue
+                    idx_safe = torch.clamp(idx_raw, min=0)
+                    k_g = k_pool_bf[idx_safe, :D_]
+                    v_g = k_pool_bf[idx_safe, :V_]
+                    scores = (q_in[b, s].float() @ k_g.float().T) * sm_scale_in
+                    scores = torch.where(invalid.view(1, -1),
+                                          torch.tensor(float("-inf"),
+                                                       device=q_in.device), scores)
+                    ref_lse[b, :, s] = torch.logsumexp(scores, dim=-1)
+                    attn = torch.softmax(scores, dim=-1)
+                    ref_out[b, s, :, :] = (attn @ v_g.float()).to(torch.bfloat16)
+            if attn_sink_in is not None:
+                sc = 1.0 / (1.0 + torch.exp(
+                    attn_sink_in.view(1, 1, H_, 1).float()
+                    - ref_lse.transpose(1, 2).unsqueeze(-1).float()))
+                sc = torch.where(torch.isfinite(sc), sc, torch.zeros_like(sc))
+                ref_out = (ref_out.float() * sc).to(torch.bfloat16)
+
+            ck_f = ck_out_in.float().flatten()
+            rf_f = ref_out.float().flatten()
+            n = (ck_f.norm() * rf_f.norm()).item()
+            cs = float(ck_f @ rf_f) / n if n > 1e-12 else float("nan")
+            diff = (ck_f - rf_f).abs()
+            mxd = diff.max().item()
+            ck_amax = ck_f.abs().max().item()
+            rf_amax = rf_f.abs().max().item()
+            rel = mxd / max(rf_amax, 1e-9)
+            valid_pct = (indices_in >= 0).float().mean().item() * 100
+
+            __os.makedirs(_shadow_dir, exist_ok=True)
+            outp = __os.path.join(_shadow_dir, f"shadow_pid{__os.getpid()}.csv")
+            new = not __os.path.exists(outp)
+            with open(outp, "a") as f:
+                if new:
+                    f.write("call,B,Sq,H,topk,valid_pct,cos,maxd,ck_amax,rf_amax,rel\n")
+                f.write(f"{st['call']},{B_},{S_},{H_},{indices_in.shape[-1]},"
+                        f"{valid_pct:.2f},{cs:.6f},{mxd:.4e},"
+                        f"{ck_amax:.4e},{rf_amax:.4e},{rel:.6f}\n")
+            st["written"] += 1
+        except Exception:
+            pass
+
+    # DEBUG: live diff of CK V32 vs torch-bf16 reference. Computed in-process on
+    # the SAME tensors the kernel just consumed — bypasses torch.save/load so we
+    # can distinguish a real kernel bug from a replay-script oracle artifact.
+    # Activate via SGLANG_FLASH_MLA_LIVE_DIFF=<dir> (writes one summary line per
+    # call to a per-pid file). Skip first SGLANG_FLASH_MLA_LIVE_DIFF_SKIP calls
+    # (default 10) to avoid cuda-graph-capture placeholder data.
+    _live_diff_dir = _os.environ.get("SGLANG_FLASH_MLA_LIVE_DIFF", "")
+    _live_diff_skip = int(_os.environ.get("SGLANG_FLASH_MLA_LIVE_DIFF_SKIP", "10"))
+    _live_diff_count = int(_os.environ.get("SGLANG_FLASH_MLA_LIVE_DIFF_COUNT", "8"))
+    if not hasattr(flash_mla_with_kvcache_torch, "_live_diff_state"):
+        flash_mla_with_kvcache_torch._live_diff_state = {"call": 0, "written": 0}
+    def _live_diff(label, q_in, k_cache_in, indices_in, attn_sink_in, sm_scale_in,
+                   ck_out_in, ck_lse_in):
+        if not _live_diff_dir:
+            return
+        st = flash_mla_with_kvcache_torch._live_diff_state
+        st["call"] += 1
+        if st["written"] >= _live_diff_count:
+            return
+        if st["call"] <= _live_diff_skip:
+            return
+        # Skip cuda-graph-capture placeholders (zero q).
+        try:
+            if q_in.detach().abs().max().item() == 0.0:
+                return
+        except Exception:
+            return
+        try:
+            import os as __os
+            __os.makedirs(_live_diff_dir, exist_ok=True)
+            B_, S_, H_, D_ = q_in.shape
+            V_ = ck_out_in.shape[-1]
+            topk_ = indices_in.shape[-1]
+            # Flatten KV pool.
+            if k_cache_in.dim() == 4:
+                npg, ps, _, slot = k_cache_in.shape
+                kv_2d = k_cache_in.reshape(npg * ps, slot)
+            elif k_cache_in.dim() == 3:
+                kv_2d = k_cache_in.reshape(-1, k_cache_in.shape[-1])
+            else:
+                kv_2d = k_cache_in
+            k_full_fp32 = kv_2d.float()  # FP32 oracle: fn-correct per probe.
+            # bf16-MFMA simulator: dequant → bf16 → bf16 matmul (mirrors kernel's
+            # in-tile precision: q[bf16] @ k[bf16] with fp32 accumulator).
+            k_full_bf16 = k_full_fp32.to(torch.bfloat16)
+            # Output containers.
+            ref32 = torch.zeros(B_, S_, H_, V_, dtype=torch.float32, device=q_in.device)
+            refbf = torch.zeros(B_, S_, H_, V_, dtype=torch.float32, device=q_in.device)
+            ref_lse = torch.full((B_, H_, S_), float("-inf"),
+                                 dtype=torch.float32, device=q_in.device)
+            refbf_lse = torch.full((B_, H_, S_), float("-inf"),
+                                   dtype=torch.float32, device=q_in.device)
+            # Per-head ranking diff containers.
+            # rank_pick[mode][b,h,s] = top-k index that mode assigns the largest
+            # softmax weight to. -1 means "all-invalid head, no pick".
+            rank_pick_fp32 = torch.full((B_, H_, S_), -1, dtype=torch.long, device=q_in.device)
+            rank_pick_bf16 = torch.full((B_, H_, S_), -1, dtype=torch.long, device=q_in.device)
+            rank_pick_ck = torch.full((B_, H_, S_), -1, dtype=torch.long, device=q_in.device)
+            top_score_fp32 = torch.zeros((B_, H_, S_), dtype=torch.float32, device=q_in.device)
+            second_score_fp32 = torch.zeros((B_, H_, S_), dtype=torch.float32, device=q_in.device)
+            score_gap = torch.zeros((B_, H_, S_), dtype=torch.float32, device=q_in.device)
+
+            # Per-head valid count (rows where all topk are -1 produce zero
+            # output by definition — tighten oracle to skip them rather than
+            # let logsumexp(-inf,...,-inf) → NaN propagate.
+            valid_per_row = (indices_in >= 0).sum(dim=-1)  # [B, S_q]
+
+            for b_ in range(B_):
+                for s_ in range(S_):
+                    idx_raw = indices_in[b_, s_].to(torch.long)
+                    invalid = idx_raw < 0
+                    if valid_per_row[b_, s_] == 0:
+                        # All-invalid row: defined-behavior output is zeros.
+                        # (Kernel post-Layer-1-2 fix also writes zeros here.)
+                        continue
+                    idx_safe = torch.clamp(idx_raw, min=0)
+                    k_g32 = k_full_fp32[idx_safe, :D_]  # FP32 K
+                    v_g32 = k_full_fp32[idx_safe, :V_]
+                    k_gb16 = k_full_bf16[idx_safe, :D_]  # bf16 K (MFMA mirror)
+                    v_gb16 = k_full_bf16[idx_safe, :V_]
+
+                    q_h32 = q_in[b_, s_, :, :].float()
+                    q_hb16 = q_in[b_, s_, :, :].to(torch.bfloat16)
+
+                    scores32 = (q_h32 @ k_g32.T) * sm_scale_in
+                    # bf16 MFMA sim: q[bf16] @ k[bf16] in fp32 accumulator
+                    # (matches gfx950 mfma_bf16_16x16x32 numerics — bf16 inputs,
+                    # fp32 acc — but does NOT replicate the kernel's per-tile
+                    # max-trick / online-softmax; this is a "raw score" diff).
+                    scores_b = (q_hb16.float() @ k_gb16.float().T) * sm_scale_in
+
+                    # Mask invalid keys with -inf (matches Layer-2-fixed kernel)
+                    inv_b = invalid.view(1, -1).expand(H_, -1)
+                    scores32 = torch.where(inv_b, torch.tensor(float("-inf"),
+                                           device=q_in.device), scores32)
+                    scores_b = torch.where(inv_b, torch.tensor(float("-inf"),
+                                           device=q_in.device), scores_b)
+
+                    # FP32 oracle output.
+                    lse32 = torch.logsumexp(scores32, dim=-1)
+                    ref_lse[b_, :, s_] = lse32
+                    attn32 = torch.softmax(scores32, dim=-1)
+                    ref32[b_, s_, :, :] = attn32 @ v_g32
+
+                    # bf16-MFMA sim output.
+                    lseb = torch.logsumexp(scores_b, dim=-1)
+                    refbf_lse[b_, :, s_] = lseb
+                    attnb = torch.softmax(scores_b, dim=-1)
+                    refbf[b_, s_, :, :] = attnb @ v_g32  # bf16 attn × fp32 V
+
+                    # Top-1 pick per (b, h, s) from FP32 + bf16 + (later) ck.
+                    # rank_pick uses argmax over scores (ignoring -inf invalids).
+                    rank_pick_fp32[b_, :, s_] = scores32.argmax(dim=-1)
+                    rank_pick_bf16[b_, :, s_] = scores_b.argmax(dim=-1)
+
+                    # FP32 score gap (top1 - top2): if gap < bf16 ULP near
+                    # top1, ranking divergence is precision-noise-driven.
+                    s_sorted, _ = torch.sort(scores32, dim=-1, descending=True)
+                    top_score_fp32[b_, :, s_] = s_sorted[:, 0]
+                    # second-best where valid; if only 1 valid, equals top
+                    second_score_fp32[b_, :, s_] = s_sorted[:, 1]
+                    score_gap[b_, :, s_] = s_sorted[:, 0] - s_sorted[:, 1]
+
+            # Apply attn_sink fold (matches kernel wrapper's behavior).
+            if attn_sink_in is not None:
+                sink = attn_sink_in.view(1, 1, H_, 1).float()
+                lse_b = ref_lse.transpose(1, 2).unsqueeze(-1).float()
+                sc32 = 1.0 / (1.0 + torch.exp(sink - lse_b))
+                # Heads with -inf lse → sink-lse=+inf → exp=+inf → sc=0 →
+                # NaN propagates only if 0×inf shows up; mask explicitly.
+                sc32 = torch.where(torch.isfinite(sc32), sc32,
+                                   torch.zeros_like(sc32))
+                ref32 = ref32.float() * sc32
+                lse_bf = refbf_lse.transpose(1, 2).unsqueeze(-1).float()
+                scbf = 1.0 / (1.0 + torch.exp(sink - lse_bf))
+                scbf = torch.where(torch.isfinite(scbf), scbf,
+                                   torch.zeros_like(scbf))
+                refbf = refbf.float() * scbf
+
+            # Final NaN scrub on both refs (defined-behavior: NaN → 0).
+            ref32 = torch.nan_to_num(ref32, nan=0.0, posinf=0.0, neginf=0.0)
+            refbf = torch.nan_to_num(refbf, nan=0.0, posinf=0.0, neginf=0.0)
+
+            ref32_bf = ref32.to(torch.bfloat16)
+            refbf_bf = refbf.to(torch.bfloat16)
+
+            # Recover the kernel's per-head argmax from ck_out: which index
+            # has output most aligned with V_index. Approximate: for each
+            # (b,h,s), find the topk index whose V row is closest in
+            # direction to ck_out[b,s,h,:]. This is a heuristic but usually
+            # right when softmax is dominated by one key.
+            # (Skip if too expensive; bound H × topk × V dot products.)
+            try:
+                ck_pick = torch.full((B_, H_, S_), -1, dtype=torch.long,
+                                     device=q_in.device)
+                for b_ in range(B_):
+                    for s_ in range(S_):
+                        if valid_per_row[b_, s_] == 0:
+                            continue
+                        idx_raw = indices_in[b_, s_].to(torch.long)
+                        invalid = idx_raw < 0
+                        idx_safe = torch.clamp(idx_raw, min=0)
+                        v_g = k_full_fp32[idx_safe, :V_]   # [topk, V]
+                        v_norm = v_g / (v_g.norm(dim=-1, keepdim=True) + 1e-9)
+                        co = ck_out_in[b_, s_, :, :].float()
+                        co_norm = co / (co.norm(dim=-1, keepdim=True) + 1e-9)
+                        sims = co_norm @ v_norm.T  # [H, topk]
+                        sims = torch.where(invalid.view(1, -1),
+                                           torch.tensor(-2.0, device=q_in.device), sims)
+                        ck_pick[b_, :, s_] = sims.argmax(dim=-1)
+                rank_pick_ck = ck_pick
+            except Exception:
+                pass
+
+            # ───── Diff summary ─────
+            ck_flat = ck_out_in.float().flatten()
+            r32_flat = ref32_bf.float().flatten()
+            rbf_flat = refbf_bf.float().flatten()
+            def _cos(a, b):
+                n = (a.norm() * b.norm()).item()
+                return float(a @ b) / n if n > 1e-12 else float("nan")
+            cos_ck_r32 = _cos(ck_flat, r32_flat)
+            cos_ck_rbf = _cos(ck_flat, rbf_flat)
+            cos_r32_rbf = _cos(r32_flat, rbf_flat)
+            mxd_ck_r32 = (ck_flat - r32_flat).abs().max().item()
+            mxd_ck_rbf = (ck_flat - rbf_flat).abs().max().item()
+            mxd_r32_rbf = (r32_flat - rbf_flat).abs().max().item()
+
+            # Ranking-divergence stats (only at valid heads).
+            # Where rank_pick_fp32 != rank_pick_bf16: bf16-precision-driven
+            # disagreement (fp32 → bf16 score truncation flips top-1).
+            valid_head = (rank_pick_fp32 >= 0)
+            n_valid = int(valid_head.sum().item())
+            mismatch_fp32_bf16 = int(((rank_pick_fp32 != rank_pick_bf16) & valid_head).sum().item())
+            mismatch_fp32_ck = int(((rank_pick_fp32 != rank_pick_ck) & valid_head).sum().item())
+            mismatch_bf16_ck = int(((rank_pick_bf16 != rank_pick_ck) & valid_head).sum().item())
+            # For mismatches, what's the score gap (in bf16 ULPs at top1)?
+            # ULP near top: rough estimate = abs(top1) / 256 (bf16 7-bit mantissa).
+            ulp_at_top = top_score_fp32.abs() / 256.0
+            mismatch_mask = (rank_pick_fp32 != rank_pick_ck) & valid_head
+            if mismatch_mask.any():
+                gap_at_mismatch = score_gap[mismatch_mask]
+                ulp_at_mismatch = ulp_at_top[mismatch_mask]
+                ratio = (gap_at_mismatch / (ulp_at_mismatch + 1e-9)).cpu().tolist()
+                # Fraction of mismatches where gap < 4 bf16 ULPs (precision-driven)
+                precision_driven = sum(1 for r in ratio if r < 4.0) / len(ratio)
+                gap_mean = float(gap_at_mismatch.mean().item())
+            else:
+                precision_driven = float("nan")
+                gap_mean = float("nan")
+
+            valid_pct = (indices_in >= 0).float().mean().item() * 100
+            pid_ = __os.getpid()
+            outp = __os.path.join(_live_diff_dir, f"_live_diff_pid{pid_}.log")
+            with open(outp, "a") as _f:
+                _f.write(
+                    f"call={st['call']:4d} {label:13s} "
+                    f"B={B_:4d} H={H_:3d} topk={topk_:3d} valid%={valid_pct:5.1f} | "
+                    f"cos(ck,r32)={cos_ck_r32:+.4f} cos(ck,rbf)={cos_ck_rbf:+.4f} "
+                    f"cos(r32,rbf)={cos_r32_rbf:+.4f} | "
+                    f"mxd(ck,r32)={mxd_ck_r32:.2e} mxd(ck,rbf)={mxd_ck_rbf:.2e} "
+                    f"mxd(r32,rbf)={mxd_r32_rbf:.2e} | "
+                    f"rank_mismatch fp32_vs_bf16={mismatch_fp32_bf16}/{n_valid} "
+                    f"fp32_vs_ck={mismatch_fp32_ck}/{n_valid} "
+                    f"bf16_vs_ck={mismatch_bf16_ck}/{n_valid} | "
+                    f"precision_driven_frac={precision_driven:.3f} "
+                    f"gap_at_mismatch_mean={gap_mean:.3e}\n"
+                )
+
+            # ───── Single-(b,h,s) drill-down for ONE mismatching head ─────
+            # Pick the first (b, h, s) where rank_pick_fp32 != rank_pick_ck and
+            # the head is valid. Dump q[b,h], indices[b,s], per-X score from
+            # fp32 oracle, the kernel's picked index (via ck_pick), and the
+            # ck_out direction. This disambiguates hypothesis 1/2/3 from the
+            # state doc.
+            try:
+                mm = (rank_pick_fp32 != rank_pick_ck) & valid_head
+                if mm.any():
+                    # take the first mismatch
+                    flat_idx = mm.flatten().nonzero(as_tuple=False).flatten()[0].item()
+                    b_pick = flat_idx // (H_ * S_)
+                    rest = flat_idx - b_pick * (H_ * S_)
+                    h_pick = rest // S_
+                    s_pick = rest % S_
+                    idx_b_s = indices_in[b_pick, s_pick].to(torch.long)
+                    invalid_b_s = idx_b_s < 0
+                    q_h_fp32 = q_in[b_pick, s_pick, h_pick, :].float()  # [D]
+                    # Score per topk index from FP32 oracle (q · K[idx]).
+                    idx_safe = torch.clamp(idx_b_s, min=0)
+                    k_g = k_full_fp32[idx_safe, :D_]  # [topk, D]
+                    scores_fp32 = (q_h_fp32 @ k_g.T) * sm_scale_in  # [topk]
+                    scores_fp32 = torch.where(invalid_b_s, torch.tensor(
+                        float("-inf"), device=q_in.device), scores_fp32)
+                    fp32_top1_X = int(rank_pick_fp32[b_pick, h_pick, s_pick].item())
+                    fp32_top1_score = float(scores_fp32[fp32_top1_X].item())
+                    fp32_top1_kv_idx = int(idx_b_s[fp32_top1_X].item())
+
+                    ck_top1_X = int(rank_pick_ck[b_pick, h_pick, s_pick].item())
+                    ck_top1_score_per_oracle = float(scores_fp32[ck_top1_X].item())
+                    ck_top1_kv_idx = int(idx_b_s[ck_top1_X].item()) if ck_top1_X >= 0 else -1
+
+                    # If kernel's chosen index has a score the oracle ranks LOW,
+                    # the kernel reads from a different KV row OR computes a
+                    # different score. To distinguish, recompute the score the
+                    # kernel WOULD see if it correctly indexed this kv slot:
+                    # `q_h_fp32 @ K[ck_top1_kv_idx]`. If that fp32 score equals
+                    # the oracle's score for ck_top1_X, the kernel's MFMA math
+                    # is correct but it's picking the wrong X (mask/index
+                    # selection bug). If it differs, the kernel reads K from
+                    # the wrong KV row (indexing bug).
+                    if ck_top1_kv_idx >= 0:
+                        k_at_ck = k_full_fp32[ck_top1_kv_idx, :D_]
+                        kernel_kv_implied_score = float(
+                            ((q_h_fp32 @ k_at_ck) * sm_scale_in).item())
+                    else:
+                        kernel_kv_implied_score = float("nan")
+
+                    # Sort scores to show fp32's top-5 vs where the kernel picked.
+                    s_sorted, s_argsort = torch.sort(scores_fp32, descending=True)
+                    top5_X = s_argsort[:5].tolist()
+                    top5_scores = s_sorted[:5].tolist()
+                    top5_kv = [int(idx_b_s[x].item()) for x in top5_X]
+
+                    # Find rank of ck_top1_X in fp32 sort (1-based).
+                    ck_rank_in_fp32 = int(
+                        (s_argsort == ck_top1_X).nonzero(as_tuple=False)
+                        .flatten()[0].item()) + 1
+
+                    drill_path = __os.path.join(
+                        _live_diff_dir,
+                        f"_drilldown_pid{pid_}_call{st['call']}.log",
+                    )
+                    with open(drill_path, "w") as _df:
+                        _df.write(f"=== Drill-down for call {st['call']} ===\n")
+                        _df.write(f"label={label} B={B_} H={H_} S_q={S_} D={D_} V={V_} topk={topk_}\n")
+                        _df.write(f"valid_pct={valid_pct:.2f}% sm_scale={sm_scale_in:.6f}\n")
+                        _df.write(f"\nPicked (b,h,s)=({b_pick},{h_pick},{s_pick}) — first rank-mismatch\n")
+                        _df.write(f"  valid_count_in_row={int((idx_b_s>=0).sum().item())}\n\n")
+                        _df.write(f"FP32 oracle top-5 (X = topk-slot index):\n")
+                        for r, (x, sc, kv) in enumerate(zip(top5_X, top5_scores, top5_kv)):
+                            _df.write(f"  rank{r+1}: X={x:3d} score={sc:+.4f} kv_idx={kv}\n")
+                        _df.write(f"\nKernel's picked X (via output-direction match): X={ck_top1_X}\n")
+                        _df.write(f"  → kv_idx (from indices[b,s,X])={ck_top1_kv_idx}\n")
+                        _df.write(f"  → fp32 score for THIS X={ck_top1_score_per_oracle:+.4f}\n")
+                        _df.write(f"  → fp32 rank of kernel's pick in oracle's order: {ck_rank_in_fp32}/{topk_}\n")
+                        _df.write(f"\nDecision tree:\n")
+                        score_for_kv = kernel_kv_implied_score
+                        oracle_at_X = ck_top1_score_per_oracle
+                        # Kernel's score for the kv slot it picked is `score_for_kv`.
+                        # If kernel were correctly reading kv_pool[ck_top1_kv_idx],
+                        # MFMA would give score ≈ score_for_kv.
+                        # If oracle says score_for_kv ≈ oracle_at_X, the kernel's
+                        # MFMA is correctly producing this score — and it's just
+                        # a low-ranked score in the oracle's ordering. So the
+                        # kernel must believe it's high (mask/argmax bug).
+                        # If score_for_kv >> oracle_at_X, kernel is reading from
+                        # a different kv row.
+                        _df.write(f"  q · k_pool[ck_top1_kv_idx={ck_top1_kv_idx}] * sm_scale = {score_for_kv:+.4f}\n")
+                        _df.write(f"  oracle's score for this X         = {oracle_at_X:+.4f}\n")
+                        _df.write(f"  fp32 top-1 score                 = {fp32_top1_score:+.4f}\n")
+                        if not (oracle_at_X != oracle_at_X):  # not nan
+                            if abs(score_for_kv - oracle_at_X) > 0.01:
+                                _df.write("  → q·K mismatch: KERNEL READS K FROM WRONG ROW (hyp 1)\n")
+                            else:
+                                _df.write("  → q·K matches: kernel sees correct score for ck pick\n")
+                                _df.write("  → but oracle ranks ck's pick LOW → KERNEL ARGMAX/MASK BUG (hyp 2)\n")
+                                _df.write("  → OR Q/K HEAD ALIGNMENT WRONG (hyp 3)\n")
+
+                        # Also dump per-index scores (full topk) for forensic.
+                        _df.write(f"\nFull per-X fp32 scores (sorted):\n")
+                        all_X = s_argsort.tolist()
+                        all_sc = s_sorted.tolist()
+                        all_kv = [int(idx_b_s[x].item()) for x in all_X]
+                        for r in range(min(20, len(all_X))):
+                            tag = " ← KERNEL_PICK" if all_X[r] == ck_top1_X else ""
+                            _df.write(f"  rank{r+1:3d}: X={all_X[r]:3d} score={all_sc[r]:+.4f} kv_idx={all_kv[r]}{tag}\n")
+            except Exception as _ex:
+                try:
+                    with open(__os.path.join(_live_diff_dir,
+                              f"_drilldown_pid{__os.getpid()}_ERR.log"), "a") as _f:
+                        import traceback as _tb
+                        _f.write(f"call={st['call']}\n{_tb.format_exc()}")
+                except Exception:
+                    pass
+
+            st["written"] += 1
+        except Exception as _ex:
+            try:
+                with open(__os.path.join(_live_diff_dir, f"_live_diff_pid{__os.getpid()}_ERR.log"), "a") as _f:
+                    import traceback as _tb
+                    _f.write(f"call={st['call']} label={label}\n")
+                    _f.write(_tb.format_exc())
+            except Exception:
+                pass
+    # Log the dispatch metadata once per (s_q, d_qk, d_v, has_extra) shape.
+    _bump_branch(f"entry_sq{s_q}_dqk{d_qk}_dv{d_v}_extra{0 if extra_k_cache is None else 1}_2shot{int(_two_shot_enabled)}_ckenabled{int(_ck_v32_enabled)}")
+
+    # Layer-3 GATE: gate the broken single_shot path off. When extra_k_cache
+    # is None at decode (s_q=1), the kernel has a labeled-transpose bug that
+    # produces wrong attention output. Skip the CK V32 dispatch entirely in
+    # that case so we fall through to ref_sparse_attn_decode (slow but correct).
+    # Override via SGLANG_HIP_CK_V32_SINGLESHOT=1 (debug only, known-broken).
+    _singleshot_gated_off = (
+        extra_k_cache is None
+        and not _two_shot_enabled
+        and _os.environ.get("SGLANG_HIP_CK_V32_SINGLESHOT", "0") != "1"
+    )
+
     if (
         _ck_v32_enabled
         and indices is not None
         and (extra_k_cache is None or _two_shot_enabled)
+        and not _singleshot_gated_off
     ):
         topk = indices.shape[-1]
         invalid_mask_2d = _get_invalid_mask(indices, topk_length, b, s_q, topk)
@@ -155,7 +644,13 @@ def flash_mla_with_kvcache_torch(
             )
 
             if extra_k_cache is None:
+                _bump_branch("path_ck_v32_single_shot")
                 # Single CK V32 call (production fast path).
+                # NOTE: at decode (s_q=1, _two_shot_enabled=False) this branch
+                # is gated OFF higher up via _singleshot_gated_off — the
+                # outer guard prevents entering this if-block in the broken
+                # regime. We only reach here when SGLANG_HIP_CK_V32_SINGLESHOT=1
+                # explicitly forces the broken path for debugging.
                 out, lse = ck_sparse_mla_decode_fp8_v32(
                     q=q.contiguous(),
                     k_cache=k_cache,
@@ -163,6 +658,14 @@ def flash_mla_with_kvcache_torch(
                     invalid_mask=invalid_mask_2d,
                     attn_sink=attn_sink,
                     sm_scale=sm_scale_f,
+                )
+                _live_diff(
+                    "single_shot", q.contiguous(), k_cache, indices_i32,
+                    attn_sink, sm_scale_f, out, lse,
+                )
+                _shadow_diff(
+                    "single_shot", q.contiguous(), k_cache, indices_i32,
+                    attn_sink, sm_scale_f, out,
                 )
                 return out, lse
 
@@ -174,6 +677,7 @@ def flash_mla_with_kvcache_torch(
             # (with strides) and optionally fuses the attn_sink fold inline,
             # eliminating the small-launch dispatch overhead that caused the
             # +131 ms elementwise regression in Phase B.
+            _bump_branch("path_ck_v32_two_shot_split")
             from sglang.srt.layers.attention.ck_v32_sparse_mla import (
                 ck_sparse_mla_decode_fp8_v32_to_split,
                 ck_combine_two_splits,
@@ -231,6 +735,7 @@ def flash_mla_with_kvcache_torch(
             return out, lse
 
         if d_qk == 512 and d_v == 448 and extra_k_cache is None:
+            _bump_branch("path_ck_v32_model1")
             # MODEL1 legacy path; only single-cache supported.
             import sys as _sys
             _ws = "/mnt/vast/john/rocm-dynamo/kernel-agents/experiments/dsv4_sparse_mla_decode_hip_workspace"
@@ -347,6 +852,7 @@ def flash_mla_with_kvcache_torch(
     #     f"{get_tensor_info(t.extra_kv_scope.blocked_k_quantized) if t.extra_kv_scope is not None else None=} "
     # )
 
+    _bump_branch("path_fallthrough_ref_sparse_attn_decode")
     pack_ref = ref_sparse_attn_decode(p, t)
 
     # tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
