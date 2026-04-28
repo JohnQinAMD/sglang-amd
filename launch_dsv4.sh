@@ -147,6 +147,30 @@ if [ "${SGLANG_HIP_CK_V32_TWO_SHOT:-}" = "" ]; then
     export SGLANG_HIP_CK_V32_TWO_SHOT=auto
 fi
 
+# Phase 9 v2 (2026-04-28): default-on the HIP fused make_swa_indices kernel.
+# Replaces the broken TileLang fast-path (empty kernel body on this gfx950/TVM
+# stack) AND the CPU Python double-loop (~5,120 inner iter / prefill batch).
+# Aligned bench result on chi2774 (Flash-Base FP8, 40 prompts c=4 max=6):
+#     metric           pre-Phase 9    + HIP make_swa     delta
+#     TPOT (ms)          41.39          41.29           -0.10  (neutral)
+#     TTFT (ms)          219.17         208.17         -11.16  (-5.1%)
+#     output tok/s        89.91          90.95         +1.16%
+#     duration (s)       405.09         400.43          -4.66 (-1.2%)
+# Microbench: 12/12 PASS bit-exact vs CPU reference; 22 us/call median at
+# production shape (vs CPU 65 ms, 2900x speedup).
+# Opt-out by setting SGLANG_HIP_SWA_PREPARE=0 explicitly. Also disables the
+# upstream TileLang path (default true) since it miscompiles on this stack.
+if [ "${SGLANG_HIP_SWA_PREPARE:-}" = "" ]; then
+    export SGLANG_HIP_SWA_PREPARE=1
+fi
+if [ "${SGLANG_OPT_USE_TILELANG_SWA_PREPARE:-}" = "" ] \
+   && [ "${SGLANG_HIP_SWA_PREPARE}" = "1" ]; then
+    # Belt-and-suspenders: silence the broken TileLang fast-path when the HIP
+    # replacement is active. paged_prefill.py checks HIP first, so this is
+    # defensive only.
+    export SGLANG_OPT_USE_TILELANG_SWA_PREPARE=false
+fi
+
 # Phase E (2026-04-28) — sparse MLA combine kernel gates for any DSv4 path
 # routed through ck_v32_sparse_mla.py (Flash-Base FP8 + any future variant).
 # Code defaults already match these — exported explicitly for discoverability.
