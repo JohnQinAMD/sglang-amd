@@ -62,17 +62,19 @@ def make_swa_ring_buffer_indices(
     if envs.SGLANG_HIP_SWA_PREPARE.get():
         from sglang.srt.layers.swa_indices_hip import hip_make_swa_prefill_indices
 
+        # Kernel handles int32 + int64 directly so we can skip the dtype cast,
+        # and computes cu_seqlens_q on-the-fly so we can skip cumsum + pad.
         seq_lens = forward_batch.seq_lens
         extend_lens = forward_batch.extend_seq_lens
         assert extend_lens is not None
-        seq_lens_k = seq_lens.to(torch.int32)
-        seq_lens_q = extend_lens.to(torch.int32)
+        if extend_lens.dtype != seq_lens.dtype:
+            extend_lens = extend_lens.to(seq_lens.dtype)
         swa_indices = torch.empty(
             (extend_num_tokens, SWA_WINDOW), device=device, dtype=torch.int32
         )
         return hip_make_swa_prefill_indices(
-            seq_lens_k=seq_lens_k,
-            seq_lens_q=seq_lens_q,
+            seq_lens_k=seq_lens,
+            seq_lens_q=extend_lens,
             swa_indices=swa_indices,
         )
     if envs.SGLANG_OPT_USE_TILELANG_SWA_PREPARE.get():

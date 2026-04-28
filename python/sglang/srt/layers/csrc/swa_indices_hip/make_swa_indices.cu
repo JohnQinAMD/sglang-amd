@@ -11,16 +11,20 @@
 // Also replaces the broken TileLang fast-path
 // (sglang/jit_kernel/swa_indices_tilelang.py) which compiles to an empty kernel
 // body on this gfx950/TVM stack — see microbench_swa_indices.py for the repro
-// and feedback_tilelang_codegen_bugs_gfx950 memory entry for the diagnosis.
+// and feedback_tilelang_codegen_bugs_gfx950 memory entry.
 //
 // Algorithm (mirrors the CPU reference exactly):
 //   for token_id in [0, num_q_tokens):
-//       seq_idx = first s s.t. cu_seqlens_q[s] <= token_id < cu_seqlens_q[s+1]
+//       cum = 0
+//       for s in [0, batch_size):
+//           if cum <= token_id < cum + seq_lens_q[s]:
+//               seq_idx = s; cum_qo_len = cum; break
+//           cum += seq_lens_q[s]
 //       prefix_len = seq_lens_k[seq_idx] - seq_lens_q[seq_idx]
-//       end   = prefix_len + (token_id - cu_seqlens_q[seq_idx]) + 1
+//       end   = prefix_len + (token_id - cum_qo_len) + 1
 //       start = max(end - SWA_WINDOW, 0)
 //       old_kv_start = seq_idx * SWA_WINDOW
-//       new_kv_start = batch_size * SWA_WINDOW + cu_seqlens_q[seq_idx]
+//       new_kv_start = batch_size * SWA_WINDOW + cum_qo_len
 //       for j in [0, SWA_WINDOW):
 //           abs_pos = start + j
 //           if abs_pos < end:
@@ -32,8 +36,11 @@
 //               out[token_id, j] = -1
 //
 // One block = WARPS_PER_BLOCK * WARP_SIZE threads. One warp per token. Each
-// lane writes (SWA_WINDOW / WARP_SIZE) cells. batch_size scan is uniform across
-// the warp (compiler keeps it scalar).
+// lane writes (SWA_WINDOW / WARP_SIZE) cells. The batch_size scan computes
+// cu_seqlens_q on-the-fly, eliminating the wrapper's `torch.cumsum + pad`
+// preamble (saves 2 kernel launches per call). Templated on the seq-lens dtype
+// so callers can pass int64 directly without first casting (saves 2 more
+// launches per call).
 
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
@@ -46,12 +53,11 @@ namespace swa_indices_hip {
 constexpr int WARP_SIZE = 64;
 constexpr int WARPS_PER_BLOCK = 4;  // 256 threads/block
 
-template <int SWA_WINDOW>
+template <typename SeqT, int SWA_WINDOW>
 __global__ __launch_bounds__(WARP_SIZE * WARPS_PER_BLOCK)
 void make_swa_indices_kernel(
-    const int32_t* __restrict__ seq_lens_k,
-    const int32_t* __restrict__ seq_lens_q,
-    const int32_t* __restrict__ cu_seqlens_q,
+    const SeqT*    __restrict__ seq_lens_k,
+    const SeqT*    __restrict__ seq_lens_q,
     int32_t*       __restrict__ swa_indices,
     int batch_size,
     int num_q_tokens
@@ -65,23 +71,25 @@ void make_swa_indices_kernel(
     const int token_id      = blockIdx.x * WARPS_PER_BLOCK + warp_in_block;
     if (token_id >= num_q_tokens) return;
 
-    // Find seq_idx: first s such that cu_seqlens_q[s] <= token_id < cu_seqlens_q[s+1].
-    // This is uniform across the warp (compiler should keep scalar).
+    // Find seq_idx: first s such that cum_so_far <= token_id < cum_so_far + qo_len_s.
+    // Computes cu_seqlens_q on-the-fly so the wrapper doesn't need a separate
+    // cumsum+pad preamble (saves 2 kernel launches per call).
     int seq_idx = 0;
     int cum_qo_len = 0;
+    int qo_at_seq_idx = 0;
     #pragma unroll 1
     for (int s = 0; s < batch_size; ++s) {
-        int lo = cu_seqlens_q[s];
-        int hi = cu_seqlens_q[s + 1];
-        if (lo <= token_id && token_id < hi) {
+        int qo_len_s = (int)seq_lens_q[s];
+        if (cum_qo_len + qo_len_s > token_id) {
             seq_idx = s;
-            cum_qo_len = lo;
+            qo_at_seq_idx = qo_len_s;
             break;
         }
+        cum_qo_len += qo_len_s;
     }
 
-    const int kv_len      = seq_lens_k[seq_idx];
-    const int qo_len      = seq_lens_q[seq_idx];
+    const int kv_len      = (int)seq_lens_k[seq_idx];
+    const int qo_len      = qo_at_seq_idx;
     const int prefix_len  = kv_len - qo_len;
     const int curr_qo_idx = token_id - cum_qo_len;
     const int end_abs_pos = prefix_len + curr_qo_idx + 1;
@@ -108,11 +116,10 @@ void make_swa_indices_kernel(
     }
 }
 
-template <int SWA_WINDOW>
-static void launch_one(
+template <typename SeqT, int SWA_WINDOW>
+static void launch_one_dtype_window(
     const torch::Tensor& seq_lens_k,
     const torch::Tensor& seq_lens_q,
-    const torch::Tensor& cu_seqlens_q,
     torch::Tensor&       swa_indices
 ) {
     const int num_q_tokens = (int)swa_indices.size(0);
@@ -124,43 +131,53 @@ static void launch_one(
 
     auto stream = at::cuda::getCurrentHIPStreamMasqueradingAsCUDA();
     hipLaunchKernelGGL(
-        (make_swa_indices_kernel<SWA_WINDOW>),
+        (make_swa_indices_kernel<SeqT, SWA_WINDOW>),
         grid, block, 0, stream.stream(),
-        seq_lens_k.data_ptr<int32_t>(),
-        seq_lens_q.data_ptr<int32_t>(),
-        cu_seqlens_q.data_ptr<int32_t>(),
+        seq_lens_k.data_ptr<SeqT>(),
+        seq_lens_q.data_ptr<SeqT>(),
         swa_indices.data_ptr<int32_t>(),
         batch_size,
         num_q_tokens
     );
 }
 
+template <int SWA_WINDOW>
+static void launch_one_window(
+    const torch::Tensor& seq_lens_k,
+    const torch::Tensor& seq_lens_q,
+    torch::Tensor&       swa_indices
+) {
+    const auto dt = seq_lens_k.scalar_type();
+    if (dt == at::kInt) {
+        launch_one_dtype_window<int32_t, SWA_WINDOW>(seq_lens_k, seq_lens_q, swa_indices);
+    } else if (dt == at::kLong) {
+        launch_one_dtype_window<int64_t, SWA_WINDOW>(seq_lens_k, seq_lens_q, swa_indices);
+    } else {
+        TORCH_CHECK(false, "seq_lens dtype must be int32 or int64");
+    }
+}
+
 void make_swa_indices_launch(
-    torch::Tensor seq_lens_k,    // int32 [batch_size]
-    torch::Tensor seq_lens_q,    // int32 [batch_size]
-    torch::Tensor cu_seqlens_q,  // int32 [batch_size + 1]
+    torch::Tensor seq_lens_k,    // int32/int64 [batch_size]
+    torch::Tensor seq_lens_q,    // int32/int64 [batch_size]
     torch::Tensor swa_indices    // int32 [num_q_tokens, swa_window]   (output)
 ) {
-    TORCH_CHECK(seq_lens_k.scalar_type() == at::kInt, "seq_lens_k must be int32");
-    TORCH_CHECK(seq_lens_q.scalar_type() == at::kInt, "seq_lens_q must be int32");
-    TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be int32");
+    TORCH_CHECK(seq_lens_k.scalar_type() == seq_lens_q.scalar_type(),
+                "seq_lens_k and seq_lens_q must have same dtype");
     TORCH_CHECK(swa_indices.scalar_type() == at::kInt, "swa_indices must be int32");
     TORCH_CHECK(seq_lens_k.is_cuda(), "seq_lens_k must be on device");
     TORCH_CHECK(seq_lens_q.is_cuda(), "seq_lens_q must be on device");
-    TORCH_CHECK(cu_seqlens_q.is_cuda(), "cu_seqlens_q must be on device");
     TORCH_CHECK(swa_indices.is_cuda(), "swa_indices must be on device");
     TORCH_CHECK(swa_indices.dim() == 2, "swa_indices must be 2D");
     TORCH_CHECK(swa_indices.is_contiguous(), "swa_indices must be contiguous");
     TORCH_CHECK(seq_lens_k.size(0) == seq_lens_q.size(0),
                 "seq_lens_k and seq_lens_q must have same length");
-    TORCH_CHECK(cu_seqlens_q.size(0) == seq_lens_k.size(0) + 1,
-                "cu_seqlens_q must have batch_size + 1 entries");
 
     const int swa_window = (int)swa_indices.size(1);
-    if      (swa_window == 64)   launch_one<64>(seq_lens_k, seq_lens_q, cu_seqlens_q, swa_indices);
-    else if (swa_window == 128)  launch_one<128>(seq_lens_k, seq_lens_q, cu_seqlens_q, swa_indices);
-    else if (swa_window == 256)  launch_one<256>(seq_lens_k, seq_lens_q, cu_seqlens_q, swa_indices);
-    else if (swa_window == 512)  launch_one<512>(seq_lens_k, seq_lens_q, cu_seqlens_q, swa_indices);
+    if      (swa_window == 64)   launch_one_window<64>(seq_lens_k, seq_lens_q, swa_indices);
+    else if (swa_window == 128)  launch_one_window<128>(seq_lens_k, seq_lens_q, swa_indices);
+    else if (swa_window == 256)  launch_one_window<256>(seq_lens_k, seq_lens_q, swa_indices);
+    else if (swa_window == 512)  launch_one_window<512>(seq_lens_k, seq_lens_q, swa_indices);
     else {
         TORCH_CHECK(false, "swa_window ", swa_window,
                     " not supported (expected 64/128/256/512)");
@@ -174,6 +191,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "HIP fused kernel — replacement for the broken TileLang make_swa_prefill_indices",
           py::arg("seq_lens_k"),
           py::arg("seq_lens_q"),
-          py::arg("cu_seqlens_q"),
           py::arg("swa_indices"));
 }
