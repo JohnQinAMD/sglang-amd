@@ -55,6 +55,15 @@ export SGLANG_OPT_USE_FUSED_HASH_TOPK=false
 export SGLANG_HACK_FLASHMLA_BACKEND=torch
 # CK V32 sparse MLA decode is default-on via source change.
 # export SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1
+
+# Phase E (2026-04-28) — same combine-kernel gates as Flash-Base / Pro-Base.
+# Pro-mxfp4 routes through the same sparse MLA combine path. See
+# phase_e/STATUS.md for the work-score gate logic + measured numbers.
+export SGLANG_CK_V32_TRITON_COMBINE="${SGLANG_CK_V32_TRITON_COMBINE:-1}"
+export SGLANG_CK_V32_TRITON_COMBINE_NWAY="${SGLANG_CK_V32_TRITON_COMBINE_NWAY:-1}"
+export SGLANG_CK_V32_TRITON_COMBINE_MIN_WORK="${SGLANG_CK_V32_TRITON_COMBINE_MIN_WORK:-8192}"
+export SGLANG_CK_V32_TRITON_COMBINE_BLOCK_V="${SGLANG_CK_V32_TRITON_COMBINE_BLOCK_V:-256}"
+export SGLANG_CK_V32_TRITON_COMBINE_NUM_WARPS="${SGLANG_CK_V32_TRITON_COMBINE_NUM_WARPS:-4}"
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=false
 export SGLANG_OPT_USE_TILELANG_MHC_PRE=false
 export SGLANG_OPT_USE_TILELANG_MHC_POST=false

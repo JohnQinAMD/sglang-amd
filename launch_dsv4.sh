@@ -132,6 +132,19 @@ if [ "${SGLANG_HIP_CK_V32_TWO_SHOT:-}" = "" ]; then
     export SGLANG_HIP_CK_V32_TWO_SHOT=auto
 fi
 
+# Phase E (2026-04-28) — sparse MLA combine kernel gates for any DSv4 path
+# routed through ck_v32_sparse_mla.py (Flash-Base FP8 + any future variant).
+# Code defaults already match these — exported explicitly for discoverability.
+# E2E A/B chi2811 (shipping config, num=40 c=4): TPOT neutral, P99 TTFT -33%,
+# throughput +0.5%. Microbench: BLOCK_V=256/num_warps=4 hits HBM roofline
+# (1.6-1.8x faster than CK at PREFILL q≥4096); below work_score 8192 the gate
+# routes to CK to avoid Triton's ~40us launch overhead. See phase_e/STATUS.md.
+export SGLANG_CK_V32_TRITON_COMBINE="${SGLANG_CK_V32_TRITON_COMBINE:-1}"
+export SGLANG_CK_V32_TRITON_COMBINE_NWAY="${SGLANG_CK_V32_TRITON_COMBINE_NWAY:-1}"
+export SGLANG_CK_V32_TRITON_COMBINE_MIN_WORK="${SGLANG_CK_V32_TRITON_COMBINE_MIN_WORK:-8192}"
+export SGLANG_CK_V32_TRITON_COMBINE_BLOCK_V="${SGLANG_CK_V32_TRITON_COMBINE_BLOCK_V:-256}"
+export SGLANG_CK_V32_TRITON_COMBINE_NUM_WARPS="${SGLANG_CK_V32_TRITON_COMBINE_NUM_WARPS:-4}"
+
 export TORCHINDUCTOR_CACHE_DIR=/mnt/vast/john/rocm-dynamo/sglang/.inductor_cache_dsv4
 export TRITON_CACHE_DIR=/mnt/vast/john/rocm-dynamo/sglang/.triton_cache_dsv4
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
