@@ -248,7 +248,7 @@ class PiecewiseCudaGraphRunner:
             ) as patched_model:
                 install_torch_compiled(
                     patched_model,
-                    fullgraph=True,
+                    fullgraph=False,
                     dynamic_arg_dims=None,
                     compile_config=self.compile_config,
                     graph_pool=get_global_graph_memory_pool(),

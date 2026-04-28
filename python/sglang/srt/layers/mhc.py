@@ -7,6 +7,7 @@ import tilelang.language as T
 import torch
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 
 tilelang.set_log_level("WARNING")
@@ -93,18 +94,18 @@ def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
     return hc_split_sinkhorn_kernel_
 
 
+@register_custom_op(mutates_args=["pre", "post", "comb"])
 def hc_split_sinkhorn(
     mixes: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
+    pre: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
     hc_mult: int = 4,
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
-):
-    b, s, _ = mixes.size()
-    pre = mixes.new_empty(b, s, hc_mult)
-    post = mixes.new_empty(b, s, hc_mult)
-    comb = mixes.new_empty(b, s, hc_mult, hc_mult)
+) -> None:
     kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
     kernel(
         mixes.view(-1, (2 + hc_mult) * hc_mult),
@@ -114,7 +115,6 @@ def hc_split_sinkhorn(
         post.view(-1, hc_mult),
         comb.view(-1, hc_mult, hc_mult),
     )
-    return pre, post, comb
 
 
 # Adapted from https://github.com/tile-ai/tilelang/blob/5fe8b84313083d0a4035849c9282f06586c93d58/examples/deepseek_mhc/example_mhc_pre.py
@@ -467,6 +467,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
 
 # Adapted from https://github.com/tile-ai/tilelang/blob/5fe8b84313083d0a4035849c9282f06586c93d58/examples/deepseek_mhc/example_mhc_pre.py
+@torch.compiler.disable
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -662,6 +663,7 @@ def mhc_post_tilelang(
 
 
 # Adapted from https://github.com/tile-ai/tilelang/blob/5fe8b84313083d0a4035849c9282f06586c93d58/examples/deepseek_mhc/example_mhc_post.py
+@torch.compiler.disable
 def mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,

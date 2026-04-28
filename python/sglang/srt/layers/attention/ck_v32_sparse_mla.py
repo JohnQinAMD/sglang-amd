@@ -152,15 +152,38 @@ def _get_ck_mod():
     return _ck_mod
 
 
+_PICK_NUM_SPLITS_LOGGED = False
+
+
 def pick_num_splits(B: int, topk: int) -> int:
     """Pick num_kv_splits so each split has ~1 BLOCK_N=32 worth of work AND
-    total workgroup count stays in the [64, 512] sweet spot for MI355X."""
+    total workgroup count stays in the [64, 512] sweet spot for MI355X.
+
+    Override via env `SGLANG_CK_V32_FORCE_SPLITS=<int>` for Phase C tuning.
+    """
+    global _PICK_NUM_SPLITS_LOGGED
+    forced = os.environ.get("SGLANG_CK_V32_FORCE_SPLITS", "")
+    if forced:
+        s = int(forced)
+        # Snap to a divisor of topk (kernel requires topk % splits == 0).
+        while topk % s != 0 and s > 1:
+            s -= 1
+        if not _PICK_NUM_SPLITS_LOGGED:
+            print(f"[ck_v32_sparse_mla] FORCED num_kv_splits={s} via "
+                  f"SGLANG_CK_V32_FORCE_SPLITS (B={B} topk={topk})", flush=True)
+            _PICK_NUM_SPLITS_LOGGED = True
+        return s
     BLOCK_N = 32
     splits_by_topk = max(1, topk // BLOCK_N)
     splits_by_total = max(1, 512 // (HEAD_GROUPS * B))
     splits = min(splits_by_topk, splits_by_total)
     while topk % splits != 0 and splits > 1:
         splits -= 1
+    if not _PICK_NUM_SPLITS_LOGGED:
+        print(f"[ck_v32_sparse_mla] pick_num_splits(B={B}, topk={topk}) -> {splits} "
+              f"(by_topk={splits_by_topk}, by_total={splits_by_total}, "
+              f"HEAD_GROUPS={HEAD_GROUPS})", flush=True)
+        _PICK_NUM_SPLITS_LOGGED = True
     return splits
 
 
@@ -203,6 +226,34 @@ def _get_split_buffers(total_q: int, num_splits: int, H: int, V: int,
         _split_buf_cache.clear()
     _split_buf_cache[key] = (sd, sl)
     return sd, sl
+
+
+# Cache for the bf16 output buffer + transposed lse buffer. These are the
+# tensors returned to the caller; without caching, each call did
+# `split_data.to(bf16)` and `lse.transpose().contiguous()` as fresh
+# allocations — the captured cuda-graph downstream baked the first-call
+# addresses, then read stale memory on replay (root cause of garbage tokens
+# in iter22). Cache by per-call shape so each call reuses the same buffer
+# (memory: 32 MB total saved across 61 layers); sequential pipeline within
+# each layer guarantees attention-write before downstream-read.
+_OUT_BUF_CACHE: dict = {}
+
+
+def _get_out_buffers(total_q: int, B: int, S_q: int, H: int, V: int,
+                     device: torch.device):
+    """Return (out_bf16, lse_bhs) cached per shape. `out_bf16` is the
+    [total_q, H, V] bf16 attention output; `lse_bhs` is the transposed
+    [B, H, S_q] log-sum-exp."""
+    key = (total_q, B, S_q, H, V, str(device))
+    cached = _OUT_BUF_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out_bf16 = torch.empty((total_q, H, V), dtype=torch.bfloat16, device=device)
+    lse_bhs = torch.empty((B, H, S_q), dtype=torch.float32, device=device)
+    if len(_OUT_BUF_CACHE) > 32:
+        _OUT_BUF_CACHE.clear()
+    _OUT_BUF_CACHE[key] = (out_bf16, lse_bhs)
+    return out_bf16, lse_bhs
 
 
 def _build_uniform_reduce_meta(total_q: int, num_splits: int, device: torch.device):
@@ -356,35 +407,43 @@ def ck_sparse_mla_decode_fp8_v32(
         float(sm_scale), int(num_splits), float(fp8_decode_scale),
     )
 
+    # Cached output buffers (cuda-graph mempool-stable). copy_ does an
+    # in-place fp32→bf16 cast into the cached buffer; the original code
+    # did `split_data[:, 0].to(bfloat16)` which allocated a fresh tensor
+    # every call → stale-buffer reads on cuda-graph replay (iter22 root
+    # cause of garbage tokens).
+    out_bf16_cached, lse_bhs_cached = _get_out_buffers(
+        total_q, B, S_q, H, V_HEAD_DIM, device,
+    )
+
     if num_splits == 1:
         # Kernel pre-normalizes for single-split case — no reduce needed.
-        out = split_data[:, 0, :, :]
-        lse = split_lse[:, 0, :, 0]
-        out_bf16 = out.to(torch.bfloat16)
+        out_bf16_cached.copy_(split_data[:, 0, :, :])  # fp32→bf16 in place
+        lse_2d = split_lse[:, 0, :, 0]
     else:
-        out_bf16, lse = _ck_native_reduce(split_data, split_lse, max_seqlen_q=S_q)
-
-    # Lonely-Q queries (all-invalid indices) come out of the kernel as exactly
-    # zero — `pidx < 0` rows are zero-filled in the LDS tile, so Q@K=0 and
-    # P@V=0. No wrapper correction needed.
+        # Multi-split: reduce path still allocates internally; copy result
+        # into our cached buffer so the captured graph reads stable address.
+        out_reduced, lse_2d = _ck_native_reduce(
+            split_data, split_lse, max_seqlen_q=S_q,
+        )
+        out_bf16_cached.view_as(out_reduced).copy_(out_reduced)
 
     # Attention sink correction: out *= 1 / (1 + exp(sink - lse)).
-    #
     # Fused into a single Triton kernel (`_sink_fold_inplace_kernel`) — one
-    # launch instead of the previous 3-4-kernel torch chain (broadcast sub →
-    # exp → add → div → mul → cast). The kernel streams `out_bf16` in place
-    # so we avoid the f32 round-trip and the extra HBM allocation.
+    # launch instead of the previous 3-4-kernel torch chain. Kernel streams
+    # out_bf16_cached in place; no fresh allocation.
     if attn_sink is not None:
-        # `out_bf16` may not be contiguous in the num_splits==1 fast path
-        # (it's a `.to(bfloat16)` of a strided view of split_data), so make
-        # it contiguous first — the kernel writes in place.
-        if not out_bf16.is_contiguous():
-            out_bf16 = out_bf16.contiguous()
-        _apply_sink_fold_inplace(out_bf16, lse, attn_sink)
+        _apply_sink_fold_inplace(out_bf16_cached, lse_2d, attn_sink)
 
-    out_bf16 = out_bf16.view(B, S_q, H, V_HEAD_DIM)
-    lse_bhs = lse.view(B, S_q, H).transpose(1, 2).contiguous()  # [B, H, S_q]
-    return out_bf16, lse_bhs
+    # Reshape views (no allocation) into the public output shapes.
+    out_bf16 = out_bf16_cached.view(B, S_q, H, V_HEAD_DIM)
+    # lse: [total_q, H] → [B, S_q, H] → [B, H, S_q] in cached buffer.
+    # transpose+contiguous would allocate; instead we hand-write the
+    # transpose into lse_bhs_cached via a copy_ from the strided view.
+    lse_bhs_cached.copy_(
+        lse_2d.view(B, S_q, H).transpose(1, 2)
+    )
+    return out_bf16, lse_bhs_cached
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -532,6 +591,25 @@ def ck_combine_two_splits(
         lse = torch.empty((total_q, H), dtype=torch.float32, device=device)
     else:
         assert lse.shape == (total_q, H) and lse.dtype == torch.float32
+
+    # Phase C3: small-S Triton fast-path. CK combine is launch-overhead-bound at
+    # B*H = 96 blocks × 256 threads = ~1.5 waves/CU on MI355X (~107 µs/call). At
+    # S_a == 1 (forced via SGLANG_CK_V32_FORCE_SPLITS=1, or pick_num_splits when
+    # topk allows), the merge is a 2-way softmax which a Triton (B*H, V/64) grid
+    # handles at much higher CU saturation. Falls back to CK for the general
+    # N-way case (S_a > 1) where the broadcast-LSE design is the better fit.
+    S_a = split_data_a.size(1)
+    S_b = split_data_b.size(1) if split_data_b is not None else 0
+    if (
+        os.environ.get("SGLANG_CK_V32_TRITON_COMBINE", "1") == "1"
+        and S_a == 1 and S_b <= 1
+    ):
+        from sglang.jit_kernel.mla_combine_triton import mla_combine_two_splits_triton
+        return mla_combine_two_splits_triton(
+            split_data_a, split_lse_a,
+            split_data_b, split_lse_b,
+            attn_sink, out, lse,
+        )
 
     ck = _get_ck_mod()
     ck.mla_combine_fwd_ck(

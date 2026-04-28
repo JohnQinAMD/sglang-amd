@@ -96,6 +96,7 @@ class CompressorBackend:
         )
         return rotate_activation(kv_compressed) if rotate else kv_compressed
 
+    @torch.compiler.disable
     def forward_core_compressor(
         self,
         x: torch.Tensor,

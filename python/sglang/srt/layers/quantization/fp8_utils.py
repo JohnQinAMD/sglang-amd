@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 
 if TYPE_CHECKING:
@@ -477,6 +479,67 @@ def _unpack_ue8m0_scale_for_triton(
     return sf_fp32
 
 
+# Per-shape backend selection for under-tuned attention GEMMs at prefill.
+# Sweep across Triton (default), CK, and ASM at (M=8192, FP8 a8w8) shows:
+#   shape (K=7168, N=512  — wkv  Pro):  Triton 127us, CK 62us  → CK 2.04x
+#   shape (K=7168, N=1536 — wq_a Pro):  Triton 206us, CK 134us → CK 1.53x
+#   shape (K=1536, N=8192 — wq_b Pro):  Triton 202us, CK 391us → Triton 1.94x  (keep default)
+#   shape (K=1024, N=7168 — wo_b Pro):  Triton 154us, CK 228us → Triton 1.48x  (keep default)
+#   shape (K=*,    moe gate_up/down):   Triton 1.9x faster than CK             (keep default)
+# So we route only the K=7168 thin-N attention shapes to CK; everything else
+# stays on Triton (the better backend for those shapes).
+_DSV4_A8W8_PREFILL_USE_CK = {
+    # (K, N) tuple -> use the CK kernel
+    (7168,  512),   # Pro wkv
+    (7168, 1536),   # Pro wq_a
+}
+
+# Triton tile-config overrides for shapes where Triton stays the chosen backend
+# but the auto-tuner picks a suboptimal tile (BM=64 BN=256 amortizes the
+# per-CTA scale-block load when N is the thin dim).
+#   shape (K=1024, N=4096 — Flash wo_b/wq_b): Triton default 86us -> tuned 66us (1.30x)
+_DSV4_A8W8_PREFILL_TRITON_CFG = {
+    (1024, 4096): {
+        "BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 4, "NUM_KSPLIT": 1,
+        "num_warps": 4, "num_stages": 2, "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 32, "kpack": 1, "cache_modifier": None,
+    },
+}
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def _aiter_w8a8_gemm_into(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> None:
+    # GEMM only — caller pre-allocates output AND pre-quantizes input. No
+    # fresh tensor allocations inside the captured custom op.
+    output_2d = output.view(-1, output.shape[-1])
+    M = q_input.shape[0]
+    K = q_input.shape[1]
+    N = weight.shape[0]
+
+    if M >= 256 and (K, N) in _DSV4_A8W8_PREFILL_USE_CK:
+        aiter.gemm_a8w8_blockscale_ck(
+            q_input, weight, x_scale, weight_scale, output_2d,
+        )
+    else:
+        cfg = _DSV4_A8W8_PREFILL_TRITON_CFG.get((K, N)) if M >= 256 else None
+        gemm_a8w8_blockscale(
+            q_input, weight, x_scale, weight_scale,
+            dtype=output_2d.dtype, y=output_2d, config=cfg,
+        )
+
+    if bias is not None:
+        output_2d.add_(bias)
+
+
 def aiter_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -485,32 +548,22 @@ def aiter_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # assert input_scale is None
+    # Quant runs at the wrapper level (dynamo-traced) so its fresh tensor
+    # outputs land in the cuda-graph mempool. The GEMM-only custom op below
+    # mutates the caller-allocated output.
     input_2d = input.view(-1, input.shape[-1])
-    output_shape = [*input.shape[:-1], weight.shape[0]]
+    output_shape = (*input.shape[:-1], weight.shape[0])
+    out_dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    output = input.new_empty(output_shape, dtype=out_dtype)
 
-    # if input_scale not None, input is quanted
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
-
     else:
         q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
 
-    output = gemm_a8w8_blockscale(
-        q_input,
-        weight,
-        x_scale,
-        weight_scale,
-        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
-    )
-
-    if bias is not None:
-        output += bias
-
-    return output.to(
-        dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
-    ).view(*output_shape)
+    _aiter_w8a8_gemm_into(q_input, weight, x_scale, weight_scale, output, bias)
+    return output
 
 
 def triton_w8a8_block_fp8_linear(
