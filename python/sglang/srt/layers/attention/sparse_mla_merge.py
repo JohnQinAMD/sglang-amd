@@ -14,6 +14,13 @@ kernel merges them via the standard FlashAttention-2 two-split formula:
 
 Lonely-Q rows (sw == 0) come out as out=0, lse=-inf — matches the BF16
 fallback semantics.
+
+Phase B (2026-04-28): kernel now accepts arbitrary strides for the (q, h)
+axes to skip the 4× ``.contiguous()`` calls in the dispatch wrapper. The V
+axis MUST stay stride-1 (kernel does flat ``+ offs`` loads). A constexpr
+``IS_CONTIGUOUS`` switch keeps the original SASS for the all-contiguous
+fast path. The wrapper also accepts ``out=`` / ``lse=`` kwargs for
+caller-allocated destinations (no internal ``empty_like``).
 """
 from __future__ import annotations
 
@@ -26,15 +33,39 @@ import triton.language as tl
 def _merge_kernel(
     out_ptr, out_a_ptr, out_b_ptr,
     lse_ptr, lse_a_ptr, lse_b_ptr,
+    stride_a_q, stride_a_h,
+    stride_b_q, stride_b_h,
+    stride_out_q, stride_out_h,
+    stride_lse_a_q, stride_lse_a_h,
+    stride_lse_b_q, stride_lse_b_h,
+    stride_lse_out_q, stride_lse_out_h,
     H: tl.constexpr,
     V: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    IS_CONTIGUOUS: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    qh_id = pid
+    if IS_CONTIGUOUS:
+        # Original flat-indexing path — preserves the SASS the kernel had
+        # before Phase B for the all-contiguous case (no perf regression).
+        base_a = pid * V
+        base_b = pid * V
+        base_o = pid * V
+        lse_a_off = pid
+        lse_b_off = pid
+        lse_o_off = pid
+    else:
+        q_idx = pid // H
+        h_idx = pid % H
+        base_a = q_idx * stride_a_q + h_idx * stride_a_h
+        base_b = q_idx * stride_b_q + h_idx * stride_b_h
+        base_o = q_idx * stride_out_q + h_idx * stride_out_h
+        lse_a_off = q_idx * stride_lse_a_q + h_idx * stride_lse_a_h
+        lse_b_off = q_idx * stride_lse_b_q + h_idx * stride_lse_b_h
+        lse_o_off = q_idx * stride_lse_out_q + h_idx * stride_lse_out_h
 
-    la = tl.load(lse_a_ptr + qh_id).to(tl.float32)
-    lb = tl.load(lse_b_ptr + qh_id).to(tl.float32)
+    la = tl.load(lse_a_ptr + lse_a_off).to(tl.float32)
+    lb = tl.load(lse_b_ptr + lse_b_off).to(tl.float32)
     lm = tl.maximum(la, lb)
 
     da = la - lm
@@ -47,17 +78,16 @@ def _merge_kernel(
     sw_safe = tl.where(all_invalid, 1.0, sw)
 
     new_lse = tl.where(all_invalid, float("-inf"), lm + tl.log(sw))
-    tl.store(lse_ptr + qh_id, new_lse)
+    tl.store(lse_ptr + lse_o_off, new_lse)
 
-    base = qh_id * V
     for v_start in tl.static_range(0, V, BLOCK_V):
         offs = v_start + tl.arange(0, BLOCK_V)
         mask = offs < V
-        oa = tl.load(out_a_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        ob = tl.load(out_b_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        oa = tl.load(out_a_ptr + base_a + offs, mask=mask, other=0.0).to(tl.float32)
+        ob = tl.load(out_b_ptr + base_b + offs, mask=mask, other=0.0).to(tl.float32)
         merged = (wa * oa + wb * ob) / sw_safe
         merged = tl.where(all_invalid, 0.0, merged)
-        tl.store(out_ptr + base + offs, merged.to(tl.bfloat16), mask=mask)
+        tl.store(out_ptr + base_o + offs, merged.to(tl.bfloat16), mask=mask)
 
 
 def merge_two_sparse_attn_outputs(
@@ -65,10 +95,18 @@ def merge_two_sparse_attn_outputs(
     lse_a: torch.Tensor,           # [total_q, H]    fp32
     out_b: torch.Tensor,           # [total_q, H, V] bf16
     lse_b: torch.Tensor,           # [total_q, H]    fp32
+    *,
+    out: torch.Tensor | None = None,   # caller-allocated [total_q, H, V] bf16
+    lse: torch.Tensor | None = None,   # caller-allocated [total_q, H]    fp32
 ):
     """Online-softmax merge of two parallel sparse-attention outputs.
 
-    Returns (out_merged [total_q, H, V] bf16, lse_merged [total_q, H] fp32).
+    Inputs may be non-contiguous on the (q, h) axes; the V axis (innermost
+    dim of ``out_a/out_b``) MUST be stride-1 — asserted below. Outputs are
+    written into caller-supplied ``out``/``lse`` if provided (saves the
+    per-call empty_like allocation that churns the caching allocator).
+
+    Returns (out [total_q, H, V] bf16, lse [total_q, H] fp32).
     """
     assert out_a.shape == out_b.shape
     assert lse_a.shape == lse_b.shape
@@ -77,20 +115,38 @@ def merge_two_sparse_attn_outputs(
 
     total_q, H, V = out_a.shape
     assert lse_a.shape == (total_q, H)
+    # V axis must be stride-1 in all input tensors (kernel does flat
+    # `out_a_ptr + base + offs` loads); other axes may be strided.
+    assert out_a.stride(-1) == 1, f"out_a V-stride must be 1, got {out_a.stride(-1)}"
+    assert out_b.stride(-1) == 1, f"out_b V-stride must be 1, got {out_b.stride(-1)}"
 
-    out_a_c = out_a if out_a.is_contiguous() else out_a.contiguous()
-    out_b_c = out_b if out_b.is_contiguous() else out_b.contiguous()
-    lse_a_c = lse_a if lse_a.is_contiguous() else lse_a.contiguous()
-    lse_b_c = lse_b if lse_b.is_contiguous() else lse_b.contiguous()
+    if out is None:
+        out = torch.empty((total_q, H, V), dtype=torch.bfloat16, device=out_a.device)
+    else:
+        assert out.shape == (total_q, H, V) and out.dtype == torch.bfloat16
+        assert out.stride(-1) == 1, f"out V-stride must be 1, got {out.stride(-1)}"
+    if lse is None:
+        lse = torch.empty((total_q, H), dtype=torch.float32, device=lse_a.device)
+    else:
+        assert lse.shape == (total_q, H) and lse.dtype == torch.float32
 
-    out = torch.empty_like(out_a_c)
-    lse = torch.empty_like(lse_a_c)
+    is_contig = (
+        out_a.is_contiguous() and out_b.is_contiguous() and out.is_contiguous()
+        and lse_a.is_contiguous() and lse_b.is_contiguous() and lse.is_contiguous()
+    )
 
     BLOCK_V = min(512, V)
     grid = (total_q * H,)
     _merge_kernel[grid](
-        out, out_a_c, out_b_c,
-        lse, lse_a_c, lse_b_c,
+        out, out_a, out_b,
+        lse, lse_a, lse_b,
+        out_a.stride(0), out_a.stride(1),
+        out_b.stride(0), out_b.stride(1),
+        out.stride(0),   out.stride(1),
+        lse_a.stride(0), lse_a.stride(1),
+        lse_b.stride(0), lse_b.stride(1),
+        lse.stride(0),   lse.stride(1),
         H=H, V=V, BLOCK_V=BLOCK_V,
+        IS_CONTIGUOUS=is_contig,
     )
     return out, lse

@@ -118,13 +118,20 @@ struct MlaDecodeArgs {
     float* split_data_ptr; float* split_lse_ptr;
     const int32_t* qo_indptr; const int32_t* kv_indptr; const int32_t* kv_indices;
     float sm_scale; int nhead; int num_kv_splits;
-    int64_t stride_q_s, stride_q_h, stride_kv;       // stride_kv counted in fp8 bytes (per-row stride in bytes)
+    int64_t stride_q_s, stride_q_h, stride_kv;       // stride_kv: bytes between consecutive pages within a pool row
     int64_t stride_sd_s, stride_sd_split, stride_sd_h;
     int64_t stride_lse_s, stride_lse_split, stride_lse_h;
     // FP8 decode scale: 1.0 if KV stored as torch.float8_e4m3fn (HW intrinsic
     // matches storage, no fold needed); 0.5 if stored as fnuz (HW gives 2×
     // fnuz value, fold halves it). See `fp8x8_decode_to_bf16x8` comment.
     float fp8_decode_scale;
+    // Phase B+ : 4D padded pool support (e.g., c4/c128 caches).
+    // pool_outer_stride: bytes between rows of the pool (>= pages_per_row*stride_kv)
+    // pages_per_row:     valid pages per row (= 1 for 2D linear pools, = P for 4D).
+    // For 2D linear mode set pool_outer_stride=stride_kv and pages_per_row=1; the
+    // kernel formula degenerates to `addr = base + idx*stride_kv` (legacy).
+    int64_t pool_outer_stride;
+    int32_t pages_per_row;
 };
 
 static constexpr int MFMA_HEADS  = 16;
@@ -203,10 +210,13 @@ load_kv_tile_fp8_to_lds(const MlaDecodeArgs& args, int tid, int kv_start, int s_
                    ? args.kv_indices[kv_start + n_start + ld_row]
                    : -1;
     if (pidx >= 0) {
-        // stride_kv is counted in fp8 BYTES at the launcher (one full row of
-        // QK_HEAD_DIM=576 fp8 bytes per row).
+        // 4D padded-pool addressing: each pool row contains `pages_per_row`
+        // consecutive pages then padding. Linear/2D mode: pages_per_row=1 and
+        // pool_outer_stride=stride_kv → degenerates to `pidx*stride_kv`.
+        const int outer = pidx / args.pages_per_row;
+        const int inner = pidx - outer * args.pages_per_row;
         const uint32_t* src_row_fp8 = reinterpret_cast<const uint32_t*>(
-            kv_base_fp8 + pidx * args.stride_kv);
+            kv_base_fp8 + outer * args.pool_outer_stride + inner * args.stride_kv);
         const float decode_scale = args.fp8_decode_scale;
         #pragma unroll
         for (int k = 0; k < VECS_PER_THREAD; ++k) {
