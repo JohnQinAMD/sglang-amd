@@ -177,7 +177,19 @@ case "$PRESET" in
     # A6 baked-in (2026-04-25): TileLang mHC PRE/POST=1 on gfx950.
     # Measured +2-4% throughput, -6 to -7% TTFT vs MHC=off; replicates
     # Xiaobo's MI300X +9% prefill (xiaobo/optim_p0a_mhc.md).
-    _TOPK_TORCH=0; _FORCE_TRITON_MOE=1; _INDEXER_CAP=4096
+    #
+    # Phase 7 (2026-04-28): _FORCE_TRITON_MOE flipped 1→0. AITER's
+    # `fmoe_bf16_blockscaleFp8_g1u1` (gfx950-native FP8 [128,128] blockwise)
+    # produces 4× fewer launches per layer than Triton fused_moe_kernel
+    # (86 vs 344) for similar GPU exec time. Aligned bench result on chi2774
+    # (Flash-Base FP8, 40 prompts c=4 max=6):
+    #     metric       Triton MoE  AITER MoE   delta
+    #     TPOT (ms)      42.68       41.39    -1.29 (-3.0%)
+    #     TTFT (ms)      230.57      219.17  -11.40 (-4.9%)
+    #     output tok/s    86.67       89.91   +3.74%
+    #     duration (s)   420.22      405.09   -3.6%
+    # Net first measurable TPOT win after Phase B+ shipped.
+    _TOPK_TORCH=0; _FORCE_TRITON_MOE=0; _INDEXER_CAP=4096
     _MULTI_STREAM=0; _DISABLE_COMPILE=1
     _MHC_PRE=1; _MHC_POST=1
     _CG_BS="1 2 4 8"; _CG_MAX_BS=8
