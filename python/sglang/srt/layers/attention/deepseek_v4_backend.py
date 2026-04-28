@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, TypeV
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.debug_flash_mla_adapter import (
     flash_mla_with_kvcache_entrypoint,
@@ -377,11 +378,21 @@ class DeepseekV4Backend(AttentionBackend, C4IndexerBackend, CompressorBackend):
         extend_seq_lens_cpu = extend_seq_lens_cpu or forward_batch.extend_seq_lens_cpu
         assert seq_lens_cpu is not None and extend_seq_lens_cpu is not None
         # NOTE: expanded follow a `causal` mask pattern
-        seq_lens_expanded, idx_mapping = paged_prefill.expand_seq_lens(
-            seq_lens=seq_lens_cpu.tolist(),
-            extend_seq_lens=extend_seq_lens_cpu,
-            device=self.device,
-        )
+        if envs.SGLANG_HIP_EXPAND_SEQ_LENS.get():
+            from sglang.srt.layers.expand_seq_lens_hip import hip_expand_seq_lens
+
+            extend_num_tokens = sum(extend_seq_lens_cpu)
+            seq_lens_expanded, idx_mapping = hip_expand_seq_lens(
+                seq_lens=forward_batch.seq_lens,
+                extend_seq_lens=forward_batch.extend_seq_lens,
+                extend_num_tokens=extend_num_tokens,
+            )
+        else:
+            seq_lens_expanded, idx_mapping = paged_prefill.expand_seq_lens(
+                seq_lens=seq_lens_cpu.tolist(),
+                extend_seq_lens=extend_seq_lens_cpu,
+                device=self.device,
+            )
         core_metadata = self._make_paged_core_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices=forward_batch.req_pool_indices[idx_mapping],
