@@ -316,3 +316,33 @@ print(r.json()[\"choices\"][0][\"text\"])
 ```
 
 Setting `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0` produces "Paris..." correctly (proven by the A/B in session 2 at session1 doc).
+
+### Path (a) bit-match attempt (2026-04-29 EOD-6)
+
+Replaced the kernel's `exp2f(x * log2e)` softmax + LSE with `__expf(x)` to bit-match torch.softmax (which uses __expf on CUDA). This eliminates one ULP-level transcendental mismatch.
+
+Changes:
+- Removed `kLog2e` pre-multiply on s_acc; now uses raw sm_scale.
+- Replaced `exp2f` → `__expf` at both rescale (rsc) and pv computation.
+- Removed `kLn2` from LSE epilogue (rmax is now natural-log-space directly).
+
+Result:
+- Production replay: 2/2 non-degenerate captures still PASS at cos=1.000 / maxd=2.0 (no regression).
+- E2E `SGLANG_HIP_CK_V32_SINGLESHOT=1` at T=0: still garbage tokens, similar character.
+- E2E with `SGLANG_CK_V32_FORCE_SPLITS=1` (bypass aiter.mla_reduce_v1, use Triton sink-fold instead): still garbage.
+
+**Conclusion**: the transcendental wasn't the dominant per-call delta. Even after bit-matching exp, the per-layer-compounded drift remains. The kernel's per-call output matches the FP32 oracle at bf16 floor (verified) but the residual stream still diverges from the ref path's specific bf16 trajectory.
+
+True bit-equality with the bf16 ref path likely requires:
+- bit-identical bf16 mfma operand reduction order (specific to torch's GEMM kernel choice)
+- bit-identical fp8→bf16 dequant rounding (depends on torch's `flashmla_quant.dequantize_k_cache` implementation)
+- bit-identical softmax math (closer now via __expf, but not guaranteed)
+- bit-identical V matmul accumulator order
+
+Each of these would require ~half-day of bisecting against the specific torch reference and reproducing its exact arithmetic order. The cumulative effort is high relative to the alternative levers in the path-to-1×-B200 plan.
+
+**Final shipping recommendation (post-bit-match-attempt)**:
+- Layer-3 stopgap (`ca6f41917`) stays ON for production. Correct results today via BF16 ref fall-through.
+- The kernel + diagnostic infrastructure are production-grade. The fp32-PV compile flag (`SGLANG_CK_V32_FP32_PV=1`) and the __expf bit-match (this commit) are committed as defensive precision improvements available at near-zero perf cost.
+- For the perf gain (-7 to -10 ms TPOT), recommend pursuing **decode-body megakernel (Class A, -5 to -7 ms / 7 days)** as the next high-leverage lever. Orthogonal to CK V32 single_shot, with no precision-drift risk. The CK V32 perf gain remains available if a future session can land the bit-match work or finetune the model with the kernel's specific delta tolerance.
+

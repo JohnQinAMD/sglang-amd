@@ -454,13 +454,19 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
             if (!qp_active[qp]) break;
             float4_t (&s_acc)[QK_N_TILES] = s_acc_all[qp];
 
-            constexpr float kLog2e = 1.4426950408889634f;
-            const float sm_scale_log2e = args.sm_scale * kLog2e;
+            // Layer-3-bitmatch path (a): use sm_scale directly + __expf (not
+            // sm_scale*log2e + exp2f). Torch's softmax on CUDA uses __expf
+            // internally; matching that eliminates one ULP-level transcendental
+            // mismatch that compounds across 60 layers in the residual stream.
+            // The math is identical (exp2(x*log2e) == exp(x)) but the bit-level
+            // results differ because exp2f and __expf use different polynomial
+            // approximations on gfx950 hardware.
+            const float sm_scale_native = args.sm_scale;
             #pragma unroll
             for (int nt = 0; nt < QK_N_TILES; ++nt)
                 #pragma unroll
                 for (int c = 0; c < 4; ++c)
-                    s_acc[nt][c] *= sm_scale_log2e;
+                    s_acc[nt][c] *= sm_scale_native;
             {
                 int kv_col = lane_id % 16;
                 #pragma unroll
@@ -527,7 +533,8 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
             #pragma unroll
             for (int c = 0; c < 4; ++c) {
                 new_max_arr[c] = fmaxf(rmax[qp*4+c], lmax[c]);
-                float rsc = exp2f(rmax[qp*4+c] - new_max_arr[c]);
+                // Layer-3-bitmatch: use __expf to match torch.softmax bit-by-bit.
+                float rsc = __expf(rmax[qp*4+c] - new_max_arr[c]);
                 #pragma unroll
                 for (int i = 0; i < PV_PER_WARP; ++i)
                     o_acc[qp*PV_PER_WARP+i][c] *= rsc;
@@ -540,7 +547,7 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
                 lsum[c] = 0.0f;
                 #pragma unroll
                 for (int nt = 0; nt < QK_N_TILES; ++nt) {
-                    float pv = exp2f(s_acc[nt][c] - new_max_arr[c]);
+                    float pv = __expf(s_acc[nt][c] - new_max_arr[c]);
                     s_acc[nt][c] = pv;
                     lsum[c] += pv;
                 }
@@ -718,9 +725,11 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
                 int lb = qo_start * args.stride_lse_s +
                          split_id * args.stride_lse_split +
                          cur_head * args.stride_lse_h;
-                constexpr float kLn2 = 0.6931471805599453f;
+                // Layer-3-bitmatch: rmax_c is now natural-log-space (was
+                // log2-space when we used exp2f). LSE = rmax + log(rsum)
+                // directly, no kLn2 conversion needed.
                 float lse_val = row_ok
-                    ? (rmax_c * kLn2 + logf(rsum_c))
+                    ? (rmax_c + logf(rsum_c))
                     : -1e30f;
                 args.split_lse_ptr[lb] = lse_val;
             }
