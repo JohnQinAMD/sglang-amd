@@ -22,19 +22,29 @@ _invalid_mask_cache: dict = {}
 
 
 def _get_invalid_mask(indices, topk_length, b, s_q, topk):
+    """Item #5 (revised after E2E regression): keep the data_ptr cache for the
+    HIT path (zero-launch fast path), use Triton fusion only on MISS.
+
+    Original observation: removing the cache and using Triton on every call
+    caused +20 ms TPOT regression on chi2811 — under cuda-graph capture the
+    page_table data_ptr is stable, the cache hits reliably, and torch did 0
+    work on the hit path.
+
+    Trade-off: the cache is keyed on `data_ptr() + id(topk_length)` plus
+    `id(indices)` verification, which is documented as unsafe under the caching
+    allocator (per `feedback_data_ptr_caching_unsafe`). On cuda-graph captured
+    decode where the buffers are persistent, hits are correct; on eager calls
+    with allocator churn the indices id check disambiguates.
+    """
     key = (indices.data_ptr(), id(topk_length), b, s_q, topk)
     cached = _invalid_mask_cache.get(key)
     if cached is not None:
         cached_mask, cached_indices_id = cached
         if cached_indices_id == id(indices):
             return cached_mask
-    mask = indices < 0
-    if topk_length is not None:
-        arange_topk = torch.arange(
-            topk, device=indices.device, dtype=topk_length.dtype
-        ).view(1, 1, topk)
-        mask = mask | (arange_topk >= topk_length.view(b, 1, 1))
-    mask_2d = mask.view(b * s_q, topk)
+    # MISS path: fused Triton kernel (was 3 separate ewise launches before).
+    from sglang.jit_kernel.invalid_mask_triton import get_invalid_mask_triton
+    mask_2d = get_invalid_mask_triton(indices, topk_length, b, s_q, topk)
     if len(_invalid_mask_cache) > 16:
         _invalid_mask_cache.clear()
     _invalid_mask_cache[key] = (mask_2d, id(indices))
@@ -134,6 +144,131 @@ def flash_mla_with_kvcache_torch(
         _two_shot_enabled = _two_shot_env == "1"
     # Default-on; opt out with SGLANG_HIP_SPARSE_MLA_DECODE_FP8=0.
     _ck_v32_enabled = _os.environ.get("SGLANG_HIP_SPARSE_MLA_DECODE_FP8", "1") != "0"
+
+    # DEBUG: branch counter — which of the 5 paths (ck_v32_single, ck_v32_two_shot,
+    # ck_v32_model1, fallthrough_ref, _ck_v32_disabled) is the production hot path?
+    # No-op when SGLANG_FLASH_MLA_BRANCH_DUMP unset.
+    _branch_dump_dir = _os.environ.get("SGLANG_FLASH_MLA_BRANCH_DUMP", "")
+    def _bump_branch(_label):
+        if not _branch_dump_dir:
+            return
+        try:
+            import os as __os
+            __os.makedirs(_branch_dump_dir, exist_ok=True)
+            _p = __os.path.join(_branch_dump_dir, f"_branch_pid{__os.getpid()}_{_label}")
+            # File-based atomic counter: append one byte per call.
+            with open(_p, "ab") as _bf:
+                _bf.write(b".")
+        except Exception:
+            pass
+
+    # DEBUG: live diff of CK V32 vs torch-bf16 reference. Computed in-process on
+    # the SAME tensors the kernel just consumed — bypasses torch.save/load so we
+    # can distinguish a real kernel bug from a replay-script oracle artifact.
+    # Activate via SGLANG_FLASH_MLA_LIVE_DIFF=<dir> (writes one summary line per
+    # call to a per-pid file). Skip first SGLANG_FLASH_MLA_LIVE_DIFF_SKIP calls
+    # (default 10) to avoid cuda-graph-capture placeholder data.
+    _live_diff_dir = _os.environ.get("SGLANG_FLASH_MLA_LIVE_DIFF", "")
+    _live_diff_skip = int(_os.environ.get("SGLANG_FLASH_MLA_LIVE_DIFF_SKIP", "10"))
+    _live_diff_count = int(_os.environ.get("SGLANG_FLASH_MLA_LIVE_DIFF_COUNT", "8"))
+    if not hasattr(flash_mla_with_kvcache_torch, "_live_diff_state"):
+        flash_mla_with_kvcache_torch._live_diff_state = {"call": 0, "written": 0}
+    def _live_diff(label, q_in, k_cache_in, indices_in, attn_sink_in, sm_scale_in,
+                   ck_out_in, ck_lse_in):
+        if not _live_diff_dir:
+            return
+        st = flash_mla_with_kvcache_torch._live_diff_state
+        st["call"] += 1
+        if st["written"] >= _live_diff_count:
+            return
+        if st["call"] <= _live_diff_skip:
+            return
+        # Skip cuda-graph-capture placeholders (zero q).
+        try:
+            if q_in.detach().abs().max().item() == 0.0:
+                return
+        except Exception:
+            return
+        try:
+            import os as __os
+            __os.makedirs(_live_diff_dir, exist_ok=True)
+            B_, S_, H_, D_ = q_in.shape
+            V_ = ck_out_in.shape[-1]
+            topk_ = indices_in.shape[-1]
+            # Compute torch-bf16 reference attention IN-PROCESS on same tensors.
+            # k_cache may be 2D/3D/4D; flatten to (N_KV, slot_stride) like the kernel.
+            if k_cache_in.dim() == 4:
+                npg, ps, _, slot = k_cache_in.shape
+                kv_2d = k_cache_in.reshape(npg * ps, slot)
+            elif k_cache_in.dim() == 3:
+                kv_2d = k_cache_in.reshape(-1, k_cache_in.shape[-1])
+            else:
+                kv_2d = k_cache_in
+            k_full = kv_2d.float()  # fp8_e4m3fn → fp32 (PyTorch fn-correct per probe)
+            ref = torch.zeros(B_, S_, H_, V_, dtype=torch.float32, device=q_in.device)
+            ref_lse = torch.zeros(B_, H_, S_, dtype=torch.float32, device=q_in.device)
+            ref_lse.fill_(float("-inf"))
+            for b_ in range(B_):
+                for s_ in range(S_):
+                    idx_raw = indices_in[b_, s_].to(torch.long)
+                    invalid = idx_raw < 0
+                    idx_safe = torch.clamp(idx_raw, min=0)
+                    k_g = k_full[idx_safe, :D_]
+                    v_g = k_full[idx_safe, :V_]
+                    if invalid.all():
+                        continue
+                    q_h = q_in[b_, s_, :, :].float()  # [H, D]
+                    scores = (q_h @ k_g.T) * sm_scale_in  # [H, topk]
+                    scores = torch.where(
+                        invalid.view(1, -1),
+                        torch.tensor(float("-inf"), device=q_in.device),
+                        scores,
+                    )
+                    lse = torch.logsumexp(scores, dim=-1)  # [H]
+                    ref_lse[b_, :, s_] = lse
+                    attn = torch.softmax(scores, dim=-1)  # [H, topk]
+                    ref[b_, s_, :, :] = attn @ v_g  # [H, V]
+            ref_bf = ref.to(torch.bfloat16)
+            if attn_sink_in is not None:
+                sink = attn_sink_in.view(1, 1, H_, 1).float()
+                lse_b = ref_lse.transpose(1, 2).unsqueeze(-1).float()
+                sc = 1.0 / (1.0 + torch.exp(sink - lse_b))
+                ref_bf = (ref.float() * sc).to(torch.bfloat16)
+            # Diff metrics.
+            ck = ck_out_in.float().flatten()
+            rf = ref_bf.float().flatten()
+            n = (ck.norm() * rf.norm()).item()
+            cs = float(ck @ rf) / n if n > 1e-12 else float("nan")
+            mxd = (ck - rf).abs().max().item()
+            ck_amax = ck.abs().max().item()
+            rf_amax = rf.abs().max().item()
+            ck_nan = torch.isnan(ck).sum().item()
+            rf_nan = torch.isnan(rf).sum().item()
+            valid_pct = (indices_in >= 0).float().mean().item() * 100
+            pid_ = __os.getpid()
+            outp = __os.path.join(_live_diff_dir, f"_live_diff_pid{pid_}.log")
+            with open(outp, "a") as _f:
+                _f.write(
+                    f"call={st['call']:4d} {label:18s} "
+                    f"B={B_:4d} S_q={S_} H={H_:3d} D={D_} V={V_} topk={topk_:3d} "
+                    f"valid%={valid_pct:5.1f} sink={int(attn_sink_in is not None)} "
+                    f"sm_scale={sm_scale_in:.5f} "
+                    f"cos={cs:+.5f} maxd={mxd:.3e} "
+                    f"ck.amax={ck_amax:.2e} rf.amax={rf_amax:.2e} "
+                    f"ck.nan={ck_nan} rf.nan={rf_nan}\n"
+                )
+            st["written"] += 1
+        except Exception as _ex:
+            try:
+                with open(__os.path.join(_live_diff_dir, f"_live_diff_pid{__os.getpid()}_ERR.log"), "a") as _f:
+                    import traceback as _tb
+                    _f.write(f"call={st['call']} label={label}\n")
+                    _f.write(_tb.format_exc())
+            except Exception:
+                pass
+    # Log the dispatch metadata once per (s_q, d_qk, d_v, has_extra) shape.
+    _bump_branch(f"entry_sq{s_q}_dqk{d_qk}_dv{d_v}_extra{0 if extra_k_cache is None else 1}_2shot{int(_two_shot_enabled)}_ckenabled{int(_ck_v32_enabled)}")
+
     if (
         _ck_v32_enabled
         and indices is not None
@@ -155,6 +290,7 @@ def flash_mla_with_kvcache_torch(
             )
 
             if extra_k_cache is None:
+                _bump_branch("path_ck_v32_single_shot")
                 # Single CK V32 call (production fast path).
                 out, lse = ck_sparse_mla_decode_fp8_v32(
                     q=q.contiguous(),
@@ -163,6 +299,10 @@ def flash_mla_with_kvcache_torch(
                     invalid_mask=invalid_mask_2d,
                     attn_sink=attn_sink,
                     sm_scale=sm_scale_f,
+                )
+                _live_diff(
+                    "single_shot", q.contiguous(), k_cache, indices_i32,
+                    attn_sink, sm_scale_f, out, lse,
                 )
                 return out, lse
 
@@ -174,6 +314,7 @@ def flash_mla_with_kvcache_torch(
             # (with strides) and optionally fuses the attn_sink fold inline,
             # eliminating the small-launch dispatch overhead that caused the
             # +131 ms elementwise regression in Phase B.
+            _bump_branch("path_ck_v32_two_shot_split")
             from sglang.srt.layers.attention.ck_v32_sparse_mla import (
                 ck_sparse_mla_decode_fp8_v32_to_split,
                 ck_combine_two_splits,
@@ -231,6 +372,7 @@ def flash_mla_with_kvcache_torch(
             return out, lse
 
         if d_qk == 512 and d_v == 448 and extra_k_cache is None:
+            _bump_branch("path_ck_v32_model1")
             # MODEL1 legacy path; only single-cache supported.
             import sys as _sys
             _ws = "/mnt/vast/john/rocm-dynamo/kernel-agents/experiments/dsv4_sparse_mla_decode_hip_workspace"
@@ -347,6 +489,7 @@ def flash_mla_with_kvcache_torch(
     #     f"{get_tensor_info(t.extra_kv_scope.blocked_k_quantized) if t.extra_kv_scope is not None else None=} "
     # )
 
+    _bump_branch("path_fallthrough_ref_sparse_attn_decode")
     pack_ref = ref_sparse_attn_decode(p, t)
 
     # tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
