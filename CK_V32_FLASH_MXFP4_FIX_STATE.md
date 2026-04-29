@@ -41,7 +41,25 @@
    2. **Wrong invalid masking** — Layer-2 fix masked beyond/pidx<0, but maybe a subtler mask bug remains (e.g. masking the wrong column when `lane_id % 16 + nt * 16` mapping is off)
    3. **Q/K head alignment mismatch** — q row from one head matched against K loaded for a different head (Q_PASSES × MFMA_HEADS indexing bug under H=64)
 
-   **Next-step bisect**: dump (q_row, k_row, idx, score_kernel, score_oracle) for ONE failing (b, h, s) tuple from production. If kernel score for index X doesn't match `q[b,h] · k_pool[kv_indices[b,s,X]]`, it's hypothesis 1. If it matches but the kernel chose different X, it's hypothesis 2. Hypothesis 3 implies q rows are reading from wrong q-head.
+   **Per-tuple drill-down — Hypothesis 2 confirmed (argmax/index-mapping bug)**:
+
+   The live-diff was extended with a per-(b,h,s) drill-down that dumps q, indices, per-X fp32 scores, kernel's picked X, and a decision tree. Across 10 production samples (every drill-down dump from 4 TP workers × 4 calls), the pattern is **identical**:
+
+   - Production indices in failing rows have only 2 valid slots (X=0 → kv_idx=128, X=1 → kv_idx=129); the rest are `-1`.
+   - For different heads, the fp32 oracle's top-1 X varies (sometimes 0, sometimes 1, depending on q·K).
+   - **The kernel ALWAYS picks the OPPOSITE valid X** (when oracle picks X=0, kernel picks X=1; when oracle picks X=1, kernel picks X=0).
+   - Decision-tree check: `q · k_pool[ck_top1_kv_idx] * sm_scale == oracle's score for this X` to 4 decimals — **the K-row reads are correct**; the kernel computes the right score for the index it picks.
+
+   This is **NOT hypothesis 1** (KV indexing) — kernel reads the right K rows.
+   This is **a swap/transpose in the score-to-X mapping** inside the kernel's softmax pipeline.
+
+   **Most likely cause**: the gfx950 `mfma_bf16_16x16x32` per-lane output layout is `[M=lane_id%16, N=kgrp*4+c]` (head=M, kv_col=N), but the kernel's LDS write of P uses `kv_col=lane_id%16` and `head=kgrp*4+c` — which is the **transposed** labeling. So the score that the MFMA produced for (head=h, kv_col=k) gets stored at LDS slot `(head=h_assumed=k, kv_col=k_assumed=h)`. With only 2 valid kv_cols, this manifests as "kernel always picks the OTHER valid slot."
+
+   See [`feedback_flydsl_mfma32_layout`](/home/yanyuqin/.claude/projects/-mnt-vast-john-rocm-dynamo/memory/feedback_flydsl_mfma32_layout.md) for the analogous fwd-kernel labeled-transpose pattern at 32x32x16; the 16x16x32 layout used here likely has the same need for a careful M/N labeling.
+
+   **Fix path**: re-derive the per-lane output mapping for `mfma_bf16_16x16x32` from the gfx950 ISA / CDNA3 reference (or single-MFMA microbench with known input), then either: (a) swap the LDS-write indexing to `lds_p_qp[kv_col_actual * BLOCK_N + head_actual]` matching the actual MFMA layout, OR (b) use a labeled-transpose A/B operand ordering that produces the kernel's currently-assumed layout natively.
+
+   This unblocks Layer 3. ~1 day for an experienced CDNA kernel engineer with ISA docs in hand.
 
 ## Why the existing microbench misses both layers
 

@@ -390,6 +390,123 @@ def flash_mla_with_kvcache_torch(
                     f"precision_driven_frac={precision_driven:.3f} "
                     f"gap_at_mismatch_mean={gap_mean:.3e}\n"
                 )
+
+            # ───── Single-(b,h,s) drill-down for ONE mismatching head ─────
+            # Pick the first (b, h, s) where rank_pick_fp32 != rank_pick_ck and
+            # the head is valid. Dump q[b,h], indices[b,s], per-X score from
+            # fp32 oracle, the kernel's picked index (via ck_pick), and the
+            # ck_out direction. This disambiguates hypothesis 1/2/3 from the
+            # state doc.
+            try:
+                mm = (rank_pick_fp32 != rank_pick_ck) & valid_head
+                if mm.any():
+                    # take the first mismatch
+                    flat_idx = mm.flatten().nonzero(as_tuple=False).flatten()[0].item()
+                    b_pick = flat_idx // (H_ * S_)
+                    rest = flat_idx - b_pick * (H_ * S_)
+                    h_pick = rest // S_
+                    s_pick = rest % S_
+                    idx_b_s = indices_in[b_pick, s_pick].to(torch.long)
+                    invalid_b_s = idx_b_s < 0
+                    q_h_fp32 = q_in[b_pick, s_pick, h_pick, :].float()  # [D]
+                    # Score per topk index from FP32 oracle (q · K[idx]).
+                    idx_safe = torch.clamp(idx_b_s, min=0)
+                    k_g = k_full_fp32[idx_safe, :D_]  # [topk, D]
+                    scores_fp32 = (q_h_fp32 @ k_g.T) * sm_scale_in  # [topk]
+                    scores_fp32 = torch.where(invalid_b_s, torch.tensor(
+                        float("-inf"), device=q_in.device), scores_fp32)
+                    fp32_top1_X = int(rank_pick_fp32[b_pick, h_pick, s_pick].item())
+                    fp32_top1_score = float(scores_fp32[fp32_top1_X].item())
+                    fp32_top1_kv_idx = int(idx_b_s[fp32_top1_X].item())
+
+                    ck_top1_X = int(rank_pick_ck[b_pick, h_pick, s_pick].item())
+                    ck_top1_score_per_oracle = float(scores_fp32[ck_top1_X].item())
+                    ck_top1_kv_idx = int(idx_b_s[ck_top1_X].item()) if ck_top1_X >= 0 else -1
+
+                    # If kernel's chosen index has a score the oracle ranks LOW,
+                    # the kernel reads from a different KV row OR computes a
+                    # different score. To distinguish, recompute the score the
+                    # kernel WOULD see if it correctly indexed this kv slot:
+                    # `q_h_fp32 @ K[ck_top1_kv_idx]`. If that fp32 score equals
+                    # the oracle's score for ck_top1_X, the kernel's MFMA math
+                    # is correct but it's picking the wrong X (mask/index
+                    # selection bug). If it differs, the kernel reads K from
+                    # the wrong KV row (indexing bug).
+                    if ck_top1_kv_idx >= 0:
+                        k_at_ck = k_full_fp32[ck_top1_kv_idx, :D_]
+                        kernel_kv_implied_score = float(
+                            ((q_h_fp32 @ k_at_ck) * sm_scale_in).item())
+                    else:
+                        kernel_kv_implied_score = float("nan")
+
+                    # Sort scores to show fp32's top-5 vs where the kernel picked.
+                    s_sorted, s_argsort = torch.sort(scores_fp32, descending=True)
+                    top5_X = s_argsort[:5].tolist()
+                    top5_scores = s_sorted[:5].tolist()
+                    top5_kv = [int(idx_b_s[x].item()) for x in top5_X]
+
+                    # Find rank of ck_top1_X in fp32 sort (1-based).
+                    ck_rank_in_fp32 = int(
+                        (s_argsort == ck_top1_X).nonzero(as_tuple=False)
+                        .flatten()[0].item()) + 1
+
+                    drill_path = __os.path.join(
+                        _live_diff_dir,
+                        f"_drilldown_pid{pid_}_call{st['call']}.log",
+                    )
+                    with open(drill_path, "w") as _df:
+                        _df.write(f"=== Drill-down for call {st['call']} ===\n")
+                        _df.write(f"label={label} B={B_} H={H_} S_q={S_} D={D_} V={V_} topk={topk_}\n")
+                        _df.write(f"valid_pct={valid_pct:.2f}% sm_scale={sm_scale_in:.6f}\n")
+                        _df.write(f"\nPicked (b,h,s)=({b_pick},{h_pick},{s_pick}) — first rank-mismatch\n")
+                        _df.write(f"  valid_count_in_row={int((idx_b_s>=0).sum().item())}\n\n")
+                        _df.write(f"FP32 oracle top-5 (X = topk-slot index):\n")
+                        for r, (x, sc, kv) in enumerate(zip(top5_X, top5_scores, top5_kv)):
+                            _df.write(f"  rank{r+1}: X={x:3d} score={sc:+.4f} kv_idx={kv}\n")
+                        _df.write(f"\nKernel's picked X (via output-direction match): X={ck_top1_X}\n")
+                        _df.write(f"  → kv_idx (from indices[b,s,X])={ck_top1_kv_idx}\n")
+                        _df.write(f"  → fp32 score for THIS X={ck_top1_score_per_oracle:+.4f}\n")
+                        _df.write(f"  → fp32 rank of kernel's pick in oracle's order: {ck_rank_in_fp32}/{topk_}\n")
+                        _df.write(f"\nDecision tree:\n")
+                        score_for_kv = kernel_kv_implied_score
+                        oracle_at_X = ck_top1_score_per_oracle
+                        # Kernel's score for the kv slot it picked is `score_for_kv`.
+                        # If kernel were correctly reading kv_pool[ck_top1_kv_idx],
+                        # MFMA would give score ≈ score_for_kv.
+                        # If oracle says score_for_kv ≈ oracle_at_X, the kernel's
+                        # MFMA is correctly producing this score — and it's just
+                        # a low-ranked score in the oracle's ordering. So the
+                        # kernel must believe it's high (mask/argmax bug).
+                        # If score_for_kv >> oracle_at_X, kernel is reading from
+                        # a different kv row.
+                        _df.write(f"  q · k_pool[ck_top1_kv_idx={ck_top1_kv_idx}] * sm_scale = {score_for_kv:+.4f}\n")
+                        _df.write(f"  oracle's score for this X         = {oracle_at_X:+.4f}\n")
+                        _df.write(f"  fp32 top-1 score                 = {fp32_top1_score:+.4f}\n")
+                        if not (oracle_at_X != oracle_at_X):  # not nan
+                            if abs(score_for_kv - oracle_at_X) > 0.01:
+                                _df.write("  → q·K mismatch: KERNEL READS K FROM WRONG ROW (hyp 1)\n")
+                            else:
+                                _df.write("  → q·K matches: kernel sees correct score for ck pick\n")
+                                _df.write("  → but oracle ranks ck's pick LOW → KERNEL ARGMAX/MASK BUG (hyp 2)\n")
+                                _df.write("  → OR Q/K HEAD ALIGNMENT WRONG (hyp 3)\n")
+
+                        # Also dump per-index scores (full topk) for forensic.
+                        _df.write(f"\nFull per-X fp32 scores (sorted):\n")
+                        all_X = s_argsort.tolist()
+                        all_sc = s_sorted.tolist()
+                        all_kv = [int(idx_b_s[x].item()) for x in all_X]
+                        for r in range(min(20, len(all_X))):
+                            tag = " ← KERNEL_PICK" if all_X[r] == ck_top1_X else ""
+                            _df.write(f"  rank{r+1:3d}: X={all_X[r]:3d} score={all_sc[r]:+.4f} kv_idx={all_kv[r]}{tag}\n")
+            except Exception as _ex:
+                try:
+                    with open(__os.path.join(_live_diff_dir,
+                              f"_drilldown_pid{__os.getpid()}_ERR.log"), "a") as _f:
+                        import traceback as _tb
+                        _f.write(f"call={st['call']}\n{_tb.format_exc()}")
+                except Exception:
+                    pass
+
             st["written"] += 1
         except Exception as _ex:
             try:
