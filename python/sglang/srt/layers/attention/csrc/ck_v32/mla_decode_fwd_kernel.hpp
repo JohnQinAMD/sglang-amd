@@ -96,6 +96,26 @@ lds_load_f16x8(const _Float16* p)
 // Convert bf16x8 → f16x8 in registers (lossless for fp8-decoded values:
 // fp8 e4m3 has only 4 mantissa bits, so it fits in fp16's 10 bits with
 // margin). Used to feed bf16 V from LDS into the fp16 PV mfma.
+// fp32 mfma for the highest-precision PV path. Used when
+// SGLANG_CK_V32_FP32_PV is defined at compile time. K=4 per call (vs fp16's
+// K=32), so 8 calls per (qp, vl) tuple — ~8x compute increase on PV.
+// Eliminates the bf16/fp16 mantissa loss that caused the 60-layer-compounded
+// drift under SGLANG_HIP_CK_V32_SINGLESHOT=1 (production residual stream
+// expects fp32-equivalent per-layer attention output).
+//
+// Per-lane operand layout for mfma_f32_16x16x4_f32:
+//   A: 1 fp32 per lane, lane = M + K*16 (M=lane%16, K=lane/16)
+//   B: 1 fp32 per lane, lane = N + K*16 (N=lane%16, K=lane/16)
+//   C: 4 fp32 per lane, c=M%4, lane=N+(M/4)*16 (same as bf16/fp16 mfma)
+__device__ __forceinline__ void
+mfma_f32_16x16x4(float4_t& c, float a, float b)
+{
+    float4_native cn = *reinterpret_cast<float4_native*>(&c);
+    cn = __builtin_amdgcn_mfma_f32_16x16x4f32(a, b, cn, 0, 0, 0);
+    asm volatile("" : "+v"(cn));
+    *reinterpret_cast<float4_native*>(&c) = cn;
+}
+
 __device__ __forceinline__ f16x8_t
 bf16x8_to_f16x8(bf16x8_t a)
 {
@@ -351,9 +371,6 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
 
     const uint8_t* __restrict__ kv_base = reinterpret_cast<const uint8_t*>(args.kv_ptr);
     const __bf16*  __restrict__ q_base  = reinterpret_cast<const __bf16*>(args.q_ptr);
-    // P-tile LDS is now fp16 (was bf16). Same byte layout — _Float16 is 2 bytes.
-    // Gives 3 extra mantissa bits per P value at zero compute cost via the
-    // mfma_f32_16x16x32_f16 PV mfma.
     _Float16* __restrict__ lds_p_r =
         reinterpret_cast<_Float16*>(smem + LDS_KV_SIZE);
 
@@ -601,16 +618,56 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
             int vt = warp_id * PV_PER_WARP + vl;
             int v_col = (lane_id % 16) + vt * 16;
             int kv_bt = kgrp * 8;
+
+#ifdef SGLANG_CK_V32_FP32_PV
+            // Highest-precision PV path: fp32 inputs to mfma_f32_16x16x4_f32.
+            // 8x more MFMA calls per (qp, vl) than mfma_f16_16x16x32 (K=4 vs
+            // K=32) but matches the bf16 ref path's fp32 softmax-output @ V
+            // precision. Required to ship Lever 1's perf gain — fp16's
+            // 10-bit mantissa wasn't enough; the model's residual stream
+            // expects fp32-equivalent attention output across 60 layers.
+            //
+            // Per-call layout (fp32 mfma 16x16x4):
+            //   A[M=lane%16, K=lane/16]: 1 fp32/lane → P value at this kgrp
+            //   B[K=lane/16, N=lane%16]: 1 fp32/lane → V value at this kgrp
+            // 8 iterations × K=4 = K=32 BLOCK_N. Each iteration the lane
+            // reads its specific (M, K) and (K, N) operand from LDS.
+            //
+            // For this lane (kgrp = lane_id/16):
+            //   k_off in 0..7: A reads P[head=lane%16, kv_col=k_off*4+kgrp]
+            //                   B reads V[kv_row=k_off*4+kgrp, v_col]
+            // (kgrp varies across lanes 0..63 as 0,0..15→0; 16..31→1; etc.)
+            #pragma unroll
+            for (int qp = 0; qp < Q_PASSES; ++qp) {
+                if (!qp_active[qp]) continue;
+                _Float16* __restrict__ lds_p_qp_x =
+                    lds_p_r + qp * (MFMA_HEADS * BLOCK_N);
+                int head = lane_id % 16;
+                int kgrp_lcl = lane_id / 16;
+                #pragma unroll
+                for (int k_off = 0; k_off < 8; ++k_off) {
+                    int k_global = k_off * 4 + kgrp_lcl;
+                    // P value for this lane's (M=head, K=k_global)
+                    _Float16 p_h = lds_p_qp_x[head * BLOCK_N + k_global];
+                    // V value for this lane's (K=k_global, N=v_col)
+                    __bf16 v_b = lds_kv[k_global * LDS_STRIDE + v_col];
+                    float p_f = (float)p_h;
+                    float v_f = (float)v_b;
+                    mfma_f32_16x16x4(
+                        o_acc[qp*PV_PER_WARP+vl], p_f, v_f);
+                }
+            }
+#else
             __bf16 vb[8];
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 vb[j] = lds_kv[(kv_bt + j) * LDS_STRIDE + v_col];
             }
             bf16x8_t vb_v_bf = *reinterpret_cast<bf16x8_t*>(vb);
-            // Layer-3 precision fix: convert V from bf16 (LDS storage) to
-            // fp16 in registers for the higher-precision PV mfma. fp8-decoded
-            // V values fit losslessly in fp16 (fp8 has 4 mantissa bits, fp16
-            // has 10).
+            // Layer-3 precision fix (default fp16 path): convert V from bf16
+            // (LDS storage) to fp16 in registers for the higher-precision PV
+            // mfma. fp8-decoded V values fit losslessly in fp16 (fp8 has 4
+            // mantissa bits, fp16 has 10).
             f16x8_t vb_v = bf16x8_to_f16x8(vb_v_bf);
             #pragma unroll
             for (int qp = 0; qp < Q_PASSES; ++qp) {
@@ -618,6 +675,7 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
                 mfma_f16_16x16x32(
                     o_acc[qp*PV_PER_WARP+vl], pa_all[qp], vb_v);
             }
+#endif
         }
         __syncthreads();
         buf_idx ^= 1;
