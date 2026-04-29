@@ -53,13 +53,26 @@
    This is **NOT hypothesis 1** (KV indexing) — kernel reads the right K rows.
    This is **a swap/transpose in the score-to-X mapping** inside the kernel's softmax pipeline.
 
-   **Most likely cause**: the gfx950 `mfma_bf16_16x16x32` per-lane output layout is `[M=lane_id%16, N=kgrp*4+c]` (head=M, kv_col=N), but the kernel's LDS write of P uses `kv_col=lane_id%16` and `head=kgrp*4+c` — which is the **transposed** labeling. So the score that the MFMA produced for (head=h, kv_col=k) gets stored at LDS slot `(head=h_assumed=k, kv_col=k_assumed=h)`. With only 2 valid kv_cols, this manifests as "kernel always picks the OTHER valid slot."
+   **Initial hypothesis (REFUTED)**: the gfx950 `mfma_bf16_16x16x32` output layout disagrees with the kernel's labeling. Verified-and-refuted by `microbench/microbench_mfma_16x16x32_layout.py` — a one-hot probe over all 256 (M, N) input pairs:
 
-   See [`feedback_flydsl_mfma32_layout`](/home/yanyuqin/.claude/projects/-mnt-vast-john-rocm-dynamo/memory/feedback_flydsl_mfma32_layout.md) for the analogous fwd-kernel labeled-transpose pattern at 32x32x16; the 16x16x32 layout used here likely has the same need for a careful M/N labeling.
+   ```
+   Hypothesis A — lane=m+(n//4)*16, c=n%4: 16/256 match
+   Hypothesis B (kernel's) — lane=n+(m//4)*16, c=m%4: 256/256 match
+   >>> Layout is Hypothesis B (kernel's current assumption is correct).
+   ```
 
-   **Fix path**: re-derive the per-lane output mapping for `mfma_bf16_16x16x32` from the gfx950 ISA / CDNA3 reference (or single-MFMA microbench with known input), then either: (a) swap the LDS-write indexing to `lds_p_qp[kv_col_actual * BLOCK_N + head_actual]` matching the actual MFMA layout, OR (b) use a labeled-transpose A/B operand ordering that produces the kernel's currently-assumed layout natively.
+   So **the MFMA layout matches what the kernel expects**: `lane%16 = N (kv_col)`, `(lane//16)*4 + c = M (head)`. The kernel's labeling of `kv_col=lane_id%16` and `head=kgrp*4+c` in the QK softmax block is **correct**, not transposed.
 
-   This unblocks Layer 3. ~1 day for an experienced CDNA kernel engineer with ISA docs in hand.
+   **Bug must be elsewhere**. Possibilities:
+   1. **A/B operand INPUT layout** (probe verified OUTPUT only): kernel may load qa/kb into the MFMA with a row/col swap relative to the HW-expected operand layout — so the "score for (M=h, N=k)" in s_acc actually computed `q[k] · k_lds[h]` not `q[h] · k_lds[k]`.
+   2. **`ck_pick` heuristic in drill-down is misleading**: V-direction cosine inference assumes kernel output ≈ V[winner], but if the kernel produces a non-attn-shaped output, the inference picks the wrong "winner". The 50% mismatch could be a measurement artifact.
+   3. **LDS K loading row→column mapping**: loader stores K row `r` at LDS row `r * LDS_STRIDE`, but the QK MFMA expects K to be at a different layout for the B operand.
+
+   **Next-step bisect**: directly print per-(b,h,X) `s_acc` from inside the kernel (gated by `#define DEBUG_DUMP`), running the smallest failing config (B=1 isolation with 2 valid keys at known kv_idx). Compare the kernel's printed scores to oracle's `q[h] · k_pool[idx[X]] * sm_scale`. If kernel-printed scores match the oracle for kv_col 0 and 1: bug is in softmax/argmax post-processing. If kernel scores DIFFER from oracle: it's the operand input layout (hypothesis 1).
+
+   **Stopgap shipped (`ca6f41917`)**: gate single_shot off when extra_k_cache=None and !two_shot — falls through to ref_sparse_attn_decode. E2E coherent text restored. Two_shot prefill path unaffected. No perf regression vs `=0` baseline.
+
+   **Perf gain still pending**: -8 to -10 ms TPOT on Flash mxfp4 still unrealized until the kernel rewrite lands. Estimated 2-3 days kernel engineer + the in-kernel `printf` bisect to localize the score divergence (now a 1-day task with the live-diff drill-down infrastructure in tree).
 
 ## Why the existing microbench misses both layers
 
