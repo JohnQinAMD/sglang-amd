@@ -176,11 +176,28 @@ The fp32 PV path gives the kernel its best-attainable PV precision at near-zero 
 
 All tests PASS at cos=1.000000 / maxd=2.0 (bf16 precision floor) for non-degenerate captures, and correctly produce zeros for degenerate (all-invalid-row) captures. The kernel + wrapper + reduce + cache + graph capture/replay are ALL CORRECT under production-distribution data.
 
-**Definitive verdict on Layer-3**: the residual e2e regression is **production-only state** that the saved-tensor-replay can't reproduce:
-1. **Real model weights interacting with kernel output** — not just isolated tensors. The W_o projection + residual + RMSnorm + MLP at the next layer may amplify bf16-floor noise differently than the math model predicts.
-2. **Multi-stream overlap** — DSv4's 3-level multi-stream overlap (per `project_dsv4_tier1_cuda_graph_segv`) creates ordering interactions the single-stream test can't capture.
-3. **KV cache state buildup** — production runs many forward passes; the KV pool grows; my saved tensors are snapshots, not the full pool history.
-4. **Scheduler-side batch shape variability** — the wrapper's per-shape cache keys interact with the scheduler's chunking decisions in ways isolated tests don't reproduce.
+**Eager-mode test (2026-04-29 EOD-5)**: rebooted with `tier0` preset (no cuda graph) + `SGLANG_HIP_CK_V32_SINGLESHOT=1`. E2E garbage **persists** in eager mode but with different character — partially coherent that degrades:
+- single_shot + tier0 eager: `" a good place to start, andrewind,to, the same thing,thing,thing,thing..."` (partial coherence → degenerate repetition)
+- single_shot + cuda graph (stacked-best): `"1. 1. 1. 1."` (fully degenerate from token 1)
+- stopgap (BF16 ref): `" Paris, and the second is Rome..."` (fully coherent)
+
+This **rules out cuda graph as the sole bug source**. There's a per-call precision delta that compounds when **each layer's q depends on the prior layer's attention output** — a dependency chain the saved-tensor unit tests don't capture (saved tensors fix the inputs at one moment). cuda graph AMPLIFIES the problem (likely via captured stale-buffer addresses or stream-reorder issues) but the underlying drift exists in eager mode too.
+
+**Definitive verdict on Layer-3 (refined post-eager-test)**: the residual e2e regression is a **per-call bf16-floor precision delta that compounds via the chained-q dependency across layers**, which the saved-tensor-replay can't reproduce because it fixes the inputs at one moment.
+
+The compounding chain:
+1. **Layer N kernel output** has maxd ≈ 2.0 on output magnitude ~250 (bf16-floor delta vs ref). Per-call this is "correct" within bf16 precision.
+2. **Layer N+1's q** is computed from layer N's output (via residual + RMSnorm + q_lora projection). Q at layer N+1 thus carries that delta as input.
+3. The kernel's INPUT at layer N+1 is now slightly off vs what the ref path would have fed in. Even a perfect kernel produces slightly-different output for that layer.
+4. Across 60 layers, the cumulative delta moves hidden states off the training-distribution manifold.
+
+**My unit tests cannot catch this** because they fix the inputs across the 60 simulated calls. They verify "kernel output matches oracle for THIS input" but can't simulate "layer N+1's input is what layer N's output produces in production."
+
+**Cuda graph amplification** is real but secondary: with cuda graph (stacked-best preset) the output is fully degenerate; without graph (tier0 preset) it's partially coherent then degenerates. Same root cause, different amplification factor.
+
+Other (minor or ruled-out) factors:
+- **DSv4's 3-level multi-stream overlap** — `SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=0` in current production, so not active here.
+- **Scheduler-side batch shape variability** — minor interaction with cache keys; the wrapper's per-shape caches handle this correctly per the integration test.
 
 **This places the fix scope outside the kernel domain**. The Lever 1 perf gain ships behind a fix to one of the four production-state interactions above — work that requires:
 - Live model forward debugging (py-spy + tensor snapshots between layers)
