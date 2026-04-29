@@ -1,5 +1,6 @@
 import functools
 import math
+import os
 from typing import Tuple
 
 import tilelang
@@ -514,6 +515,30 @@ def mhc_pre(
     hc_mult3 = hc_mult * 2 + hc_mult2
 
     hc_hidden_size = hc_mult * hidden_size
+
+    # Optional Triton backend (default ON). Replaces the 2-stage TileLang
+    # pipeline (gemm_sqrsum splitk + big_fuse) with 3 Triton kernels using
+    # MFMA + split-K. Bypasses TileLang's per-shape JIT cache (which caused
+    # a +21 ms TPOT regression on chi2811 Flash-Base FP8 on 2026-04-29 when
+    # an unrelated mhc.py edit invalidated the autotune cache).
+    # Set SGLANG_MHC_USE_TRITON=0 to fall back to TileLang.
+    if os.environ.get("SGLANG_MHC_USE_TRITON", "1") == "1":
+        from sglang.jit_kernel.mhc_pre_triton import mhc_pre_triton as _triton_pre
+        result = _triton_pre(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+        if result is not None:
+            return result
+        # Fall through to TileLang on shape unsupported.
+
     assert fn.shape[0] == hc_mult3
     assert fn.shape[1] == hc_hidden_size
     assert hc_scale.shape == (3,)
@@ -676,6 +701,15 @@ def mhc_post(
         post_layer_mix = post_layer_mix.contiguous()
         comb_res_mix = comb_res_mix.contiguous()
     out = torch.empty_like(residual)
+
+    # Optional Triton backend (default ON). Single-kernel fused linear-combine
+    # across hc_mult slots. Set SGLANG_MHC_USE_TRITON=0 to fall back to TileLang.
+    if os.environ.get("SGLANG_MHC_USE_TRITON", "1") == "1":
+        from sglang.jit_kernel.mhc_post_triton import mhc_post_triton as _triton_post
+        if _triton_post(x, residual, post_layer_mix, comb_res_mix, out):
+            return out
+        # Fall through to TileLang on shape unsupported.
+
     mhc_post_tilelang(
         comb_res_mix,
         residual,
