@@ -162,6 +162,98 @@ def flash_mla_with_kvcache_torch(
         except Exception:
             pass
 
+    # SHADOW-REF: lightweight per-call hook that, when enabled, runs ref attention
+    # on the SAME tensors the kernel just consumed and appends one CSV line
+    # (call_idx, B, valid_pct, cos_sim, max_diff, ck_amax, rf_amax, rel_diff).
+    # This answers the question "is the e2e drift from a small number of
+    # outlier calls, or from cumulative bf16-floor noise across all calls?"
+    # The 8-capture saved-tensor test sampled 0.7% of production call space;
+    # this hook samples 100% of single_shot calls during a live e2e run.
+    # Enable via SGLANG_FLASH_MLA_SHADOW_REF=<dir>. Optional cap on lines via
+    # SGLANG_FLASH_MLA_SHADOW_REF_MAX (default 5000).
+    _shadow_dir = _os.environ.get("SGLANG_FLASH_MLA_SHADOW_REF", "")
+    _shadow_max = int(_os.environ.get("SGLANG_FLASH_MLA_SHADOW_REF_MAX", "5000"))
+    if not hasattr(flash_mla_with_kvcache_torch, "_shadow_state"):
+        flash_mla_with_kvcache_torch._shadow_state = {"call": 0, "written": 0}
+
+    def _shadow_diff(label, q_in, k_cache_in, indices_in, attn_sink_in,
+                     sm_scale_in, ck_out_in):
+        if not _shadow_dir:
+            return
+        st = flash_mla_with_kvcache_torch._shadow_state
+        st["call"] += 1
+        if st["written"] >= _shadow_max:
+            return
+        try:
+            if q_in.detach().abs().max().item() == 0.0:
+                return  # warmup placeholder
+        except Exception:
+            return
+        try:
+            import os as __os
+            B_, S_, H_, D_ = q_in.shape
+            V_ = ck_out_in.shape[-1]
+            if k_cache_in.dim() == 4:
+                npg, ps, _, slot = k_cache_in.shape
+                kv2d = k_cache_in.reshape(npg * ps, slot)
+            elif k_cache_in.dim() == 3:
+                kv2d = k_cache_in.reshape(-1, k_cache_in.shape[-1])
+            else:
+                kv2d = k_cache_in
+            if kv2d.dtype == torch.uint8:
+                kv2d = kv2d.view(torch.float8_e4m3fn)
+            k_pool_bf = kv2d.to(torch.bfloat16)
+
+            ref_out = torch.zeros(B_, S_, H_, V_, dtype=torch.bfloat16, device=q_in.device)
+            ref_lse = torch.full((B_, H_, S_), float("-inf"),
+                                  dtype=torch.float32, device=q_in.device)
+            for b in range(B_):
+                for s in range(S_):
+                    idx_raw = indices_in[b, s].long()
+                    invalid = idx_raw < 0
+                    if invalid.all():
+                        continue
+                    idx_safe = torch.clamp(idx_raw, min=0)
+                    k_g = k_pool_bf[idx_safe, :D_]
+                    v_g = k_pool_bf[idx_safe, :V_]
+                    scores = (q_in[b, s].float() @ k_g.float().T) * sm_scale_in
+                    scores = torch.where(invalid.view(1, -1),
+                                          torch.tensor(float("-inf"),
+                                                       device=q_in.device), scores)
+                    ref_lse[b, :, s] = torch.logsumexp(scores, dim=-1)
+                    attn = torch.softmax(scores, dim=-1)
+                    ref_out[b, s, :, :] = (attn @ v_g.float()).to(torch.bfloat16)
+            if attn_sink_in is not None:
+                sc = 1.0 / (1.0 + torch.exp(
+                    attn_sink_in.view(1, 1, H_, 1).float()
+                    - ref_lse.transpose(1, 2).unsqueeze(-1).float()))
+                sc = torch.where(torch.isfinite(sc), sc, torch.zeros_like(sc))
+                ref_out = (ref_out.float() * sc).to(torch.bfloat16)
+
+            ck_f = ck_out_in.float().flatten()
+            rf_f = ref_out.float().flatten()
+            n = (ck_f.norm() * rf_f.norm()).item()
+            cs = float(ck_f @ rf_f) / n if n > 1e-12 else float("nan")
+            diff = (ck_f - rf_f).abs()
+            mxd = diff.max().item()
+            ck_amax = ck_f.abs().max().item()
+            rf_amax = rf_f.abs().max().item()
+            rel = mxd / max(rf_amax, 1e-9)
+            valid_pct = (indices_in >= 0).float().mean().item() * 100
+
+            __os.makedirs(_shadow_dir, exist_ok=True)
+            outp = __os.path.join(_shadow_dir, f"shadow_pid{__os.getpid()}.csv")
+            new = not __os.path.exists(outp)
+            with open(outp, "a") as f:
+                if new:
+                    f.write("call,B,Sq,H,topk,valid_pct,cos,maxd,ck_amax,rf_amax,rel\n")
+                f.write(f"{st['call']},{B_},{S_},{H_},{indices_in.shape[-1]},"
+                        f"{valid_pct:.2f},{cs:.6f},{mxd:.4e},"
+                        f"{ck_amax:.4e},{rf_amax:.4e},{rel:.6f}\n")
+            st["written"] += 1
+        except Exception:
+            pass
+
     # DEBUG: live diff of CK V32 vs torch-bf16 reference. Computed in-process on
     # the SAME tensors the kernel just consumed — bypasses torch.save/load so we
     # can distinguish a real kernel bug from a replay-script oracle artifact.
@@ -570,6 +662,10 @@ def flash_mla_with_kvcache_torch(
                 _live_diff(
                     "single_shot", q.contiguous(), k_cache, indices_i32,
                     attn_sink, sm_scale_f, out, lse,
+                )
+                _shadow_diff(
+                    "single_shot", q.contiguous(), k_cache, indices_i32,
+                    attn_sink, sm_scale_f, out,
                 )
                 return out, lse
 
