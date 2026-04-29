@@ -397,11 +397,30 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
             {
                 int kv_col = lane_id % 16;
                 #pragma unroll
-                for (int nt = 0; nt < QK_N_TILES; ++nt)
-                    if (kv_col + nt * 16 >= n_valid)
+                for (int nt = 0; nt < QK_N_TILES; ++nt) {
+                    int row_in_tile = kv_col + nt * 16;
+                    bool beyond = (row_in_tile >= n_valid);
+                    // Layer-2 fix: also mask rows with pidx < 0 (real invalid
+                    // indices, not just beyond-last-tile padding). Without this,
+                    // q @ k_zero_filled = 0 produces score 0, which becomes a
+                    // valid (non-`-inf`) entry in the softmax. When subsequent
+                    // tiles produce small max values, the bf16-rounded P[invalid]
+                    // is non-zero, inflating rsum and scaling output down. Oracle
+                    // treats pidx<0 as -inf so its softmax excludes them entirely.
+                    // This was the asymmetry causing the FP8-saturation microbench
+                    // failures at invalid_frac=0.95.
+                    bool invalid_idx = false;
+                    if (!beyond) {
+                        int pidx_check = args.kv_indices[
+                            kv_start + n_start + row_in_tile];
+                        invalid_idx = (pidx_check < 0);
+                    }
+                    if (beyond || invalid_idx) {
                         #pragma unroll
                         for (int c = 0; c < 4; ++c)
                             s_acc[nt][c] = -1e30f;
+                    }
+                }
             }
 
             float lmax[4];
