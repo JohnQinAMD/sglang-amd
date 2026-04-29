@@ -195,8 +195,7 @@ def flash_mla_with_kvcache_torch(
             B_, S_, H_, D_ = q_in.shape
             V_ = ck_out_in.shape[-1]
             topk_ = indices_in.shape[-1]
-            # Compute torch-bf16 reference attention IN-PROCESS on same tensors.
-            # k_cache may be 2D/3D/4D; flatten to (N_KV, slot_stride) like the kernel.
+            # Flatten KV pool.
             if k_cache_in.dim() == 4:
                 npg, ps, _, slot = k_cache_in.shape
                 kv_2d = k_cache_in.reshape(npg * ps, slot)
@@ -204,58 +203,192 @@ def flash_mla_with_kvcache_torch(
                 kv_2d = k_cache_in.reshape(-1, k_cache_in.shape[-1])
             else:
                 kv_2d = k_cache_in
-            k_full = kv_2d.float()  # fp8_e4m3fn → fp32 (PyTorch fn-correct per probe)
-            ref = torch.zeros(B_, S_, H_, V_, dtype=torch.float32, device=q_in.device)
-            ref_lse = torch.zeros(B_, H_, S_, dtype=torch.float32, device=q_in.device)
-            ref_lse.fill_(float("-inf"))
+            k_full_fp32 = kv_2d.float()  # FP32 oracle: fn-correct per probe.
+            # bf16-MFMA simulator: dequant → bf16 → bf16 matmul (mirrors kernel's
+            # in-tile precision: q[bf16] @ k[bf16] with fp32 accumulator).
+            k_full_bf16 = k_full_fp32.to(torch.bfloat16)
+            # Output containers.
+            ref32 = torch.zeros(B_, S_, H_, V_, dtype=torch.float32, device=q_in.device)
+            refbf = torch.zeros(B_, S_, H_, V_, dtype=torch.float32, device=q_in.device)
+            ref_lse = torch.full((B_, H_, S_), float("-inf"),
+                                 dtype=torch.float32, device=q_in.device)
+            refbf_lse = torch.full((B_, H_, S_), float("-inf"),
+                                   dtype=torch.float32, device=q_in.device)
+            # Per-head ranking diff containers.
+            # rank_pick[mode][b,h,s] = top-k index that mode assigns the largest
+            # softmax weight to. -1 means "all-invalid head, no pick".
+            rank_pick_fp32 = torch.full((B_, H_, S_), -1, dtype=torch.long, device=q_in.device)
+            rank_pick_bf16 = torch.full((B_, H_, S_), -1, dtype=torch.long, device=q_in.device)
+            rank_pick_ck = torch.full((B_, H_, S_), -1, dtype=torch.long, device=q_in.device)
+            top_score_fp32 = torch.zeros((B_, H_, S_), dtype=torch.float32, device=q_in.device)
+            second_score_fp32 = torch.zeros((B_, H_, S_), dtype=torch.float32, device=q_in.device)
+            score_gap = torch.zeros((B_, H_, S_), dtype=torch.float32, device=q_in.device)
+
+            # Per-head valid count (rows where all topk are -1 produce zero
+            # output by definition — tighten oracle to skip them rather than
+            # let logsumexp(-inf,...,-inf) → NaN propagate.
+            valid_per_row = (indices_in >= 0).sum(dim=-1)  # [B, S_q]
+
             for b_ in range(B_):
                 for s_ in range(S_):
                     idx_raw = indices_in[b_, s_].to(torch.long)
                     invalid = idx_raw < 0
-                    idx_safe = torch.clamp(idx_raw, min=0)
-                    k_g = k_full[idx_safe, :D_]
-                    v_g = k_full[idx_safe, :V_]
-                    if invalid.all():
+                    if valid_per_row[b_, s_] == 0:
+                        # All-invalid row: defined-behavior output is zeros.
+                        # (Kernel post-Layer-1-2 fix also writes zeros here.)
                         continue
-                    q_h = q_in[b_, s_, :, :].float()  # [H, D]
-                    scores = (q_h @ k_g.T) * sm_scale_in  # [H, topk]
-                    scores = torch.where(
-                        invalid.view(1, -1),
-                        torch.tensor(float("-inf"), device=q_in.device),
-                        scores,
-                    )
-                    lse = torch.logsumexp(scores, dim=-1)  # [H]
-                    ref_lse[b_, :, s_] = lse
-                    attn = torch.softmax(scores, dim=-1)  # [H, topk]
-                    ref[b_, s_, :, :] = attn @ v_g  # [H, V]
-            ref_bf = ref.to(torch.bfloat16)
+                    idx_safe = torch.clamp(idx_raw, min=0)
+                    k_g32 = k_full_fp32[idx_safe, :D_]  # FP32 K
+                    v_g32 = k_full_fp32[idx_safe, :V_]
+                    k_gb16 = k_full_bf16[idx_safe, :D_]  # bf16 K (MFMA mirror)
+                    v_gb16 = k_full_bf16[idx_safe, :V_]
+
+                    q_h32 = q_in[b_, s_, :, :].float()
+                    q_hb16 = q_in[b_, s_, :, :].to(torch.bfloat16)
+
+                    scores32 = (q_h32 @ k_g32.T) * sm_scale_in
+                    # bf16 MFMA sim: q[bf16] @ k[bf16] in fp32 accumulator
+                    # (matches gfx950 mfma_bf16_16x16x32 numerics — bf16 inputs,
+                    # fp32 acc — but does NOT replicate the kernel's per-tile
+                    # max-trick / online-softmax; this is a "raw score" diff).
+                    scores_b = (q_hb16.float() @ k_gb16.float().T) * sm_scale_in
+
+                    # Mask invalid keys with -inf (matches Layer-2-fixed kernel)
+                    inv_b = invalid.view(1, -1).expand(H_, -1)
+                    scores32 = torch.where(inv_b, torch.tensor(float("-inf"),
+                                           device=q_in.device), scores32)
+                    scores_b = torch.where(inv_b, torch.tensor(float("-inf"),
+                                           device=q_in.device), scores_b)
+
+                    # FP32 oracle output.
+                    lse32 = torch.logsumexp(scores32, dim=-1)
+                    ref_lse[b_, :, s_] = lse32
+                    attn32 = torch.softmax(scores32, dim=-1)
+                    ref32[b_, s_, :, :] = attn32 @ v_g32
+
+                    # bf16-MFMA sim output.
+                    lseb = torch.logsumexp(scores_b, dim=-1)
+                    refbf_lse[b_, :, s_] = lseb
+                    attnb = torch.softmax(scores_b, dim=-1)
+                    refbf[b_, s_, :, :] = attnb @ v_g32  # bf16 attn × fp32 V
+
+                    # Top-1 pick per (b, h, s) from FP32 + bf16 + (later) ck.
+                    # rank_pick uses argmax over scores (ignoring -inf invalids).
+                    rank_pick_fp32[b_, :, s_] = scores32.argmax(dim=-1)
+                    rank_pick_bf16[b_, :, s_] = scores_b.argmax(dim=-1)
+
+                    # FP32 score gap (top1 - top2): if gap < bf16 ULP near
+                    # top1, ranking divergence is precision-noise-driven.
+                    s_sorted, _ = torch.sort(scores32, dim=-1, descending=True)
+                    top_score_fp32[b_, :, s_] = s_sorted[:, 0]
+                    # second-best where valid; if only 1 valid, equals top
+                    second_score_fp32[b_, :, s_] = s_sorted[:, 1]
+                    score_gap[b_, :, s_] = s_sorted[:, 0] - s_sorted[:, 1]
+
+            # Apply attn_sink fold (matches kernel wrapper's behavior).
             if attn_sink_in is not None:
                 sink = attn_sink_in.view(1, 1, H_, 1).float()
                 lse_b = ref_lse.transpose(1, 2).unsqueeze(-1).float()
-                sc = 1.0 / (1.0 + torch.exp(sink - lse_b))
-                ref_bf = (ref.float() * sc).to(torch.bfloat16)
-            # Diff metrics.
-            ck = ck_out_in.float().flatten()
-            rf = ref_bf.float().flatten()
-            n = (ck.norm() * rf.norm()).item()
-            cs = float(ck @ rf) / n if n > 1e-12 else float("nan")
-            mxd = (ck - rf).abs().max().item()
-            ck_amax = ck.abs().max().item()
-            rf_amax = rf.abs().max().item()
-            ck_nan = torch.isnan(ck).sum().item()
-            rf_nan = torch.isnan(rf).sum().item()
+                sc32 = 1.0 / (1.0 + torch.exp(sink - lse_b))
+                # Heads with -inf lse → sink-lse=+inf → exp=+inf → sc=0 →
+                # NaN propagates only if 0×inf shows up; mask explicitly.
+                sc32 = torch.where(torch.isfinite(sc32), sc32,
+                                   torch.zeros_like(sc32))
+                ref32 = ref32.float() * sc32
+                lse_bf = refbf_lse.transpose(1, 2).unsqueeze(-1).float()
+                scbf = 1.0 / (1.0 + torch.exp(sink - lse_bf))
+                scbf = torch.where(torch.isfinite(scbf), scbf,
+                                   torch.zeros_like(scbf))
+                refbf = refbf.float() * scbf
+
+            # Final NaN scrub on both refs (defined-behavior: NaN → 0).
+            ref32 = torch.nan_to_num(ref32, nan=0.0, posinf=0.0, neginf=0.0)
+            refbf = torch.nan_to_num(refbf, nan=0.0, posinf=0.0, neginf=0.0)
+
+            ref32_bf = ref32.to(torch.bfloat16)
+            refbf_bf = refbf.to(torch.bfloat16)
+
+            # Recover the kernel's per-head argmax from ck_out: which index
+            # has output most aligned with V_index. Approximate: for each
+            # (b,h,s), find the topk index whose V row is closest in
+            # direction to ck_out[b,s,h,:]. This is a heuristic but usually
+            # right when softmax is dominated by one key.
+            # (Skip if too expensive; bound H × topk × V dot products.)
+            try:
+                ck_pick = torch.full((B_, H_, S_), -1, dtype=torch.long,
+                                     device=q_in.device)
+                for b_ in range(B_):
+                    for s_ in range(S_):
+                        if valid_per_row[b_, s_] == 0:
+                            continue
+                        idx_raw = indices_in[b_, s_].to(torch.long)
+                        invalid = idx_raw < 0
+                        idx_safe = torch.clamp(idx_raw, min=0)
+                        v_g = k_full_fp32[idx_safe, :V_]   # [topk, V]
+                        v_norm = v_g / (v_g.norm(dim=-1, keepdim=True) + 1e-9)
+                        co = ck_out_in[b_, s_, :, :].float()
+                        co_norm = co / (co.norm(dim=-1, keepdim=True) + 1e-9)
+                        sims = co_norm @ v_norm.T  # [H, topk]
+                        sims = torch.where(invalid.view(1, -1),
+                                           torch.tensor(-2.0, device=q_in.device), sims)
+                        ck_pick[b_, :, s_] = sims.argmax(dim=-1)
+                rank_pick_ck = ck_pick
+            except Exception:
+                pass
+
+            # ───── Diff summary ─────
+            ck_flat = ck_out_in.float().flatten()
+            r32_flat = ref32_bf.float().flatten()
+            rbf_flat = refbf_bf.float().flatten()
+            def _cos(a, b):
+                n = (a.norm() * b.norm()).item()
+                return float(a @ b) / n if n > 1e-12 else float("nan")
+            cos_ck_r32 = _cos(ck_flat, r32_flat)
+            cos_ck_rbf = _cos(ck_flat, rbf_flat)
+            cos_r32_rbf = _cos(r32_flat, rbf_flat)
+            mxd_ck_r32 = (ck_flat - r32_flat).abs().max().item()
+            mxd_ck_rbf = (ck_flat - rbf_flat).abs().max().item()
+            mxd_r32_rbf = (r32_flat - rbf_flat).abs().max().item()
+
+            # Ranking-divergence stats (only at valid heads).
+            # Where rank_pick_fp32 != rank_pick_bf16: bf16-precision-driven
+            # disagreement (fp32 → bf16 score truncation flips top-1).
+            valid_head = (rank_pick_fp32 >= 0)
+            n_valid = int(valid_head.sum().item())
+            mismatch_fp32_bf16 = int(((rank_pick_fp32 != rank_pick_bf16) & valid_head).sum().item())
+            mismatch_fp32_ck = int(((rank_pick_fp32 != rank_pick_ck) & valid_head).sum().item())
+            mismatch_bf16_ck = int(((rank_pick_bf16 != rank_pick_ck) & valid_head).sum().item())
+            # For mismatches, what's the score gap (in bf16 ULPs at top1)?
+            # ULP near top: rough estimate = abs(top1) / 256 (bf16 7-bit mantissa).
+            ulp_at_top = top_score_fp32.abs() / 256.0
+            mismatch_mask = (rank_pick_fp32 != rank_pick_ck) & valid_head
+            if mismatch_mask.any():
+                gap_at_mismatch = score_gap[mismatch_mask]
+                ulp_at_mismatch = ulp_at_top[mismatch_mask]
+                ratio = (gap_at_mismatch / (ulp_at_mismatch + 1e-9)).cpu().tolist()
+                # Fraction of mismatches where gap < 4 bf16 ULPs (precision-driven)
+                precision_driven = sum(1 for r in ratio if r < 4.0) / len(ratio)
+                gap_mean = float(gap_at_mismatch.mean().item())
+            else:
+                precision_driven = float("nan")
+                gap_mean = float("nan")
+
             valid_pct = (indices_in >= 0).float().mean().item() * 100
             pid_ = __os.getpid()
             outp = __os.path.join(_live_diff_dir, f"_live_diff_pid{pid_}.log")
             with open(outp, "a") as _f:
                 _f.write(
-                    f"call={st['call']:4d} {label:18s} "
-                    f"B={B_:4d} S_q={S_} H={H_:3d} D={D_} V={V_} topk={topk_:3d} "
-                    f"valid%={valid_pct:5.1f} sink={int(attn_sink_in is not None)} "
-                    f"sm_scale={sm_scale_in:.5f} "
-                    f"cos={cs:+.5f} maxd={mxd:.3e} "
-                    f"ck.amax={ck_amax:.2e} rf.amax={rf_amax:.2e} "
-                    f"ck.nan={ck_nan} rf.nan={rf_nan}\n"
+                    f"call={st['call']:4d} {label:13s} "
+                    f"B={B_:4d} H={H_:3d} topk={topk_:3d} valid%={valid_pct:5.1f} | "
+                    f"cos(ck,r32)={cos_ck_r32:+.4f} cos(ck,rbf)={cos_ck_rbf:+.4f} "
+                    f"cos(r32,rbf)={cos_r32_rbf:+.4f} | "
+                    f"mxd(ck,r32)={mxd_ck_r32:.2e} mxd(ck,rbf)={mxd_ck_rbf:.2e} "
+                    f"mxd(r32,rbf)={mxd_r32_rbf:.2e} | "
+                    f"rank_mismatch fp32_vs_bf16={mismatch_fp32_bf16}/{n_valid} "
+                    f"fp32_vs_ck={mismatch_fp32_ck}/{n_valid} "
+                    f"bf16_vs_ck={mismatch_bf16_ck}/{n_valid} | "
+                    f"precision_driven_frac={precision_driven:.3f} "
+                    f"gap_at_mismatch_mean={gap_mean:.3e}\n"
                 )
             st["written"] += 1
         except Exception as _ex:

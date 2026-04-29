@@ -26,9 +26,22 @@
 
 2. **Layer 2 (FIXED, commit `1f65d9f62`)**: kernel produced finite-but-wrong attention values at high KV magnitudes + high invalid_frac. Root cause: the loader zero-fills K rows for `pidx<0` (invalid indices); `q @ k_zero = 0` gives score=0 which is a finite softmax entry, so exp2f(0 - max) leaks non-zero P contributions into rsum when max is small (or the bf16 round-trip puts P[invalid] just above subnormal threshold), scaling output down vs the oracle which uses `where(invalid, -inf, scores)`. Fix: in the score step, also `s_acc[nt][c] = -1e30f` when `args.kv_indices[...] < 0`. Verified by microbench_ck_v32_fp8_saturation: 37/150 → 62/150 PASS, all cos_sim now 1.00000.
 
-3. **Layer 3 (NOT FIXED)**: e2e Flash mxfp4 still produces incoherent text under `=1` despite Layers 1 and 2 fixed. Production-tensor replay shows cos_sim ≈ -0.06 (direction mismatch, NOT scaling) on B=6 and B=856 captures with mostly-invalid index distributions. Microbench at the same shapes shows cos_sim = 1.000, so either (a) the synthetic data doesn't capture a production-specific correlation between q-heads + indexer-selected KV pages, or (b) the replay script's oracle treats the production tensors differently than the kernel does (e.g. dtype roundtrip in torch.save/load).
+3. **Layer 3 (LOCALIZED, not yet fixed)**: e2e Flash mxfp4 still produces incoherent text under `=1` despite Layers 1+2 fixed. Live in-process diff (`SGLANG_FLASH_MLA_LIVE_DIFF=<dir>`, no save/load) confirms a real kernel bug AND rules out bf16 precision:
 
-   **Next-step bisect for Layer 3**: instrument the wrapper to compare kernel output vs ref_sparse_attn_decode output on the SAME production tensor (no torch.save/load detour). If they agree, the replay's oracle is bugged. If they disagree, instrument layer-by-layer in production to find the divergence point.
+   | Diff metric | Result | What it rules out |
+   |---|---|---|
+   | `cos(fp32_oracle, bf16_mfma_sim) = 1.0000` everywhere | fp32 and bf16 paths agree exactly | bf16 truncation is NOT the bug |
+   | `rank_mismatch(fp32, bf16) = 0/N` valid heads | bf16 sim and fp32 pick same top-1 key | Precision is not driving rankings |
+   | `rank_mismatch(fp32, ck) = ~50% of valid heads` | Kernel picks different top-1 from oracle on half of (b,h,s) | Real logic bug (not random noise) |
+   | `precision_driven_frac = 0.02-0.10` | Only 2-10% of kernel mismatches have score gaps within 4 bf16 ULPs | **>90% of mismatches are at clearly-distinct fp32 scores** |
+   | `gap_at_mismatch_mean = 10-250` (vs ~1.75 bf16 ULP) | Kernel picks "wrong" keys at scores 10-250× the bf16 noise floor | The wrong key is FAR from top-rank — kernel is reading/computing the wrong thing |
+
+   **Conclusion**: the kernel computes scores that disagree with the bf16-precision math by amounts far exceeding bf16 ULPs. The bug is in the kernel's logic — most likely candidates:
+   1. **Wrong KV row indexing** — kernel reads K from a different KV position than `kv_indices` says (off-by-one in `kv_start + n_start + ld_row`, or a `pages_per_row`/`pool_outer_stride` bug in 4D padded-pool addressing)
+   2. **Wrong invalid masking** — Layer-2 fix masked beyond/pidx<0, but maybe a subtler mask bug remains (e.g. masking the wrong column when `lane_id % 16 + nt * 16` mapping is off)
+   3. **Q/K head alignment mismatch** — q row from one head matched against K loaded for a different head (Q_PASSES × MFMA_HEADS indexing bug under H=64)
+
+   **Next-step bisect**: dump (q_row, k_row, idx, score_kernel, score_oracle) for ONE failing (b, h, s) tuple from production. If kernel score for index X doesn't match `q[b,h] · k_pool[kv_indices[b,s,X]]`, it's hypothesis 1. If it matches but the kernel chose different X, it's hypothesis 2. Hypothesis 3 implies q rows are reading from wrong q-head.
 
 ## Why the existing microbench misses both layers
 
