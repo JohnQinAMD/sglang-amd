@@ -94,6 +94,34 @@
 
    **Action**: kernel-agents CK fellow has the task; can be resumed via SendMessage to agent `aab7f9333a86dd4c4` for the next-step deep dive (RTNE rounding test, generic-ptr LDS waitcnt audit, full kernel-trace simulation).
 
+### Layer 3 update (2026-04-29 unit-test bisect): kernel itself is CORRECT
+
+`microbench/microbench_ck_v32_score_dump.py` extended into a full unit test reproducing production:
+- B=6, S_q=1, H=64, topk=128, num_splits=4 (production-matching)
+- 2 valid kv_idx per batch + 126 invalid (-1)
+- Different per-batch q (different randn seeds)
+- Different per-batch kv_idx (each batch uses a unique pair)
+- 4D padded-pool layout (matches production)
+- Calls `ck.mla_decode_fwd_ck_sparse_fp8` + `aiter.mla_reduce_v1` (the multi-split path that production hits)
+- Compares against per-batch FP32 oracle
+
+**Result: 6/6 batches PASS, cos_sim=1.000000, max_diff≈0.25 (bf16 precision floor).**
+
+So the kernel + reduce produces the correct attention output for the smallest production-matching shape. The Layer-3 bug as observed in the e2e probe (`'(a, b)'` garbage tokens under `=1` + single_shot ENABLED) is NOT in the kernel arithmetic.
+
+The drill-down's earlier "kernel always picks the OPPOSITE valid X from oracle" finding was a **measurement artifact of the V-direction cosine `ck_pick` heuristic**: when softmax weights are close (e.g., 0.5 vs 1.0 like our Stage-B P=[0.5977, 1.0, 0...]), the cosine inference can spuriously match the lower-weighted V vector and misreport the kernel's "winner". The actual kernel output is a CORRECT attention-weighted sum of both vectors.
+
+**Therefore the Layer-3 production failure (e2e garbage when single_shot is forced) must be in something the unit test doesn't replicate**:
+- cuda graph capture/replay interactions with the kernel-run state.
+- The wrapper's `_apply_split0_cast_with_sink_and_lse_transpose` Triton fast path (only fires for num_splits==1; production B=6 uses num_splits=4 so doesn't hit this).
+- The `_get_split_buffers` cache returning torch.empty buffers across calls — could be the original NaN-source for which Layer 1 added the empty-split safety, possibly still has a corner case in production multi-call sequences.
+- A torch stride or contiguity assumption in the wrapper that the unit test happens to satisfy but production doesn't.
+
+The Layer-3 stopgap (`ca6f41917`) remains the correct production fix because:
+- It restores e2e correctness under `=1`.
+- The kernel is a correct piece of code — falling through to ref in the broken integration regime doesn't fix a kernel bug; it sidesteps an integration bug that the kernel can't fix on its own.
+- The perf gain (-8 to -10 ms TPOT) requires fixing the integration regime, not the kernel.
+
    **Stopgap shipped (`ca6f41917`)**: gate single_shot off when extra_k_cache=None and !two_shot — falls through to ref_sparse_attn_decode. E2E coherent text restored. Two_shot prefill path unaffected. No perf regression vs `=0` baseline.
 
    **Perf gain still pending**: -8 to -10 ms TPOT on Flash mxfp4 still unrealized until the kernel rewrite lands. Estimated 2-3 days kernel engineer + the in-kernel `printf` bisect to localize the score divergence (now a 1-day task with the live-diff drill-down infrastructure in tree).

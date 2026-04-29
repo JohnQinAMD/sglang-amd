@@ -504,6 +504,34 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
             pa_all[qp] = lds_load_bf16x8(
                 &lds_p_qp[(lane_id % 16) * BLOCK_N + kgrp * 8]);
 
+#ifdef SGLANG_CK_V32_DEBUG_DUMP
+            // Stage-B: dump pa_all after the LDS write→read round-trip.
+            // The PV mfma_bf16_16x16x32 expects pa_all[qp] for lane L holds
+            // P[head=L%16, kv_col=kgrp*8..kgrp*8+7] in a bf16x8.
+            // For B=1 with 2 valid kv_idx (X=0, X=1), the EXPECTED P at
+            // (head=h, kv_col=0..7) is:
+            //   kv_col=0: softmax weight on idx[0]=128 = exp2(score_0-max)/rsum
+            //   kv_col=1: softmax weight on idx[1]=129 = exp2(score_1-max)/rsum
+            //                                            actually rsum NOT applied here yet
+            //                                            (rsum applied in epilogue via inv)
+            //   kv_col=2..7: 0 (kernel sets s_acc=-1e30 for these → exp=0)
+            // Compare to the s_acc dump in Stage-A: that printed POST-MASK
+            // s_acc (still in score-space). Stage-B prints what made it into
+            // pa_all (= softmax-output P, post-bf16-roundtrip).
+            if (batch_id == 0 && head_group == 0 && split_id == 0 &&
+                qp == 0 && n_start == s_start && lane_id < 16) {
+                __bf16* p = reinterpret_cast<__bf16*>(&pa_all[qp]);
+                printf("[CK_DBG_PA] lane=%2d head=%d kgrp=%d kv_cols=%d..%d "
+                       "P=[%+.4f %+.4f %+.4f %+.4f %+.4f %+.4f %+.4f %+.4f] "
+                       "rmax=%+.4f rsum=%+.4f\n",
+                       lane_id, lane_id % 16, kgrp,
+                       kgrp * 8, kgrp * 8 + 7,
+                       (float)p[0], (float)p[1], (float)p[2], (float)p[3],
+                       (float)p[4], (float)p[5], (float)p[6], (float)p[7],
+                       rmax[qp*4+0], rsum[qp*4+0]);
+            }
+#endif
+
         } // Q passes
 
         #pragma unroll 2
