@@ -135,6 +135,11 @@ struct MlaDecodeArgs {
 };
 
 static constexpr int MFMA_HEADS  = 16;
+// Default Q_PASSES (compile-time constant for legacy launcher dispatch). Phase
+// C2a templates this — the kernel takes Q_PASSES_T as a non-type template arg
+// and Q_PASSES is shadowed inside the kernel scope. The default below is
+// retained for places that compute LDS sizes at the .hip launch site for the
+// LEGACY 2-pass path. New callers should use MlaSizes<QK_HEAD_DIM_T, Q_PASSES_T>.
 static constexpr int Q_PASSES    = 2;
 static constexpr int TILE_HEADS  = MFMA_HEADS * Q_PASSES;
 static constexpr int BLOCK_N     = 32;
@@ -153,25 +158,36 @@ static constexpr int LDS_P_ONE   = MFMA_HEADS * BLOCK_N * 2;
 static constexpr int LDS_P_SIZE  = LDS_P_ONE * Q_PASSES;
 
 // Per-shape derived sizes. The kernel template instantiates these and the
-// launcher reads `lds_total<QK_HEAD_DIM_T>()` to size the dynamic LDS request.
+// launcher reads `lds_total<QK_HEAD_DIM_T, Q_PASSES_T>()` to size the dynamic
+// LDS request.
+//
+// Phase C2a (2026-04-28): added Q_PASSES_T template parameter. With Q_PASSES_T=1
+// the LDS P-tile shrinks by half AND the kernel runs ~half the QK MFMA work
+// (the second pass is wasted at production H=16, which fits in MFMA_HEADS=16).
+// Default Q_PASSES_T=2 preserves legacy behavior for H>16 (Pro V32 / Flash
+// non-TP-sharded).
 //
 // Math sanity per shape (verified at compile time below via static_asserts
 // inside the templated loader):
 //   QK_HEAD_DIM=576: QK_K_ITERS=18 (576/32), VECS_PER_ROW=72 (576/8), 72/8=9
 //   QK_HEAD_DIM=512: QK_K_ITERS=16 (512/32), VECS_PER_ROW=64 (512/8), 64/8=8
-template <int QK_HEAD_DIM_T>
+template <int QK_HEAD_DIM_T, int Q_PASSES_T = 2>
 struct MlaSizes {
     static constexpr int QK_HEAD_DIM = QK_HEAD_DIM_T;
+    static constexpr int Q_PASSES    = Q_PASSES_T;
+    static constexpr int TILE_HEADS  = MFMA_HEADS * Q_PASSES_T;
     static constexpr int QK_K_ITERS  = QK_HEAD_DIM_T / MFMA_K;
     static constexpr int LDS_STRIDE  = QK_HEAD_DIM_T + LDS_PAD;
     static constexpr int LDS_KV_ONE  = BLOCK_N * LDS_STRIDE * 2;
     static constexpr int LDS_KV_SIZE = LDS_KV_ONE * 2;
+    static constexpr int LDS_P_ONE_T = MFMA_HEADS * BLOCK_N * 2;
+    static constexpr int LDS_P_SIZE  = LDS_P_ONE_T * Q_PASSES_T;
     static constexpr int LDS_TOTAL   = LDS_KV_SIZE + LDS_P_SIZE;
 };
 
-template <int QK_HEAD_DIM_T>
+template <int QK_HEAD_DIM_T, int Q_PASSES_T = 2>
 __host__ __device__ constexpr int lds_total() {
-    return MlaSizes<QK_HEAD_DIM_T>::LDS_TOTAL;
+    return MlaSizes<QK_HEAD_DIM_T, Q_PASSES_T>::LDS_TOTAL;
 }
 
 // FP8 KV-tile loader: read QK_HEAD_DIM_T fp8 bytes per row from HBM via
@@ -237,14 +253,20 @@ load_kv_tile_fp8_to_lds(const MlaDecodeArgs& args, int tid, int kv_start, int s_
     }
 }
 
-template <int QK_HEAD_DIM_T>
+template <int QK_HEAD_DIM_T, int Q_PASSES_T = 2>
 __global__ void __launch_bounds__(BLOCK_SIZE, 2)
 mla_decode_fwd_kernel(MlaDecodeArgs args)
 {
-    constexpr int QK_K_ITERS  = MlaSizes<QK_HEAD_DIM_T>::QK_K_ITERS;
-    constexpr int LDS_STRIDE  = MlaSizes<QK_HEAD_DIM_T>::LDS_STRIDE;
-    constexpr int LDS_KV_ONE  = MlaSizes<QK_HEAD_DIM_T>::LDS_KV_ONE;
-    constexpr int LDS_KV_SIZE = MlaSizes<QK_HEAD_DIM_T>::LDS_KV_SIZE;
+    // Phase C2a: Q_PASSES is now per-instantiation. Default 2 preserves legacy
+    // behavior; Q_PASSES_T=1 cuts compute ~2× when H ≤ MFMA_HEADS=16 (Flash-Base
+    // FP8 TP=4 production case). All references to Q_PASSES below resolve to the
+    // template parameter via this constexpr shadow.
+    constexpr int Q_PASSES    = Q_PASSES_T;
+    constexpr int TILE_HEADS  = MFMA_HEADS * Q_PASSES_T;
+    constexpr int QK_K_ITERS  = MlaSizes<QK_HEAD_DIM_T, Q_PASSES_T>::QK_K_ITERS;
+    constexpr int LDS_STRIDE  = MlaSizes<QK_HEAD_DIM_T, Q_PASSES_T>::LDS_STRIDE;
+    constexpr int LDS_KV_ONE  = MlaSizes<QK_HEAD_DIM_T, Q_PASSES_T>::LDS_KV_ONE;
+    constexpr int LDS_KV_SIZE = MlaSizes<QK_HEAD_DIM_T, Q_PASSES_T>::LDS_KV_SIZE;
 
     const int batch_id   = blockIdx.x;
     const int head_group = blockIdx.y;
@@ -261,7 +283,18 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
     const int split_len = (kv_len + args.num_kv_splits - 1) / args.num_kv_splits;
     const int s_start   = split_len * split_id;
     const int s_end     = min(s_start + split_len, kv_len);
-    if (s_end <= s_start) return;
+
+    // Empty-split tile: skip the QK/softmax loop but STILL run the epilogue
+    // so split_data/split_lse get safe zeros + -1e30 sentinel. Without this,
+    // the empty tile leaves the cached split_data/split_lse buffers (allocated
+    // via torch.empty in the Python wrapper and reused across calls) at
+    // whatever stale memory pattern a prior call left there — including NaN.
+    // The combine kernel then reads NaN and propagates it to the model output,
+    // poisoning residual + RMSnorm + lm_head and producing garbage tokens
+    // (verified root cause for the Flash mxfp4 e2e regression). Sanitization
+    // below (row_ok = isfinite(rmax) && rsum > 0) handles this case because
+    // rmax stays -1e30 and rsum stays 0 if the QK/softmax loop never runs.
+    const bool empty_split = (s_end <= s_start);
 
     extern __shared__ char smem[];
     // Avoid initializer-list of LDS-derived pointers (triggers an
@@ -459,26 +492,48 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
         buf_idx ^= 1;
     } // KV tiles
 
+    // Epilogue: write split_data + split_lse with NaN/Inf sanitization.
+    //
+    // Production Flash mxfp4 captures with FP8-saturated KV (kv.abs.max=255)
+    // and B>=6 trip a NaN-producing path inside the online softmax accumulator
+    // (verified by microbench/microbench_ck_v32_nan_diff.py — 99% of rows
+    // yield NaN even with 92.6% of indices valid). Suspected internal cause:
+    // an inf score from a max-reduce edge case turning subsequent (s - max)
+    // into NaN. Until the root-cause kernel change lands, sanitize at the
+    // boundary so the broken split doesn't poison downstream combine /
+    // residual / lm_head and produce garbage tokens. Sanitized rows
+    // contribute LSE = -1e30 to the combine, which weights them to zero by
+    // the online-softmax merge across splits — same behavior as the
+    // all-masked case.
     int v_col_base = lane_id % 16;
     for (int qp = 0; qp < Q_PASSES; ++qp) {
         for (int c = 0; c < 4; ++c) {
             int cur_head = head_start + qp * MFMA_HEADS + kgrp * 4 + c;
             if (cur_head >= args.nhead) continue;
-            float inv = (rsum[qp*4+c] > 0) ? 1.0f / rsum[qp*4+c] : 0;
+            float rmax_c = rmax[qp*4+c];
+            float rsum_c = rsum[qp*4+c];
+            bool row_ok = isfinite(rmax_c) && isfinite(rsum_c) && (rsum_c > 0.0f);
+            float inv = row_ok ? (1.0f / rsum_c) : 0.0f;
             int sd = qo_start * args.stride_sd_s +
                      split_id * args.stride_sd_split +
                      cur_head * args.stride_sd_h;
             for (int vl = 0; vl < PV_PER_WARP; ++vl) {
                 int vc = v_col_base + (warp_id * PV_PER_WARP + vl) * 16;
-                if (vc < V_HEAD_DIM)
-                    args.split_data_ptr[sd + vc] = o_acc[qp*PV_PER_WARP+vl][c] * inv;
+                if (vc < V_HEAD_DIM) {
+                    float o_val = o_acc[qp*PV_PER_WARP+vl][c] * inv;
+                    if (!isfinite(o_val)) o_val = 0.0f;
+                    args.split_data_ptr[sd + vc] = o_val;
+                }
             }
             if (v_col_base == 0) {
                 int lb = qo_start * args.stride_lse_s +
                          split_id * args.stride_lse_split +
                          cur_head * args.stride_lse_h;
                 constexpr float kLn2 = 0.6931471805599453f;
-                args.split_lse_ptr[lb] = rmax[qp*4+c] * kLn2 + logf(rsum[qp*4+c]);
+                float lse_val = row_ok
+                    ? (rmax_c * kLn2 + logf(rsum_c))
+                    : -1e30f;
+                args.split_lse_ptr[lb] = lse_val;
             }
         }
     }
