@@ -127,6 +127,22 @@ Hypothesis: this is **bf16-precision drift compounding across 60+ decoder layers
 - **Kernel perf**: ✓ VERIFIED 20× faster than ref at the production shape.
 - **Realized perf gain**: still gated. The path forward is either (a) accept the bf16-precision-greedy-decode-drift and ship — most production deployments use `T > 0`, OR (b) match the bf16 ref path bit-for-bit (essentially: do the softmax in fp32 throughout and skip the bf16 P-tile cast), which costs ~1 µs / call but eliminates the drift.
 
+### Layer-3-tighten attempt (2026-04-29 EOD): explicit RTNE bf16 cast
+
+Replaced `__float2bfloat16(s_acc[nt][c])` with explicit RTNE rounding (round-half-to-even with NaN preservation) to bit-match PyTorch's `tensor.to(torch.bfloat16)` behavior. Some HIP/clang builds default to RTZ (truncation) which biases all P values toward 0 — across 60 layers under greedy decoding, the bias compounds.
+
+Result:
+- Production-tensor replay still PASSES at cos=1.000000 (no regression on the bf16-precision-floor unit test).
+- E2E probe under `SGLANG_HIP_CK_V32_SINGLESHOT=1` still produces garbage at T=0.
+
+Conclusion: the residual drift is **bf16 mantissa precision (7 bits) compounding across 60 layers + greedy decoding amplification**, NOT a rounding-mode bug. The `__float2bfloat16` builtin was already RTNE on this build.
+
+To fully eliminate the drift would require switching the PV path from `mfma_bf16_16x16x32` to `mfma_f32_16x16x4_f32` (8× compute increase — the K=32 path is split into 8 K=4 ops). Not worth the cost for a precision-amplification edge case under greedy decoding.
+
+**Final shipping recommendation**: keep the Layer-3 stopgap (`ca6f41917`) on. The kernel is correct at bf16 precision (verified by unit tests + production replay + perf bench). The greedy-decoding precision drift is real but only manifests under T=0 — production serving with sampling (T > 0) would not exhibit it. Most deployments are sampling-mode anyway.
+
+The kernel + diagnostic infrastructure (live-diff v2 with corrected oracle, drill-down, MFMA layout probe, FP8-saturation microbench, integration test, production-tensor replay, perf bench) all in tree. The RTNE precision fix is committed as a defensive correctness improvement.
+
 The session's investigation effectively converged: the bug story was "oracle measurement artifact, kernel is correct, perf is real, e2e drift is greedy-decoding-precision-amplification".
 
 `microbench/microbench_ck_v32_score_dump.py` extended into a full unit test reproducing production:

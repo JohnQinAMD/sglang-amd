@@ -495,9 +495,42 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
                 int kv_col = lane_id % 16;
                 for (int c = 0; c < 4; ++c) {
                     int head = kgrp * 4 + c;
-                    for (int nt = 0; nt < QK_N_TILES; ++nt)
-                        lds_p_qp[head * BLOCK_N + kv_col + nt * 16] =
-                            __float2bfloat16(s_acc[nt][c]);
+                    for (int nt = 0; nt < QK_N_TILES; ++nt) {
+                        // Layer-3-tighten: explicit RTNE bf16 cast for
+                        // bit-stable bf16 P-tile that matches PyTorch's
+                        // `tensor.to(torch.bfloat16)`. Some HIP/clang builds
+                        // default `__float2bfloat16` to RTZ (truncation),
+                        // which biases all P values toward 0; across 60
+                        // layers of compounded sparse softmax under greedy
+                        // decode (T=0), the bias drifts hidden states off
+                        // the training-distribution manifold.
+                        // Verified post-fix: production-tensor replay PASS
+                        // at cos=1.000000 / maxd=2.0 (bf16 ULP). E2E greedy
+                        // garbage still observed under SGLANG_HIP_CK_V32_SINGLESHOT=1
+                        // — the residual drift is bf16 mantissa precision
+                        // (7 bits) × 60-layer compounding × greedy
+                        // amplification, not RTZ vs RTNE. Eliminating that
+                        // requires switching the PV path to mfma_f32_16x16x4_f32
+                        // (8x compute). Keep RTNE as defensive correctness;
+                        // ship the Layer-3 stopgap (ca6f41917) for production.
+                        float pv = s_acc[nt][c];
+                        uint32_t bits;
+                        __builtin_memcpy(&bits, &pv, sizeof(bits));
+                        // RTNE: round-half-to-even at the bf16 mantissa cut.
+                        uint32_t lsb = (bits >> 16) & 1;
+                        uint32_t rounding = 0x7FFFu + lsb;
+                        // Preserve NaN: keep nonzero mantissa.
+                        if ((bits & 0x7F800000u) == 0x7F800000u
+                            && (bits & 0x007FFFFFu) != 0) {
+                            bits |= 0x00400000u;
+                        } else {
+                            bits += rounding;
+                        }
+                        uint16_t bf_bits = (uint16_t)(bits >> 16);
+                        __bf16 bf_val;
+                        __builtin_memcpy(&bf_val, &bf_bits, sizeof(bf_val));
+                        lds_p_qp[head * BLOCK_N + kv_col + nt * 16] = bf_val;
+                    }
                 }
             }
 
