@@ -29,16 +29,21 @@
 
 `microbench_ck_v32_512.py` uses `randn() * 0.1` for KV → `kv.abs().max() ≈ 3.0`. Production decode KV reaches `kv.abs().max() == 255.0` (FP8 e4m3 saturation max).
 
-Recommended microbench addition (Layer 2 bug should reproduce):
-```python
-# Replace
-k_cache_bf16 = torch.randn(N_KV, SLOT, dtype=torch.bfloat16, device=device) * 0.1
-# With
-k_cache_bf16 = torch.randn(N_KV, SLOT, dtype=torch.bfloat16, device=device) * 80.0
-k_cache_bf16 = torch.clamp(k_cache_bf16, -240, 240)  # near FP8 saturation
-```
+[`microbench/microbench_ck_v32_fp8_saturation.py`](microbench/microbench_ck_v32_fp8_saturation.py) — NEW — sweeps the saturation regime + B + invalid_frac and **reproduces the Layer-2 bug cleanly**: 37/150 PASS, all post-fix NaN-count is 0, but failures concentrate where:
+- `kv_scale ≥ 30` (i.e. `kv.abs().max ≥ 100`) + `invalid_frac == 0.95`: cos_sim 0.97-0.99 but `max_diff` in the hundreds.
 
-If this PASSES the cos_sim ≥ 0.999 check, the bug is data-distribution-specific in another way (e.g. correlations between q heads + indexer-selected KV pages that random data doesn't capture). If it FAILS, you have a localized microbench reproducer.
+Failure signature: cos_sim near 1 with magnitude blow-up → scaling/normalization bug, not direction error. Likely candidates inside the kernel:
+
+1. **`exp2f(s_acc - new_max)` rescale chain across tiles** — when old_max is far below new_max, `rsc = exp2f(old_max - new_max)` underflows to 0; if rsum was non-zero before, it gets zeroed; subsequent additions can produce ratios that don't recover. Bisect: print rsum across tiles in a small repro.
+2. **bf16 round-trip on the P (softmax probability) tile** — `__float2bfloat16(s_acc[nt][c])` after softmax-normalize loses ~7 bits. At `invalid_frac=0.95`, only 5% of P entries are non-tiny; the rest can quantize to subnormal/zero in bf16. Then `bf16(P) × bf16(V) → fp32 o_acc` may miss small contributors.
+3. **`lds_load_bf16x8` P reload at `lane_id % 16`** — verify the index math handles `kgrp` correctly across `MFMA_HEADS=16` × `Q_PASSES=2`. If a stale LDS slot is read on the second Q-pass, output magnitude scales wrong.
+4. **`fp8_decode_scale=1.0` for FP8 fn vs the cvt_pk_f32_fp8 HW intrinsic on saturated bytes** — comments at line 91 mention `kFnuzBiasFix=0.5f`. If a specific saturated byte pattern (e.g. 0x7E, near the NaN slot 0x7F) gets decoded with the wrong bias, the K row magnitude is 2× off → output 2× off.
+
+**Bisect entry point**: pick the smallest failing config from the sweep
+(e.g. `kv_scale=30, B=6, topk=64, invalid=0.95` → cos_sim 0.969, maxd 88, 0
+NaN). Add per-tile printf inside the kernel under a compile-time DEBUG flag,
+re-run, compare rsum/rmax/o_acc snapshots between this kernel and the FP32
+oracle. The first divergence point pins the bug.
 
 ## Recommendation for the path-to-1×-B200 Model 2 lever (-8 to -10 ms TPOT)
 
