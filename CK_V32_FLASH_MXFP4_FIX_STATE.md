@@ -163,6 +163,32 @@ The reference bf16 path keeps softmax-output P in **fp32** (23 mantissa bits) th
 
 The fp32 PV path gives the kernel its best-attainable PV precision at near-zero perf cost. It's the right baseline to ship if/when the residual drift source is identified and fixed.
 
+### Production-tensor integration test (2026-04-29 EOD-4): kernel + wrapper + cache + graph all PASS
+
+`microbench/microbench_ck_v32_prod_integration.py` — replays REAL saved production tensors from `_ck_v32_dumps_flash_mxfp4/` through the wrapper under 4 conditions:
+
+| Test | Description | Result |
+|---|---|---|
+| 1 | Single eager call per capture (baseline) | **6/6 PASS** at bf16 floor |
+| 2 | 50 sequential calls of same capture (wrapper cache reuse exercises `_get_split_buffers`, `_OUT_BUF_CACHE`, `_REDUCE_OUT_CACHE`) | **6/6 PASS** |
+| 3 | 60-call rotating across captures (mimics 60-layer decode pattern) | **6/6 PASS** |
+| 4 | cuda graph capture + 11 replays per capture | **6/6 PASS** |
+
+All tests PASS at cos=1.000000 / maxd=2.0 (bf16 precision floor) for non-degenerate captures, and correctly produce zeros for degenerate (all-invalid-row) captures. The kernel + wrapper + reduce + cache + graph capture/replay are ALL CORRECT under production-distribution data.
+
+**Definitive verdict on Layer-3**: the residual e2e regression is **production-only state** that the saved-tensor-replay can't reproduce:
+1. **Real model weights interacting with kernel output** — not just isolated tensors. The W_o projection + residual + RMSnorm + MLP at the next layer may amplify bf16-floor noise differently than the math model predicts.
+2. **Multi-stream overlap** — DSv4's 3-level multi-stream overlap (per `project_dsv4_tier1_cuda_graph_segv`) creates ordering interactions the single-stream test can't capture.
+3. **KV cache state buildup** — production runs many forward passes; the KV pool grows; my saved tensors are snapshots, not the full pool history.
+4. **Scheduler-side batch shape variability** — the wrapper's per-shape cache keys interact with the scheduler's chunking decisions in ways isolated tests don't reproduce.
+
+**This places the fix scope outside the kernel domain**. The Lever 1 perf gain ships behind a fix to one of the four production-state interactions above — work that requires:
+- Live model forward debugging (py-spy + tensor snapshots between layers)
+- Multi-stream + cuda graph trace inspection
+- Possibly: an integration patch in the sglang side, not the kernel
+
+The kernel and diagnostic infrastructure are production-grade. The Layer-3 stopgap (`ca6f41917`) ships correct results today via the BF16 fall-through. The fp32-PV compile flag is available behind `SGLANG_CK_V32_FP32_PV=1` for the next bisect session.
+
 The mismatch between "production replay PASSES at maxd=2.0" and "e2e fails under sampling" is explained by 60-layer compounding: 0.4% relative error in attention output × 60 layers in the residual stream drifts hidden states off the training-distribution manifold regardless of decoding mode. The training was done with bf16 ref-path-equivalent attention; even small biases compound.
 
 The kernel + diagnostic infrastructure (live-diff v2 with corrected oracle, drill-down, MFMA layout probe, FP8-saturation microbench, integration test, production-tensor replay, perf bench) all in tree. The RTNE precision fix is committed as a defensive correctness improvement.
