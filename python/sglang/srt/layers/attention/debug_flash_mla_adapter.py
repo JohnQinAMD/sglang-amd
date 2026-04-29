@@ -519,10 +519,22 @@ def flash_mla_with_kvcache_torch(
     # Log the dispatch metadata once per (s_q, d_qk, d_v, has_extra) shape.
     _bump_branch(f"entry_sq{s_q}_dqk{d_qk}_dv{d_v}_extra{0 if extra_k_cache is None else 1}_2shot{int(_two_shot_enabled)}_ckenabled{int(_ck_v32_enabled)}")
 
+    # Layer-3 GATE: gate the broken single_shot path off. When extra_k_cache
+    # is None at decode (s_q=1), the kernel has a labeled-transpose bug that
+    # produces wrong attention output. Skip the CK V32 dispatch entirely in
+    # that case so we fall through to ref_sparse_attn_decode (slow but correct).
+    # Override via SGLANG_HIP_CK_V32_SINGLESHOT=1 (debug only, known-broken).
+    _singleshot_gated_off = (
+        extra_k_cache is None
+        and not _two_shot_enabled
+        and _os.environ.get("SGLANG_HIP_CK_V32_SINGLESHOT", "0") != "1"
+    )
+
     if (
         _ck_v32_enabled
         and indices is not None
         and (extra_k_cache is None or _two_shot_enabled)
+        and not _singleshot_gated_off
     ):
         topk = indices.shape[-1]
         invalid_mask_2d = _get_invalid_mask(indices, topk_length, b, s_q, topk)
@@ -542,6 +554,11 @@ def flash_mla_with_kvcache_torch(
             if extra_k_cache is None:
                 _bump_branch("path_ck_v32_single_shot")
                 # Single CK V32 call (production fast path).
+                # NOTE: at decode (s_q=1, _two_shot_enabled=False) this branch
+                # is gated OFF higher up via _singleshot_gated_off — the
+                # outer guard prevents entering this if-block in the broken
+                # regime. We only reach here when SGLANG_HIP_CK_V32_SINGLESHOT=1
+                # explicitly forces the broken path for debugging.
                 out, lse = ck_sparse_mla_decode_fp8_v32(
                     q=q.contiguous(),
                     k_cache=k_cache,
