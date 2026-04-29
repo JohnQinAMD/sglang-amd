@@ -20,10 +20,15 @@
 
 - **E2E correctness is NOT restored.** `"The capital of France is"` still does not produce "Paris..." under `SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1`. The kernel produces incorrect (but finite) attention output; mapping NaN→0 in the epilogue prevents poisoning but does not give the model the right attention values.
 
-## Two-layer bug structure
+## Three-layer bug structure
 
-1. **Layer 1 (FIXED)**: kernel produced NaN for production captures with `kv.abs().max == 255.0` (FP8 saturation) and B≥6 or large prefill batches. Root cause: most likely an inf score from a max-reduce edge case turning subsequent `(s - max)` into NaN inside the online-softmax accumulator.
-2. **Layer 2 (NOT fixed)**: even when the kernel produces finite output, the attention values are arithmetically wrong for FP8-saturated KV — possibly a per-tile range mismatch, wrong `fp8_decode_scale` for some byte patterns, or an MFMA bf16 truncation issue that the microbench's `randn() * 0.1` synthetic data does not exercise.
+1. **Layer 1 (FIXED, commit `659c54710`)**: kernel produced NaN. Root cause: empty-split early-return left cached `torch.empty` `split_data`/`split_lse` buffers with stale memory across calls, including NaN bit patterns. Fix: drop the early return + epilogue `row_ok = isfinite && rsum > 0` sanitization. Verified by microbench_ck_v32_nan_diff: 850/856 → 0/856 NaN rows on B=856 production capture.
+
+2. **Layer 2 (FIXED, commit `1f65d9f62`)**: kernel produced finite-but-wrong attention values at high KV magnitudes + high invalid_frac. Root cause: the loader zero-fills K rows for `pidx<0` (invalid indices); `q @ k_zero = 0` gives score=0 which is a finite softmax entry, so exp2f(0 - max) leaks non-zero P contributions into rsum when max is small (or the bf16 round-trip puts P[invalid] just above subnormal threshold), scaling output down vs the oracle which uses `where(invalid, -inf, scores)`. Fix: in the score step, also `s_acc[nt][c] = -1e30f` when `args.kv_indices[...] < 0`. Verified by microbench_ck_v32_fp8_saturation: 37/150 → 62/150 PASS, all cos_sim now 1.00000.
+
+3. **Layer 3 (NOT FIXED)**: e2e Flash mxfp4 still produces incoherent text under `=1` despite Layers 1 and 2 fixed. Production-tensor replay shows cos_sim ≈ -0.06 (direction mismatch, NOT scaling) on B=6 and B=856 captures with mostly-invalid index distributions. Microbench at the same shapes shows cos_sim = 1.000, so either (a) the synthetic data doesn't capture a production-specific correlation between q-heads + indexer-selected KV pages, or (b) the replay script's oracle treats the production tensors differently than the kernel does (e.g. dtype roundtrip in torch.save/load).
+
+   **Next-step bisect for Layer 3**: instrument the wrapper to compare kernel output vs ref_sparse_attn_decode output on the SAME production tensor (no torch.save/load detour). If they agree, the replay's oracle is bugged. If they disagree, instrument layer-by-layer in production to find the divergence point.
 
 ## Why the existing microbench misses both layers
 
