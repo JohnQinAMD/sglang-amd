@@ -143,6 +143,14 @@ To fully eliminate the drift would require switching the PV path from `mfma_bf16
 
 **A1 sampling test (2026-04-29 EOD)**: tested production e2e under `SGLANG_HIP_CK_V32_SINGLESHOT=1` + T=0.7 / top_p=0.9 / sampling — **still produces garbage tokens** on all 5 test prompts. So the precision drift is NOT just a greedy-decoding artifact; the kernel's bf16 mantissa loss is large enough that even sampling can't recover. The path-to-1×-B200 Lever 1 cannot ship without the deeper precision fix.
 
+**fp16 PV upgrade (2026-04-29 EOD-2)**: switched the PV mfma from `mfma_f32_16x16x32_bf16` to `mfma_f32_16x16x32_f16` (gain 3 mantissa bits at zero compute cost — both have identical throughput on gfx950; only the input format changes from 7-bit to 10-bit mantissa). LDS P-tile widened from `__bf16` to `_Float16`; V converted from bf16 to fp16 in registers (lossless for fp8-decoded V).
+
+Result: production replay PASSES at the same bf16 floor (cos=1.000 / maxd=2.0). Perf bench unchanged: 35.54 µs/call vs bf16's 36.75 µs (marginally faster). E2E garbage **still** under SGLANG_HIP_CK_V32_SINGLESHOT=1 — fp16's 10 mantissa bits are NOT enough to eliminate the 60-layer-compounded drift.
+
+The reference bf16 path keeps softmax-output P in **fp32** (23 mantissa bits) through the @V matmul — that's why it works at production quality despite bf16-precision per-layer. Matching it requires `mfma_f32_16x16x4_f32` (fp32 inputs, K=4 → 8× more MFMA invocations per PV step). Estimated cost: ~37 µs × 8 = ~296 µs per call total = **2.3× slower than current but still 2.3× faster than ref**.
+
+**Recommendation**: keep the Layer-3 stopgap on as the production fix. The fp16 PV upgrade is committed as a strict improvement over bf16 PV (no regression, defensive precision). The full fp32 PV path is a 1-2 day kernel rewrite + validation cycle that's worth pursuing if/when the perf headroom is needed AND no other Path-to-1×-B200 lever provides it more cheaply (decode-body megakernel: -5 to -7 ms / 7 days; HIP kv_write_with_rope: -1.5 ms / 2 days; etc.).
+
 The mismatch between "production replay PASSES at maxd=2.0" and "e2e fails under sampling" is explained by 60-layer compounding: 0.4% relative error in attention output × 60 layers in the residual stream drifts hidden states off the training-distribution manifold regardless of decoding mode. The training was done with bf16 ref-path-equivalent attention; even small biases compound.
 
 The kernel + diagnostic infrastructure (live-diff v2 with corrected oracle, drill-down, MFMA layout probe, FP8-saturation microbench, integration test, production-tensor replay, perf bench) all in tree. The RTNE precision fix is committed as a defensive correctness improvement.
