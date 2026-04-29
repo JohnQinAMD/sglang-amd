@@ -139,7 +139,11 @@ Conclusion: the residual drift is **bf16 mantissa precision (7 bits) compounding
 
 To fully eliminate the drift would require switching the PV path from `mfma_bf16_16x16x32` to `mfma_f32_16x16x4_f32` (8× compute increase — the K=32 path is split into 8 K=4 ops). Not worth the cost for a precision-amplification edge case under greedy decoding.
 
-**Final shipping recommendation**: keep the Layer-3 stopgap (`ca6f41917`) on. The kernel is correct at bf16 precision (verified by unit tests + production replay + perf bench). The greedy-decoding precision drift is real but only manifests under T=0 — production serving with sampling (T > 0) would not exhibit it. Most deployments are sampling-mode anyway.
+**Final shipping recommendation**: keep the Layer-3 stopgap (`ca6f41917`) on. The kernel is correct at bf16 precision (verified by unit tests + production replay + perf bench). 
+
+**A1 sampling test (2026-04-29 EOD)**: tested production e2e under `SGLANG_HIP_CK_V32_SINGLESHOT=1` + T=0.7 / top_p=0.9 / sampling — **still produces garbage tokens** on all 5 test prompts. So the precision drift is NOT just a greedy-decoding artifact; the kernel's bf16 mantissa loss is large enough that even sampling can't recover. The path-to-1×-B200 Lever 1 cannot ship without the deeper precision fix.
+
+The mismatch between "production replay PASSES at maxd=2.0" and "e2e fails under sampling" is explained by 60-layer compounding: 0.4% relative error in attention output × 60 layers in the residual stream drifts hidden states off the training-distribution manifold regardless of decoding mode. The training was done with bf16 ref-path-equivalent attention; even small biases compound.
 
 The kernel + diagnostic infrastructure (live-diff v2 with corrected oracle, drill-down, MFMA layout probe, FP8-saturation microbench, integration test, production-tensor replay, perf bench) all in tree. The RTNE precision fix is committed as a defensive correctness improvement.
 
