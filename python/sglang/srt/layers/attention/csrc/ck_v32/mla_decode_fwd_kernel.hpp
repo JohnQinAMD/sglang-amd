@@ -422,6 +422,24 @@ mla_decode_fwd_kernel(MlaDecodeArgs args)
                     }
                 }
             }
+#ifdef SGLANG_CK_V32_DEBUG_DUMP
+            // Per-(lane, c, nt) s_acc dump for the smallest failing config
+            // (B=0, head_group=0, split_id=0, qp=0, first KV tile). Used by
+            // microbench/microbench_ck_v32_score_dump.py to verify QK math.
+            // Confirmed correct on 2026-04-29: scores match oracle exactly.
+            if (batch_id == 0 && head_group == 0 && split_id == 0 &&
+                qp == 0 && n_start == s_start && lane_id < 32) {
+                for (int nt = 0; nt < QK_N_TILES; ++nt) {
+                    for (int c = 0; c < 4; ++c) {
+                        int head = (lane_id / 16) * 4 + c;
+                        int kv_col = (lane_id % 16) + nt * 16;
+                        printf("[CK_DBG] lane=%2d c=%d nt=%d head=%2d kv_col=%2d "
+                               "s_acc=%+.4f (post-scale,post-mask)\n",
+                               lane_id, c, nt, head, kv_col, s_acc[nt][c]);
+                    }
+                }
+            }
+#endif
 
             float lmax[4];
             #pragma unroll

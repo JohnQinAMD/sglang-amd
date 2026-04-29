@@ -68,7 +68,31 @@
    2. **`ck_pick` heuristic in drill-down is misleading**: V-direction cosine inference assumes kernel output ≈ V[winner], but if the kernel produces a non-attn-shaped output, the inference picks the wrong "winner". The 50% mismatch could be a measurement artifact.
    3. **LDS K loading row→column mapping**: loader stores K row `r` at LDS row `r * LDS_STRIDE`, but the QK MFMA expects K to be at a different layout for the B operand.
 
-   **Next-step bisect**: directly print per-(b,h,X) `s_acc` from inside the kernel (gated by `#define DEBUG_DUMP`), running the smallest failing config (B=1 isolation with 2 valid keys at known kv_idx). Compare the kernel's printed scores to oracle's `q[h] · k_pool[idx[X]] * sm_scale`. If kernel-printed scores match the oracle for kv_col 0 and 1: bug is in softmax/argmax post-processing. If kernel scores DIFFER from oracle: it's the operand input layout (hypothesis 1).
+   **In-kernel printf bisect (DONE 2026-04-29)**: gated by `#define SGLANG_CK_V32_DEBUG_DUMP`, dumps post-scale post-mask `s_acc[nt][c]` for batch=0/head_group=0/split=0/qp=0/first-tile, all 32 lanes. Compare to oracle. Result on smallest failing config (B=1, 2 valid kv_idx at X=0,1):
+
+   | (lane, c, nt) | head | kv_col | kernel s_acc | oracle (`q[h] · k_pool[idx[X]] * sm_scale * log2e`) | match |
+   |---|---|---|---|---|---|
+   | (0, 0, 0) | 0 | 0 | -14.7319 | -14.7319 | ✓ |
+   | (1, 0, 0) | 0 | 1 | +14.5013 | +14.5013 | ✓ |
+   | (0, 1, 0) | 1 | 0 | +2.1017 | +2.1017 | ✓ |
+   | (1, 1, 0) | 1 | 1 | +2.8436 | +2.8436 | ✓ |
+   | (0, 2, 0) | 2 | 0 | -14.7447 | -14.7447 | ✓ |
+   | (1, 2, 0) | 2 | 1 | +7.2944 | +7.2944 | ✓ |
+   | (lane=2..15, c=*, nt=0) | * | 2..15 | -1e30 | -1e30 (masked) | ✓ |
+   | (lane=*, c=*, nt=1) | * | 16..31 | -1e30 | -1e30 (masked) | ✓ |
+
+   **Per-(lane, c, nt) s_acc values are CORRECT.** QK MFMA, mask, scaling all verified. The bug is fully downstream of the score computation.
+
+   **Tried + ruled out**:
+   - **MFMA OUTPUT layout transpose** (Hypothesis A→B in microbench_mfma_16x16x32_layout.py): 256/256 match for kernel's labeling.
+   - **Cross-lane LDS RAW hazard between P-write (line ~500) and P-read (line ~505)**: spawned the CK fellow agent (kernel-agents at /mnt/vast/john/rocm-dynamo/kernel-agents/tasks/dsv4_ck_v32_layer3_review.yaml, agent id `aab7f9333a86dd4c4`) which identified this; tried inserting `__syncthreads()` between the two; e2e changes character of garbage but does NOT fix.
+
+   **Remaining candidates** (CK fellow's writeup):
+   - bf16 truncation rounding mode at `__float2bfloat16(s_acc[nt][c])` may be RTZ instead of RTNE on gfx950 — small per-cell error compounds across BLOCK_N=32 P writes.
+   - `__restrict__` aliasing on `lds_p_qp` enabling unsafe reorder of LDS load before the cross-lane stores commit (waitcnt issue).
+   - `_split0_to_bf16_with_sink_and_lse_transpose_kernel` Triton fast path in the wrapper (only fires for num_splits==1; B=4..6 production hits num_splits=4 → goes through `_ck_native_reduce` instead).
+
+   **Action**: kernel-agents CK fellow has the task; can be resumed via SendMessage to agent `aab7f9333a86dd4c4` for the next-step deep dive (RTNE rounding test, generic-ptr LDS waitcnt audit, full kernel-trace simulation).
 
    **Stopgap shipped (`ca6f41917`)**: gate single_shot off when extra_k_cache=None and !two_shot — falls through to ref_sparse_attn_decode. E2E coherent text restored. Two_shot prefill path unaffected. No perf regression vs `=0` baseline.
 
