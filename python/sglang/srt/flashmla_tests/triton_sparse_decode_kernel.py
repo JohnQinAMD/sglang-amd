@@ -182,9 +182,28 @@ def triton_sparse_attn_decode(
         and waves_per_eu is None
         and matrix_instr_nonkdim is None
     ):
+        # Per-shape autotuned config (2026-04-29 sweep on chi2774, MI355X).
+        # Sweep at /sgl-pr/microbench/triton_sparse_decode_sweep_results.md
+        # documents the search space + winners. Universal pattern:
+        # `waves_per_eu=2 matrix_instr_nonkdim=16` + BLOCK_T=32 + larger
+        # SPLIT_K + BLOCK_D matched to D_QK = avg 1.10× decode, 1.32× big-topk.
+        if D_QK == 512:
+            block_d_sk = 256  # Flash mxfp4 / Flash-Base FP8: 1 clean D-tile
+        elif D_QK == 576:
+            block_d_sk = 128  # Pro: 5 tiles with masking; BD=192 was non-improving
+        else:
+            block_d_sk = 128  # safe default
+        if BS <= 2:
+            sk_block_h, sk_split_k = 4, 16  # B=1: lots of SPLIT_K to fill CUs
+        elif Topk >= 1024:
+            sk_block_h, sk_split_k = 8, 16  # big topk: wider H + max SPLIT_K
+        else:
+            sk_block_h, sk_split_k = 8, 8   # B≥4 small topk: wider H, moderate SK
         return triton_sparse_attn_decode_split_k(
             q, gathered_kv, invalid_mask, attn_sink, sm_scale, d_v,
-            BLOCK_H=4, BLOCK_T=64, BLOCK_D=128, SPLIT_K=8, num_warps=4, num_stages=1,
+            BLOCK_H=sk_block_h, BLOCK_T=32, BLOCK_D=block_d_sk,
+            SPLIT_K=sk_split_k, num_warps=4, num_stages=1,
+            waves_per_eu=2, matrix_instr_nonkdim=16,
         )
 
     q = q.contiguous()
