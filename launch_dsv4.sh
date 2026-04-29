@@ -248,10 +248,27 @@ case "$PRESET" in
     #     output tok/s    86.67       89.91   +3.74%
     #     duration (s)   420.22      405.09   -3.6%
     # Net first measurable TPOT win after Phase B+ shipped.
+    #
+    # Phase 31 (2026-04-29): _MHC_PRE flipped 1→0. After aiter-amd
+    # mhc rebuild on 2026-04-29 06:40 (commits f43ff0743/123ad371e/
+    # 3b917823a/3cbdcb371), the TileLang mhc_pre path regressed +21 ms
+    # TPOT (chi2774 Flash mxfp4: 34.00 → 55.12 ms). Disabling
+    # SGLANG_OPT_USE_TILELANG_MHC_PRE routes through the standalone
+    # Triton fused path (hc_pre_fused_triton + hc_split_sinkhorn +
+    # mul-sum-cast) which is unaffected by the regression. Same-day A/B:
+    #     PRE=1 POST=1 (regressed):  TPOT 55.12 ms  /  68.61 tok/s
+    #     PRE=0 POST=1 (this preset):TPOT 33.69 ms  / 111.90 tok/s
+    #     PRE=1 POST=0 (degenerate): TPOT 31.96 ms  / 117.81 tok/s (FAST but degenerate output)
+    #     PRE=0 POST=0 (degenerate): TPOT 33.22 ms  / 113.47 tok/s
+    # POST is correctness-critical; PRE is the perf regression source.
+    # Coherence verified on the "The capital of France is" probe at 32 tokens.
     _TOPK_TORCH=0; _FORCE_TRITON_MOE=0; _INDEXER_CAP=4096
     _MULTI_STREAM=0; _DISABLE_COMPILE=1
-    _MHC_PRE=1; _MHC_POST=1
-    _CG_BS="1 2 4 8"; _CG_MAX_BS=8
+    _MHC_PRE=0; _MHC_POST=1
+    # Phase 17: capture bs=3 explicitly so c=4 bench (which hits bs={1,2,3,4})
+    # never pads to bs=4. Per launch-overhead microbench (3.68 us/launch eager,
+    # 1.46 us graphed), every kernel forced into eager pad fallback costs ~3 ms.
+    _CG_BS="1 2 3 4 8"; _CG_MAX_BS=8
     ;;
   stacked-aiter-moe)
     _TOPK_TORCH=0; _FORCE_TRITON_MOE=0; _INDEXER_CAP=4096
