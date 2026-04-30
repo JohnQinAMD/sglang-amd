@@ -358,3 +358,83 @@ def m3_indexer_chain_torch(
         mask = mask | (arange_k >= topk_length.view(B, 1))
     # caller expects [B*S_q, K] — at decode S_q==1 so this is just a view
     out_invalid_mask.copy_(mask.view(B * s_q, K))
+
+
+# ============================================================================
+# Cross-module mask publish/lookup — bridges the indexer-side megakernel write
+# to the adapter-side `_get_invalid_mask` reader. Lives here (in the kernel
+# module) so neither indexer.py nor debug_flash_mla_adapter.py owns the table.
+#
+# Key:    (data_ptr(indices), id(topk_length))
+# Value:  the precomputed mask_2d tensor of shape (b*s_q, topk).
+#
+# Why this scheme:
+#   - data_ptr() is stable across `.unsqueeze()` views (same storage), so the
+#     indexer-side write and the adapter-side read on a (B,K)-shaped indices
+#     vs (B,1,K)-shaped indices both hit.
+#   - id(topk_length) is stable since the topk_length tensor passed through
+#     deepseek_v4_backend is NOT view-mangled (no unsqueeze along the way).
+#   - We don't include (b, s_q, topk) in the key — at decode they are derived
+#     from indices.shape, and at the hit-check we verify the cached mask
+#     matches the requested (b*s_q, topk) shape; mismatches fall through.
+#   - Cap at 16 to prevent unbounded growth across capture sizes; in practice
+#     production has 1 capture-mode shape + 1 eager shape = 2 entries.
+# ============================================================================
+_M3_INVALID_MASK_PUBLISH: dict = {}
+
+
+def publish_invalid_mask(
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    mask_2d: torch.Tensor,
+) -> None:
+    """Indexer side: stash the mask under (data_ptr(indices), id(topk_length))."""
+    key = (indices.data_ptr(), id(topk_length))
+    if len(_M3_INVALID_MASK_PUBLISH) > 16:
+        _M3_INVALID_MASK_PUBLISH.clear()
+    _M3_INVALID_MASK_PUBLISH[key] = mask_2d
+
+
+def lookup_invalid_mask(
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    expected_shape: tuple,
+) -> Optional[torch.Tensor]:
+    """Adapter side: return the published mask if shape matches, else None.
+
+    Called from `_get_invalid_mask` BEFORE its data_ptr cache; on hit we skip
+    `get_invalid_mask_triton` entirely. On miss we return None and the caller
+    falls through to its existing path (data_ptr cache → triton MISS).
+    """
+    key = (indices.data_ptr(), id(topk_length))
+    cached = _M3_INVALID_MASK_PUBLISH.get(key)
+    if cached is None:
+        return None
+    if cached.shape != expected_shape:
+        return None
+    return cached
+
+
+def ensure_invalid_mask_buffer(core_metadata) -> torch.Tensor:
+    """Return a persistent (B*S_q=B, K) bool buffer attached to core_metadata.
+
+    Allocated once per metadata instance (matches `c4_sparse_page_indices`
+    lifetime), so cuda-graph capture pre-allocates it at worst-case batch.
+    Lazy-init: created on first call; reused across all subsequent calls.
+    """
+    indices = core_metadata.c4_sparse_page_indices
+    B, K = indices.shape
+    buf = getattr(core_metadata, "_m3_c4_sparse_invalid_mask", None)
+    if buf is not None and buf.shape == (B, K) and buf.device == indices.device:
+        return buf
+    buf = torch.empty((B, K), dtype=torch.bool, device=indices.device)
+    # Attach as a regular attribute (dataclass __post_init__ already ran;
+    # PagedCoreMetadata accepts dynamic attribute writes).
+    try:
+        core_metadata._m3_c4_sparse_invalid_mask = buf
+    except Exception:
+        # Frozen dataclass safety: just return — on next call we re-alloc
+        # which is still fine since the kernel writes in-place to whatever
+        # buffer we hand it.
+        pass
+    return buf

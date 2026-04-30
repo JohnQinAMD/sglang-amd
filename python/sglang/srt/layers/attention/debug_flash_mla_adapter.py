@@ -35,7 +35,26 @@ def _get_invalid_mask(indices, topk_length, b, s_q, topk):
     allocator (per `feedback_data_ptr_caching_unsafe`). On cuda-graph captured
     decode where the buffers are persistent, hits are correct; on eager calls
     with allocator churn the indices id check disambiguates.
+
+    M3 megakernel hook: when the indexer-side megakernel is enabled
+    (`SGLANG_M3_INDEXER_MEGAKERNEL=1`), it precomputes this exact mask and
+    publishes it under `(data_ptr(indices), id(topk_length))`. We check that
+    table FIRST — on hit we return the precomputed mask (zero-launch). On miss
+    we fall through to the legacy data_ptr cache + Triton MISS path,
+    preserving 100% of the OFF-case semantics.
     """
+    # M3 megakernel pre-publish (indexer-side). Stays inert when the env knob
+    # is OFF (no publishes ever happen → no entries → fall-through is free).
+    try:
+        from sglang.jit_kernel.m3_indexer_megakernel_triton import (
+            lookup_invalid_mask as _m3_lookup,
+        )
+        _m3_mask = _m3_lookup(indices, topk_length, expected_shape=(b * s_q, topk))
+    except Exception:
+        _m3_mask = None
+    if _m3_mask is not None:
+        return _m3_mask
+
     key = (indices.data_ptr(), id(topk_length), b, s_q, topk)
     cached = _invalid_mask_cache.get(key)
     if cached is not None:
