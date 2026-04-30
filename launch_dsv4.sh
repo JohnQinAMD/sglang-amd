@@ -202,6 +202,8 @@ mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 #   _INDEXER_CAP      → SGLANG_INDEXER_MAX_SEQ_LEN
 #   _MULTI_STREAM     → SGLANG_OPT_USE_MULTI_STREAM_OVERLAP
 #   _DISABLE_COMPILE  → SGLANG_DISABLE_CAPTURE_COMPILE
+#   _M3_INDEXER       → SGLANG_M3_INDEXER_MEGAKERNEL
+#   _M1_KV_WRITE_ROPE → SGLANG_M1_KV_WRITE_WITH_ROPE
 #   _CG_BS            → --cuda-graph-bs values (space-separated)
 #   _CG_MAX_BS        → --cuda-graph-max-bs
 #   _DISABLE_CG       → 1 to pass --disable-cuda-graph (omits both _CG_*)
@@ -265,6 +267,10 @@ case "$PRESET" in
     _TOPK_TORCH=0; _FORCE_TRITON_MOE=0; _INDEXER_CAP=4096
     _MULTI_STREAM=0; _DISABLE_COMPILE=1
     _MHC_PRE=0; _MHC_POST=1
+    # 2026-04-30: M3 indexer megakernel (commit 56538ae0e) -0.34 ms TPOT, +1.05% throughput
+    # 2026-04-30: M1 kv_write_with_rope megakernel (commit f9f100efd) -0.41 ms TPOT, TTFT -151 ms
+    # Both validated on chi2774 stacked-best, default-OFF env knobs flipped to ON in this preset.
+    _M3_INDEXER=1; _M1_KV_WRITE_ROPE=1
     # Phase 17: capture bs=3 explicitly so c=4 bench (which hits bs={1,2,3,4})
     # never pads to bs=4. Per launch-overhead microbench (3.68 us/launch eager,
     # 1.46 us graphed), every kernel forced into eager pad fallback costs ~3 ms.
@@ -306,6 +312,8 @@ export SGLANG_OPT_USE_TILELANG_MHC_PRE="${SGLANG_OPT_USE_TILELANG_MHC_PRE:-$_MHC
 export SGLANG_OPT_USE_TILELANG_MHC_POST="${SGLANG_OPT_USE_TILELANG_MHC_POST:-$_MHC_POST}"
 [ -n "$_MULTI_STREAM" ] && export SGLANG_OPT_USE_MULTI_STREAM_OVERLAP="${SGLANG_OPT_USE_MULTI_STREAM_OVERLAP:-$_MULTI_STREAM}"
 [ -n "$_DISABLE_COMPILE" ] && export SGLANG_DISABLE_CAPTURE_COMPILE="${SGLANG_DISABLE_CAPTURE_COMPILE:-$_DISABLE_COMPILE}"
+[ -n "$_M3_INDEXER" ] && export SGLANG_M3_INDEXER_MEGAKERNEL="${SGLANG_M3_INDEXER_MEGAKERNEL:-$_M3_INDEXER}"
+[ -n "$_M1_KV_WRITE_ROPE" ] && export SGLANG_M1_KV_WRITE_WITH_ROPE="${SGLANG_M1_KV_WRITE_WITH_ROPE:-$_M1_KV_WRITE_ROPE}"
 
 # ───── Build CLI ─────────────────────────────────────────────────────────────
 CLI=(
@@ -342,6 +350,7 @@ echo "Preset: $PRESET    Port: $PORT    GPUs: $GPUS"
 echo "TOPK_TORCH=$SGLANG_TOPK_TRANSFORM_512_TORCH  FORCE_TRITON_MOE=$SGLANG_FORCE_TRITON_MOE_FP8  CAP=$SGLANG_INDEXER_MAX_SEQ_LEN"
 echo "MHC_PRE=$SGLANG_OPT_USE_TILELANG_MHC_PRE  MHC_POST=$SGLANG_OPT_USE_TILELANG_MHC_POST"
 echo "MULTI_STREAM=${SGLANG_OPT_USE_MULTI_STREAM_OVERLAP:-unset}  DISABLE_COMPILE=${SGLANG_DISABLE_CAPTURE_COMPILE:-unset}"
+echo "M3_INDEXER=${SGLANG_M3_INDEXER_MEGAKERNEL:-unset}  M1_KV_WRITE_ROPE=${SGLANG_M1_KV_WRITE_WITH_ROPE:-unset}"
 echo "CUDA_GRAPH: $([ "${DISABLE_CUDA_GRAPH:-${_DISABLE_CG:-}}" = "1" ] && echo disabled || echo "max_bs=${CUDA_GRAPH_MAX_BS:-$_CG_MAX_BS} bs=[${CUDA_GRAPH_BS:-$_CG_BS}]")"
 echo "==================================================================="
 

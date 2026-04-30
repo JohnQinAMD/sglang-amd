@@ -271,6 +271,31 @@ def m3_indexer_megakernel(
         return False
 
     grid = (B,)
+    # BLOCK_L-conditional launch knobs.
+    #
+    # PMC analysis (rocprofv3, MI355X): the per-CTA `tl.sort(BLOCK_L)` is
+    # LDS-bound, NOT compute-bound. SQ_WAIT_INST_LDS dominates the wait
+    # bucket (LDS-wait/VALU = 0.42 at BLOCK_L=4096, 0.84 at BLOCK_L=8192
+    # with the original 4-warp config). Wider warp counts amortize LDS
+    # round-trips by running more independent waves, but the sweet spot
+    # depends on BLOCK_L. Latency sweep (B=6 dominant shape):
+    #
+    #   BLOCK_L  best (nw, wpe)     vs original (nw=4 wpe=0)
+    #   ≤2048    (4, 0)             flat — too little work to absorb wider CTAs
+    #   4096     (16, 1)            1.13×  (production: stacked-best INDEXER_CAP=4096)
+    #   8192     (8, 4)             1.27×  (worst-case context window)
+    #
+    # nw=16 at BLOCK_L=8192 stays flat (register pressure dilutes wins);
+    # nw=8 at BLOCK_L=4096 regresses (under-occupancy at this shape). The
+    # selected pair per BLOCK_L is the empirical Pareto winner from the
+    # microbench/triton_port_v2/bench_m3_block_sweep.py harness.
+    if BLOCK_L >= 8192:
+        nw, wpe = 8, 4
+    elif BLOCK_L >= 4096:
+        nw, wpe = 16, 1
+    else:
+        nw, wpe = 4, 0
+
     _m3_indexer_megakernel[grid](
         scores,
         seq_lens,
@@ -287,9 +312,8 @@ def m3_indexer_megakernel(
         BLOCK_L=BLOCK_L,
         HAS_TL=has_tl,
         WRITE_RAW=write_raw,
-        # num_warps=4 matches topk_transform_512_triton; sort dominates and
-        # benefits from the extra parallelism inside the row.
-        num_warps=4,
+        num_warps=nw,
+        waves_per_eu=wpe,
         num_stages=1,
     )
     return True
