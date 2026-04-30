@@ -91,37 +91,69 @@ def prep(shape):
     }
 
 
-def torch_op(args):
-    """Production 4-op chain — the reference oracle.
+def _blockscale_gemm_ref(
+    fp8_in: torch.Tensor,        # (m, k)  fp8
+    x_scale: torch.Tensor,       # (m, k // GROUP_SIZE) fp32 — per-1x128 row-group scale
+    fp8_w: torch.Tensor,         # (n, k)  fp8 row-major
+    w_scale: torch.Tensor,       # (cdiv(n, 128), k // GROUP_SIZE) fp32 — per-128x128 block scale
+) -> torch.Tensor:
+    """aiter::gemm_a8w8_blockscale semantic match — applies BOTH scales then matmuls.
 
-    Note: uses ATEN ops directly to avoid AITER import in microbench harness.
-    The aiter wrappers add wrapper-tax (alloc + view + cast) that's part of the
-    real production path; for fairness against the megakernel we measure the
-    AITER wrappers in the wired-in path, not here.
+    Mirrors `run_torch` in /aiter-amd/op_tests/test_gemm_a8w8_blockscale.py
+    (broadcast w_scale per (128_n × 128_k) block, x_scale per (1 × 128_k) group,
+    multiply into fp32, then F.linear and bf16 cast).
     """
-    # 1. RMSNorm
+    m, k = fp8_in.shape
+    n = fp8_w.shape[0]
+    scale_k = k // GROUP_SIZE
+    scale_n = (n + GROUP_SIZE - 1) // GROUP_SIZE
+    # Broadcast x_scale: (m, scale_k) -> (m, k). Each row has GROUP_SIZE k-elts at scale.
+    x_dq = fp8_in.to(torch.float32).view(m, scale_k, GROUP_SIZE) * x_scale.unsqueeze(-1)
+    x_dq = x_dq.view(m, k)
+    # Broadcast w_scale: (scale_n, scale_k) -> (scale_n*128, scale_k*128).
+    # We need result[ng*128 + nn, kg*128 + kk] = w_scale[ng, kg]. Permute so collapse
+    # produces the right ordering: (sn, 128, sk, 128) -> reshape (sn*128, sk*128).
+    w_scale_bcast = (
+        w_scale[:, None, :, None]
+        .expand(scale_n, GROUP_SIZE, scale_k, GROUP_SIZE)
+        .reshape(scale_n * GROUP_SIZE, scale_k * GROUP_SIZE)
+    )
+    w_scale_bcast = w_scale_bcast[:n, :k]
+    w_dq = fp8_w.to(torch.float32) * w_scale_bcast
+    out = torch.matmul(x_dq, w_dq.t())
+    return out.to(torch.bfloat16)
+
+
+def torch_op(args):
+    """Production 4-op chain — the reference oracle (Phase 2: scale-applying).
+
+    Mirrors aiter::gemm_a8w8_blockscale exactly:
+    - Per-1x128 x_scale computed inside the quant kernel from RMSNorm output
+    - Per-128x128 w_scale loaded from `*_a_scale` weights
+    - Output fp32 acc = (x_fp8 * x_scale_per_group) @ (w_fp8 * w_scale_per_block).T
+    """
+    # 1. RMSNorm in fp32 (production keeps fp32 in the dynamic_per_group_scaled_quant
+    #    fused kernel; the bf16 round-trip in v1 is dropped for tighter parity).
     h = args["hidden"]
     eps = EPS
     var = h.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
     rstd = torch.rsqrt(var + eps)
-    normed = (h.to(torch.float32) * rstd * args["rmsnorm_w"]).to(torch.bfloat16)
-    # 2. Per-1x128 quant (block-scale)
-    bs, hidden = normed.shape
+    normed_fp32 = h.to(torch.float32) * rstd * args["rmsnorm_w"]
+    # 2. Per-1x128 quant (block-scale). x_scale shape (bs, hidden // 128).
+    bs, hidden = normed_fp32.shape
     n_groups = hidden // GROUP_SIZE
-    normed_grouped = normed.view(bs, n_groups, GROUP_SIZE).to(torch.float32)
-    scales = normed_grouped.abs().amax(dim=-1) / 448.0
-    fp8_in = (normed_grouped / scales.unsqueeze(-1)).to(FP8_DTYPE).view(bs, hidden)
-    # 3. Block-scale GEMM wq_a (eager simulation; real path uses aiter::gemm_a8w8_blockscale)
-    fp8_w = args["wq_a_fp8"].to(torch.bfloat16)  # eager dequant for ref
-    q_lora = (
-        torch.matmul(fp8_in.to(torch.float32), fp8_w.t().to(torch.float32))
-        .to(torch.bfloat16)
+    normed_grouped = normed_fp32.view(bs, n_groups, GROUP_SIZE)
+    amax = normed_grouped.abs().amax(dim=-1)
+    x_scale = amax / 448.0
+    x_scale_safe = torch.where(x_scale == 0.0, torch.ones_like(x_scale), x_scale)
+    fp8_in = (normed_grouped / x_scale_safe.unsqueeze(-1)).to(FP8_DTYPE).view(bs, hidden)
+    # 3. Block-scale GEMM wq_a — applies BOTH x_scale (per-1x128) and w_scale (per-128x128).
+    q_lora = _blockscale_gemm_ref(
+        fp8_in, x_scale, args["wq_a_fp8"], args["wq_a_scale"],
     )
-    # 4. Block-scale GEMM wkv_a
-    fp8_kv = args["wkv_a_fp8"].to(torch.bfloat16)
-    kv = (
-        torch.matmul(fp8_in.to(torch.float32), fp8_kv.t().to(torch.float32))
-        .to(torch.bfloat16)
+    # 4. Block-scale GEMM wkv_a — same scale-applying semantic.
+    kv = _blockscale_gemm_ref(
+        fp8_in, x_scale, args["wkv_a_fp8"], args["wkv_a_scale"],
     )
     args["q_lora_out"].copy_(q_lora)
     args["kv_out"].copy_(kv)

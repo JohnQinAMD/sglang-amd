@@ -102,6 +102,20 @@ _F4_MODE_A = (
     os.environ.get("SGLANG_F4_MODE_A", "0") == "1"
     and _fused_rmsnorm_per1x128_quant is not None
 )
+
+# Decode-body megakernel — Block A (MQA prologue). Phase 2 wire-in stub.
+# Replaces the 4-op chain (input_layernorm → fp8 quant → wq_a + wkv) with one
+# Triton kernel. Default OFF; gated by SGLANG_DECODE_BODY_BLOCK_A=1. The wire-in
+# only activates on the indexer-bf16 q_lora path (DSv4 indexer enabled), which
+# is the v1 target case the kernel was designed for. E2E activation deferred
+# until baseline regression (separate track) is resolved.
+_DECODE_BODY_BLOCK_A = os.environ.get("SGLANG_DECODE_BODY_BLOCK_A", "0") == "1"
+try:
+    from sglang.jit_kernel.decode_body_mqa_prologue_triton import (
+        mqa_prologue_megakernel as _decode_body_block_a_megakernel,
+    )
+except Exception:
+    _decode_body_block_a_megakernel = None
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -2137,12 +2151,21 @@ class MQALayer(nn.Module):
         # kernel.
         prequant_x = getattr(self, "_prequant_x", None)
         self._prequant_x = None  # clear before consumption (no stale state)
-        wq_a_in = prequant_x if prequant_x is not None else x
-        wkv_in = prequant_x if prequant_x is not None else x
-        # [bs, q_lora_rank]
-        q, _ = self.wq_a(wq_a_in)
-        # [bs, head_dim]
-        kv, _ = self.wkv(wkv_in)
+        # DBM Block A consumer hook (Phase 2 stub): if the layer-level pre-pass
+        # produced megakernel outputs, skip wq_a/wkv. q is the pre-q_norm bf16
+        # tensor (matches what the unfused path produces post-wq_a). The next
+        # branch's `q_norm` / `kv_norm` step still runs.
+        dbm_outs = getattr(self, "_dbm_block_a_outputs", None)
+        self._dbm_block_a_outputs = None
+        if dbm_outs is not None:
+            q, kv = dbm_outs
+        else:
+            wq_a_in = prequant_x if prequant_x is not None else x
+            wkv_in = prequant_x if prequant_x is not None else x
+            # [bs, q_lora_rank]
+            q, _ = self.wq_a(wq_a_in)
+            # [bs, head_dim]
+            kv, _ = self.wkv(wkv_in)
         # A2-#1 path: env-gated. Fuses q_norm + per-1x128 fp8 quant into one
         # Triton launch, then feeds wq_b's FP8 GEMM with pre-quantized input.
         # This drops the qk_rmsnorm fusion (kv_norm goes through its own
@@ -2696,7 +2719,48 @@ class DeepseekV4DecoderLayer(nn.Module):
         # for indexer/compressor (non-fp8 consumers). One launch eliminates
         # the two redundant per-1x128 quants that would otherwise fire inside
         # wq_a and wkv's FP8 GEMM apply paths.
+        # Decode-body megakernel — Block A (MQA prologue) wire-in stub. Phase 2.
+        # Replaces input_layernorm + per-1x128 quant + wq_a + wkv with ONE kernel.
+        # Stashes pre-q_norm bf16 q_lora and pre-kv_norm bf16 kv on self_attn so
+        # _forward_prepare picks them up and skips its own wq_a/wkv calls.
+        # Default OFF; only fires when SGLANG_DECODE_BODY_BLOCK_A=1 and the
+        # indexer-bf16 path is active. E2E NOT yet enabled — baseline is broken.
         if (
+            _DECODE_BODY_BLOCK_A
+            and _decode_body_block_a_megakernel is not None
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[-1] % 128 == 0
+            and getattr(self.self_attn, "indexer", None) is not None
+            and getattr(self.self_attn.wq_a, "weight_scale_inv", None) is not None
+            and getattr(self.self_attn.wkv, "weight_scale_inv", None) is not None
+        ):
+            attn = self.self_attn
+            normed_in = hidden_states
+            mk_out = _decode_body_block_a_megakernel(
+                normed_in,
+                self.input_layernorm.weight.to(torch.float32)
+                if self.input_layernorm.weight.dtype != torch.float32
+                else self.input_layernorm.weight,
+                attn.wq_a.weight,
+                attn.wq_a.weight_scale_inv,
+                attn.wkv.weight,
+                attn.wkv.weight_scale_inv,
+                eps=self.input_layernorm.variance_epsilon,
+            )
+            if mk_out is not None:
+                q_lora_pre_qnorm, kv_pre_kvnorm = mk_out
+                # Run the bf16 normed_in through input_layernorm anyway for the
+                # downstream consumers (residual, hc_post). The megakernel only
+                # short-circuits the wq_a/wkv branch.
+                hidden_states = self.input_layernorm(hidden_states)
+                # Stash pre-q_norm/pre-kv_norm outputs for _forward_prepare to use.
+                attn._dbm_block_a_outputs = (q_lora_pre_qnorm, kv_pre_kvnorm)
+                attn._prequant_x = None
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
+                attn._prequant_x = None
+                attn._dbm_block_a_outputs = None
+        elif (
             _FUSED_RMSNORM_QUANT_PER1x128_DUAL
             and hidden_states.dtype == torch.bfloat16
             and hidden_states.shape[-1] % 128 == 0
@@ -2711,9 +2775,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             # here scopes its lifetime to this single self_attn call. (No
             # data_ptr-keyed cache; just a per-step transient slot.)
             self.self_attn._prequant_x = (x_fp8, x_scale)
+            self.self_attn._dbm_block_a_outputs = None
         else:
             hidden_states = self.input_layernorm(hidden_states)
             self.self_attn._prequant_x = None
+            self.self_attn._dbm_block_a_outputs = None
 
         if _trace:
             sys.stderr.write(f"[trace] L{self.layer_id} pre-attn\n"); sys.stderr.flush()
