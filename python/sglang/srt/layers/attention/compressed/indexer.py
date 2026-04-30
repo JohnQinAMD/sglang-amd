@@ -936,41 +936,97 @@ class C4IndexerBackend:
         if capture_enabled or forward_batch.hisparse_coordinator is not None:
             raw_indices = torch.empty_like(core_metadata.c4_sparse_page_indices)
 
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
-            topk_transform_512_pytorch_vectorized(
-                logits,
-                indexer_metadata.c4_seq_lens,
-                core_metadata.page_table,
-                core_metadata.c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-        elif is_hip():
-            # On HIP the tvm_ffi-backed topk_transform_512 hardcodes CUDA_HOME
-            # and crashes ("Could not find CUDA installation") during JIT build.
-            # Route to the native Triton port instead — same algorithm
-            # (bit-pack + tl.sort), AMDGCN-compatible, no nvcc dependency.
-            from sglang.jit_kernel.topk_transform_512_triton import (
-                topk_transform_512_triton,
+        # M3 indexer megakernel: single-launch fusion of
+        # `topk_transform_512_triton` + `invalid_mask` (the mask consumed later
+        # in `debug_flash_mla_adapter._get_invalid_mask`). The megakernel
+        # writes both `c4_sparse_page_indices` AND a `(B*S_q, K)` int8 mask
+        # buffer; the mask is published into a module-level dict keyed by
+        # `(data_ptr(indices), id(topk_length))` that `_get_invalid_mask`
+        # consults BEFORE its existing data_ptr cache (preserving the legacy
+        # cache HIT semantics in the OFF case and on subsequent decode layers).
+        #
+        # Gates:
+        #   - HIP only (CK V32 path is the consumer; CUDA path is unaffected)
+        #   - decode forward mode only (s_q == 1; mask shape simplifies to (B,K))
+        #   - `c4_sparse_topk_lengths` available on core_metadata
+        #   - `topk == 512` (megakernel matches the production K)
+        #   - Falls back to legacy chain on any unsupported case (megakernel
+        #     returns False).
+        _m3_megakernel_on = (
+            is_hip()
+            and os.environ.get("SGLANG_M3_INDEXER_MEGAKERNEL", "0") == "1"
+            and forward_batch.forward_mode.is_decode()
+            and not envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+            and getattr(core_metadata, "c4_sparse_topk_lengths", None) is not None
+        )
+        _m3_fired = False
+        if _m3_megakernel_on:
+            from sglang.jit_kernel.m3_indexer_megakernel_triton import (
+                m3_indexer_megakernel,
+                publish_invalid_mask,
+                ensure_invalid_mask_buffer,
             )
 
-            topk_transform_512_triton(
-                logits,
-                indexer_metadata.c4_seq_lens,
-                core_metadata.page_table,
-                core_metadata.c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
+            mask_buf = ensure_invalid_mask_buffer(core_metadata)
+            _m3_fired = m3_indexer_megakernel(
+                scores=logits,
+                seq_lens=indexer_metadata.c4_seq_lens,
+                page_tables=core_metadata.page_table,
+                topk_length=core_metadata.c4_sparse_topk_lengths,
+                out_page_indices=core_metadata.c4_sparse_page_indices,
+                out_raw_indices=raw_indices,
+                out_invalid_mask=mask_buf,
+                page_size=indexer_metadata.c4_page_size,
+                s_q=1,
             )
-        else:
-            topk_transform_512(
-                logits,
-                indexer_metadata.c4_seq_lens,
-                core_metadata.page_table,
-                core_metadata.c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
+            if _m3_fired:
+                # Publish so `_get_invalid_mask` returns this buffer (avoids
+                # the unfused 4-step torch chain or the `get_invalid_mask_triton`
+                # MISS fallback). Bound to the megakernel firing — when the
+                # kernel falls back via False return, no stale mask is
+                # published.
+                publish_invalid_mask(
+                    indices=core_metadata.c4_sparse_page_indices,
+                    topk_length=core_metadata.c4_sparse_topk_lengths,
+                    mask_2d=mask_buf,
+                )
+
+        if not _m3_fired:
+            if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+                topk_transform_512_pytorch_vectorized(
+                    logits,
+                    indexer_metadata.c4_seq_lens,
+                    core_metadata.page_table,
+                    core_metadata.c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
+            elif is_hip():
+                # On HIP the tvm_ffi-backed topk_transform_512 hardcodes CUDA_HOME
+                # and crashes ("Could not find CUDA installation") during JIT build.
+                # Route to the native Triton port instead — same algorithm
+                # (bit-pack + tl.sort), AMDGCN-compatible, no nvcc dependency.
+                from sglang.jit_kernel.topk_transform_512_triton import (
+                    topk_transform_512_triton,
+                )
+
+                topk_transform_512_triton(
+                    logits,
+                    indexer_metadata.c4_seq_lens,
+                    core_metadata.page_table,
+                    core_metadata.c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
+            else:
+                topk_transform_512(
+                    logits,
+                    indexer_metadata.c4_seq_lens,
+                    core_metadata.page_table,
+                    core_metadata.c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
 
         if forward_batch.hisparse_coordinator is not None:
             if forward_batch.forward_mode.is_decode():
