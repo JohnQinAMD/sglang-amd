@@ -93,6 +93,148 @@ def _act_quant_kernel(
     tl.store(s_ptrs, scale, mask=s_mask)
 
 
+# ---------------------------------------------------------------------------
+# Fused act_quant + gate-scale multiply (A1-#1)
+# Folds `weights * inv_n_heads`, `weights.unsqueeze(-1) * q_scale`, and
+# `* softmax_scale` into the same grid as act_quant — eliminates 3 elementwise
+# launches + 1 direct_copy from the unsqueezed-view broadcast on the
+# `_get_logits_head_gate` path. Behaviorally equivalent to the chain (verified
+# bit-exact in microbench_a1_1_act_quant_gate.py).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _act_quant_with_gate_kernel(
+    X_ptr,
+    Y_ptr,
+    S_ptr,
+    G_ptr,
+    Wg_ptr,
+    softmax_scale_x_inv_n_heads,
+    M,
+    N,
+    group_size: tl.constexpr,
+    round_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    fp8_min = -448.0
+    fp8_max = 448.0
+    fp8_max_inv = 1.0 / fp8_max
+
+    row_start = pid_m * BLOCK_M
+    col_start = pid_n * group_size
+    rows = row_start + tl.arange(0, BLOCK_M)
+    cols = col_start + tl.arange(0, BLOCK_N)
+    row_mask = rows < M
+    col_mask = cols < N
+    mask = row_mask[:, None] & col_mask[None, :]
+
+    x_ptrs = X_ptr + rows[:, None] * N + cols[None, :]
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+    x_abs = tl.abs(x)
+    amax = tl.max(x_abs, axis=1)
+    amax = tl.maximum(amax, 1e-4)
+
+    if round_scale:
+        log_val = tl.log2(amax * fp8_max_inv)
+        log_ceil = tl.ceil(log_val)
+        scale = tl.exp2(log_ceil)
+    else:
+        scale = amax * fp8_max_inv
+
+    scale_broadcast = scale[:, None]
+    y = x / scale_broadcast
+    y = tl.minimum(tl.maximum(y, fp8_min), fp8_max)
+
+    y_ptrs = Y_ptr + rows[:, None] * N + cols[None, :]
+    tl.store(y_ptrs, y, mask=mask)
+
+    n_groups = N // group_size
+    s_cols = pid_n
+    s_ptrs = S_ptr + rows * n_groups + s_cols
+    tl.store(s_ptrs, scale, mask=row_mask)
+
+    # Fused gate multiply: G[r, g] = Wgate[r] * scale[r, g] * softmax_scale * inv_n_heads
+    # Wgate is shape (M,), one bf16 entry per (token, head) row.
+    wg = tl.load(Wg_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+    gated = wg * scale * softmax_scale_x_inv_n_heads
+    g_ptrs = G_ptr + rows * n_groups + s_cols
+    tl.store(g_ptrs, gated, mask=row_mask)
+
+
+def act_quant_with_gate(
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    softmax_scale: float,
+    inv_n_heads: float,
+    block_size: int = 128,
+    scale_fmt: Optional[str] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fused act_quant(query) + (weights * inv_n_heads).unsqueeze(-1) * q_scale * softmax_scale.
+
+    Args:
+        query:        (..., D) bf16/fp16, contiguous, D % block_size == 0.
+                      Last-dim is the act_quant group dim.
+        weights:      (...,)  bf16/fp16/fp32, contiguous; broadcast across the
+                      `D // block_size` groups along the last dim.
+                      Must have shape == query.shape[:-1].
+        softmax_scale: scalar (head_dim ** -0.5).
+        inv_n_heads:   scalar (n_heads ** -0.5).
+        block_size:    act_quant group size.
+        scale_fmt:     None → linear scale; otherwise round-to-pow2 scale (matches act_quant).
+
+    Returns:
+        q_fp8         : (..., D)               fp8_e4m3fn[uz]
+        q_scale       : (..., D // block_size) fp32
+        gated_weights : (..., D // block_size) fp32 — already multiplied by softmax_scale * inv_n_heads
+    """
+    assert query.is_contiguous(), "query must be contiguous"
+    assert query.size(-1) % block_size == 0
+    assert weights.shape == query.shape[:-1], (
+        f"weights shape {tuple(weights.shape)} must match query.shape[:-1] {tuple(query.shape[:-1])}"
+    )
+    assert weights.is_contiguous(), "weights must be contiguous"
+
+    D = query.size(-1)
+    M = 1
+    for s in query.shape[:-1]:
+        M *= s
+    n_groups = D // block_size
+
+    y = torch.empty_like(query, dtype=fp8_dtype)
+    s = query.new_empty(*query.size()[:-1], n_groups, dtype=torch.float32)
+    g = query.new_empty(*query.size()[:-1], n_groups, dtype=torch.float32)
+
+    BLOCK_M = 32
+    BLOCK_N = block_size
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D, block_size))
+    round_scale = scale_fmt is not None
+
+    if round_scale:
+        num_stages = 1 if _is_hip() else 0
+    else:
+        num_stages = 2
+
+    _act_quant_with_gate_kernel[grid](
+        query.view(M, D),
+        y.view(M, D),
+        s.view(M, n_groups),
+        g.view(M, n_groups),
+        weights.reshape(M),
+        softmax_scale * inv_n_heads,
+        M,
+        D,
+        group_size=block_size,
+        round_scale=round_scale,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_stages=num_stages,
+    )
+    return y, s, g
+
+
 def act_quant(
     x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:

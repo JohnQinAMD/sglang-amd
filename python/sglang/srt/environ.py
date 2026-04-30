@@ -494,6 +494,10 @@ class Envs:
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(True)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(False)
+    # A2-#3: fuse compress_fused_norm_rope_inplace + per-1x128 fp8 quant into
+    # a single Triton launch (decode mode). Default OFF — the next FP8 GEMM
+    # path needs to be updated to consume (fp8, scale) instead of bf16.
+    SGLANG_COMPRESS_FP8_OUTPUT = EnvBool(False)
     SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE = EnvInt(-1)
     SGLANG_DSV4_FIX_ATTN_PADDING = EnvBool(False)
 
@@ -515,6 +519,20 @@ class Envs:
     # When set, takes precedence over the torch fallback. Falls back to the
     # selected path automatically if `aiter.ops.triton.pa_mqa_logits` is unavailable.
     SGLANG_FP8_PAGED_MQA_LOGITS_AITER = EnvBool(False)
+    # Cache the per-call `pt_expanded` (page_table -> token-id) tensor inside
+    # `fp8_paged_mqa_logits_aiter`, keyed on `page_table.data_ptr() + shape +
+    # dtype`. The same `page_table` is shared across all c4 layers in one
+    # decode step, so the arange + broadcast + copy that builds `pt_expanded`
+    # only needs to run once per step (saves ~3 launches/layer x ~30 layers).
+    # Default OFF preserves Phase 23 behavior.
+    SGLANG_INDEXER_PT_EXPANDED_CACHED = EnvBool(False)
+    # Skip the per-call `out.fill_(-inf)` that pre-masks the logits output
+    # buffer in `fp8_paged_mqa_logits_aiter`. The deepgemm aiter kernel only
+    # writes positions up to per-batch context_length; positions past that
+    # MUST be pre-filled with -inf for downstream top-K to ignore them. Only
+    # safe to skip if you've audited the kernel and confirmed it writes ALL
+    # positions in [0, max_model_len). Leave OFF by default.
+    SGLANG_INDEXER_SKIP_OUT_PREFILL = EnvBool(False)
     # Cap padded sequence length used by fp8_paged_mqa_logits_torch (HIP fallback).
     # 0 = inherit from caller (page_table.shape[1] * page_size, typically 1048576 at --context-len=1M),
     # which OOMs at multi-bs since transient allocs scale with B * padded * (heads | head_dim).

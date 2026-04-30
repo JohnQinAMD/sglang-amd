@@ -9,6 +9,7 @@ from sglang.jit_kernel.deepseek_v4 import (
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
+    compress_fused_norm_rope_quant,
     triton_create_paged_compress_data,
 )
 from sglang.srt.environ import envs
@@ -73,7 +74,7 @@ class CompressorBackend:
             kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
         else:
             plan = make_compressor_plan(compress_ratio, forward_batch)
-            metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
+            metadata = (forward_batch.get_req_pool_indices_int32(), None, plan)
         indices, extra_data, plan = metadata
 
         # NOTE: shape [num_q_tokens, head_dim]
@@ -87,13 +88,42 @@ class CompressorBackend:
             head_dim=head_dim,
             extra_data=extra_data,
         )
-        compress_fused_norm_rope_inplace(
-            kv_compressed,
-            norm.weight,
-            norm.eps,
-            freqs_cis_cache,
-            plan,
+        # A2-#3: optional fused (rmsnorm+rope+per-1x128 fp8 quant) path.
+        # Default OFF — downstream consumers still expect bf16 unless adapted.
+        # When ON, decode-mode plans return (fp8, scale) via the
+        # `_last_fp8_quant` side channel; the bf16 tensor is still returned
+        # so callers that ignore the side channel see no change.
+        use_fp8 = (
+            envs.SGLANG_COMPRESS_FP8_OUTPUT.get()
+            and isinstance(plan, CompressorDecodePlan)
         )
+        if use_fp8:
+            fp8_out, scale_out = compress_fused_norm_rope_quant(
+                kv_compressed,
+                norm.weight,
+                norm.eps,
+                freqs_cis_cache,
+                plan,
+            )
+            # Stash for downstream consumer; do NOT mutate kv_compressed
+            # contents — bf16 path still works.
+            self._last_fp8_quant = (fp8_out, scale_out)
+            # Still need the bf16 output for the (default) downstream path:
+            compress_fused_norm_rope_inplace(
+                kv_compressed,
+                norm.weight,
+                norm.eps,
+                freqs_cis_cache,
+                plan,
+            )
+        else:
+            compress_fused_norm_rope_inplace(
+                kv_compressed,
+                norm.weight,
+                norm.eps,
+                freqs_cis_cache,
+                plan,
+            )
         return rotate_activation(kv_compressed) if rotate else kv_compressed
 
     @torch.compiler.disable
@@ -168,7 +198,7 @@ def make_compressor_plan(
     forward_batch: ForwardBatch,
 ) -> Union[CompressorDecodePlan, CompressorPrefillPlan]:
     if forward_batch.forward_mode.is_decode():
-        seq_lens_32 = forward_batch.seq_lens.to(torch.int32)
+        seq_lens_32 = forward_batch.get_seq_lens_int32()
         return CompressorDecodePlan(compress_ratio, seq_lens_32)
     if forward_batch.forward_mode.is_prefill():
         assert not forward_batch.forward_mode.is_target_verify()

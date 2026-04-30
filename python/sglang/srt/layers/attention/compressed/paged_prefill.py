@@ -59,7 +59,12 @@ def make_swa_ring_buffer_indices(
     SWA_WINDOW = swa_window_size
     extend_num_tokens = forward_batch.extend_num_tokens
     assert extend_num_tokens is not None
-    if envs.SGLANG_HIP_SWA_PREPARE.get():
+    # Gate HIP path on graph-capture state: under cuda graph capture the
+    # GPU-resident swa_indices + effective_swa_k_cache slab gets pinned in
+    # the captured mempool (~2-3 GiB across 61 layers × BS bins on Pro).
+    # Eager replay still uses the HIP kernel for the TTFT win.
+    _hip_swa_safe = envs.SGLANG_HIP_SWA_PREPARE.get() and not torch.cuda.is_current_stream_capturing()
+    if _hip_swa_safe:
         from sglang.srt.layers.swa_indices_hip import hip_make_swa_prefill_indices
 
         # Kernel handles int32 + int64 directly so we can skip the dtype cast,

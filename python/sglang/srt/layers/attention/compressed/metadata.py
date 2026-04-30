@@ -135,6 +135,11 @@ class PagedIndexerMetadata(IndexerMetadata):
         if (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             or envs.SGLANG_FP8_PAGED_MQA_LOGITS_AITER.get()
+            or os.environ.get("SGLANG_FP8_PAGED_MQA_LOGITS_HIP", "0") == "1"
+            or os.environ.get(
+                "SGLANG_FP8_PAGED_MQA_LOGITS_FUSED_TRITON",
+                "1" if is_hip() else "0",
+            ) == "1"
         ):
             self.deep_gemm_metadata = None
         else:

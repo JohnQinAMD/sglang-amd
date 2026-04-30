@@ -32,10 +32,16 @@ class KVAndScoreOld:
         return KVAndScoreOld(kv=self.kv[index], score=self.score[index])
 
     def __setitem__(self, index, value: KVAndScore):
+        # Option A patch REVERTED: Triton-fused slice setitem (~10us) is slower
+        # than the 2-launch torch fallback (~5us) for the small shapes used by
+        # compress_extend_old (e.g. 4x256 slice copies). Caused E2E TPOT
+        # regression. Defer to a higher MIN_ELEMS threshold or a different
+        # batching strategy in a future iteration.
         self.kv[index] = value.kv
         self.score[index] = value.score
 
     def clear(self):
+        # Option A patch REVERTED: same reason as __setitem__ above.
         self.kv.zero_()
         self.score.fill_(float("-inf"))
 
@@ -186,5 +192,17 @@ class CompressStatePool:
         return self.kv_score_buffer[state_loc]
 
     def set_state_by_state_loc(self, state_loc: torch.Tensor, value: KVAndScore):
-        self.kv_score_buffer[state_loc] = value
-        self.kv_score_buffer[-1].clear()  # keep -1 location as clean state
+        # Item #1: fused scatter + (-1)-row clear via single Triton kernel.
+        # Replaces the 3-launch torch fallback (1 __setitem__ + 2 fill_) that
+        # contributed 1,824 elementwise launches/window in the chi2774 Phase 13
+        # trace (compress_state.py:34/38 attribution).
+        from sglang.jit_kernel.compress_state_triton import set_state_with_clear_triton
+        fired = set_state_with_clear_triton(
+            self.kv_score_buffer.kv_score,
+            state_loc,
+            value.kv_score,
+            self.kv_score_buffer._item_size,
+        )
+        if not fired:
+            self.kv_score_buffer[state_loc] = value
+            self.kv_score_buffer[-1].clear()  # keep -1 location as clean state

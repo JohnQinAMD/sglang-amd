@@ -87,7 +87,7 @@ class DeepseekV4Backend(AttentionBackend, C4IndexerBackend, CompressorBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
 
         req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        seq_lens = forward_batch.get_seq_lens_int32()
         batch_size = forward_batch.batch_size
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert forward_batch.req_to_token_pool.req_to_token is self.req_to_token

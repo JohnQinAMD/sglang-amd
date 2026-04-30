@@ -29,7 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
@@ -266,6 +266,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
+
+    # Stage A1: pre-converted int32 forms (computed once per forward pass,
+    # reused across all 86 layers). Eliminates ~7 .to(int32) launches/step
+    # at compressor.py + deepseek_v4_backend.py call sites. Lazily set by
+    # get_seq_lens_int32() / get_req_pool_indices_int32() helpers; safe for
+    # cuda-graph capture because the .to() call is captured once on first
+    # use, and replays use the same buffer.
+    seq_lens_int32: Optional[torch.Tensor] = None
+    req_pool_indices_int32: Optional[torch.Tensor] = None
 
     # For logprob
     return_logprob: bool = False
@@ -530,6 +539,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
+
+    def get_seq_lens_int32(self) -> torch.Tensor:
+        """Stage A1: lazy-cached int32 form of seq_lens. First call casts;
+        subsequent calls reuse the buffer. Eliminates ~5-7 .to(int32) launches/step
+        across compressor.py + deepseek_v4_backend.py call sites that all share
+        the same forward_batch.seq_lens source."""
+        if self.seq_lens_int32 is None:
+            self.seq_lens_int32 = self.seq_lens.to(torch.int32)
+        return self.seq_lens_int32
+
+    def get_req_pool_indices_int32(self) -> torch.Tensor:
+        """Stage A1: lazy-cached int32 form of req_pool_indices."""
+        if self.req_pool_indices_int32 is None:
+            self.req_pool_indices_int32 = self.req_pool_indices.to(torch.int32)
+        return self.req_pool_indices_int32
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
