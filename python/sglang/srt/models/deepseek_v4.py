@@ -1302,10 +1302,16 @@ class Compressor(nn.Module):
             kv_and_score_to_compress = kv_and_score_buffer[:compress_len].view(
                 compress_len // self.ratio, self.ratio, -1
             )
-            # NOTE: apply ape only when compressing
-            kv_and_score_to_compress.score = (
-                kv_and_score_to_compress.score + self.ape.unsqueeze(0)
-            )
+            # M2-extend: APE add fuses INTO the megakernel ADD_APE branch on
+            # the no-overlap path (c128 layers, S = ratio = 128). For
+            # overlap=True (c4 layers), overlap_transform reorders elements
+            # between APE-add and softmax, so we keep the explicit add before
+            # the transform.
+            _fuse_ape_in_kernel = not self.overlap
+            if not _fuse_ape_in_kernel:
+                kv_and_score_to_compress.score = (
+                    kv_and_score_to_compress.score + self.ape.unsqueeze(0)
+                )
 
             # Apply overlap transformation if enabled
             if self.overlap:
@@ -1323,25 +1329,63 @@ class Compressor(nn.Module):
                     pt += extend_lens[i]
                     continue
 
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
-
-            # NOTE: ref code requires dtype as the same as hidden states (float32)
-            # the raw output of kv_compressed is float32 already
-            assert kv_compressed.dtype == torch.float32
-            kv_compressed = self.norm(kv_compressed)
-
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
             freqs_cis = self.freqs_cis[beg_idx : end_idx : self.ratio]
-            assert freqs_cis.size(0) == kv_compressed.size(
-                0
-            ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
+
+            # M2-extend megakernel: fuse softmax + mul + sum + RMSNorm + RoPE
+            # (+ APE add for no-overlap = 8 ops) into one Triton launch.
+            # Replaces 6 separate launches per call x ~25 calls/step on the
+            # production prefill hot path. Mixed dtype: kv/score bf16 in,
+            # kv_compressed fp32 out (kernel internally promotes to fp32).
+            from sglang.jit_kernel.compress_decode_megakernel_triton import (
+                compress_decode_full_triton,
             )
+            n_blocks = kv_and_score_to_compress.kv.size(0)
+            _kv_in = kv_and_score_to_compress.kv.contiguous().view(
+                n_blocks, self.ratio * self.coff, self.head_dim
+            )
+            _score_in = kv_and_score_to_compress.score.contiguous().view(
+                n_blocks, self.ratio * self.coff, self.head_dim
+            )
+            assert freqs_cis.size(0) == n_blocks, (
+                f"{freqs_cis.shape=} expected first dim = {n_blocks}"
+            )
+            _freqs_per_bs = torch.view_as_real(freqs_cis).contiguous()
+            _norm_w_fp32 = (
+                self.norm.weight if self.norm.weight.dtype == torch.float32
+                else self.norm.weight.to(torch.float32)
+            )
+            _ape_arg = (
+                self.ape.view(
+                    self.ratio * self.coff, self.head_dim
+                ).contiguous().to(_score_in.dtype)
+                if _fuse_ape_in_kernel else None
+            )
+            kv_compressed = torch.empty(
+                (n_blocks, self.head_dim),
+                dtype=torch.float32,
+                device=_kv_in.device,
+            )
+            if not compress_decode_full_triton(
+                _kv_in, _score_in, _ape_arg,
+                _norm_w_fp32, _freqs_per_bs,
+                self.norm.eps, self.rope_head_dim,
+                kv_compressed,
+            ):
+                # Fallback: original 4-step torch path (Stage1 + RMSNorm + RoPE).
+                _score_for_softmax = kv_and_score_to_compress.score
+                if _fuse_ape_in_kernel:
+                    _score_for_softmax = _score_for_softmax + self.ape.unsqueeze(0)
+                kv_compressed = (
+                    kv_and_score_to_compress.kv
+                    * _score_for_softmax.softmax(dim=1)
+                ).sum(dim=1)
+                assert kv_compressed.dtype == torch.float32
+                kv_compressed = self.norm(kv_compressed)
+                apply_rotary_emb_triton(
+                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
+                )
             del beg_idx, end_idx
 
             if self.rotate:
