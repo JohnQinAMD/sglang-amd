@@ -491,6 +491,12 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
+    # M1 megakernel — fused kv-write-with-RoPE for DSv4 Flash-Base FP8 (gfx950).
+    # When ON: replaces apply_rotary_emb_triton + quant_to_nope_fp8_rope_bf16_pack
+    # + _set_k_and_s_triton chain with a single Triton launch. Microbench
+    # 1.38× graph-replay / 2.62× eager (bit-exact). See
+    # rocm-dynamo/m1-kv-write-with-rope-result.md.
+    SGLANG_M1_KV_WRITE_WITH_ROPE = EnvBool(False)
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(True)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(False)
