@@ -36,6 +36,14 @@ from sglang.srt.layers.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     fused_rmsnorm_rope_q_triton,
 )
+# M1 megakernel — fuses kv-side RoPE + per-tile FP8 quant + paged scatter.
+# Gated by envs.SGLANG_M1_KV_WRITE_WITH_ROPE (default OFF).
+try:
+    from sglang.jit_kernel.m1_kv_write_with_rope_triton import (
+        m1_kv_write_with_rope_triton as _m1_kv_write_with_rope_triton,
+    )
+except Exception:  # pragma: no cover
+    _m1_kv_write_with_rope_triton = None
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_partial,
@@ -2231,11 +2239,33 @@ class MQALayer(nn.Module):
         fused_rmsnorm_rope_q_triton(
             q, self.freqs_cis, positions, self.eps, self.qk_rope_head_dim,
         )
-        apply_rotary_emb_triton(
-            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-            self.freqs_cis,
-            positions=positions,
+        # M1 megakernel: fuse apply_rotary_emb_triton + quant_pack + paged scatter
+        # into one Triton launch. When ON, kv-cache write happens here so the
+        # downstream attn_backend.forward(save_kv_cache=...) must be False.
+        # Falls back to the unfused chain when the kernel import failed or the
+        # knob is OFF (default).
+        m1_active = (
+            envs.SGLANG_M1_KV_WRITE_WITH_ROPE.get()
+            and _m1_kv_write_with_rope_triton is not None
+            and kv.dtype == torch.bfloat16
+            and kv.shape[-1] == 512
+            and self.qk_rope_head_dim == 64
         )
+        if m1_active:
+            tkp = forward_batch.token_to_kv_pool
+            swa_loc = tkp.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
+            buf = tkp.swa_kv_pool.kv_buffer[self.layer_id]
+            page_size = tkp.swa_kv_pool.page_size
+            _m1_kv_write_with_rope_triton(
+                kv, self.freqs_cis, positions, swa_loc, buf, page_size,
+            )
+            self._m1_kv_written = True
+        else:
+            apply_rotary_emb_triton(
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                self.freqs_cis,
+                positions=positions,
+            )
 
         _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         if _use_cp:
@@ -2299,6 +2329,9 @@ class MQALayer(nn.Module):
             assert isinstance(attn_backend, DeepseekV4Backend)
 
         freqs_cis = None
+        # M1 megakernel writes kv-cache inline. Reset per-call; _forward_prepare
+        # sets True when the megakernel ran (single-stream path only).
+        self._m1_kv_written = False
 
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
@@ -2326,6 +2359,7 @@ class MQALayer(nn.Module):
             )
 
         # for TP attention, use the padded q, since q_out is set to the correct slice
+        # When M1 ran inside _forward_prepare, kv-cache is already written.
         o = attn_backend.forward(
             q=q_padded if q_padded is not None else q,
             k=kv,
@@ -2334,7 +2368,7 @@ class MQALayer(nn.Module):
             forward_batch=forward_batch,
             compress_ratio=self.compress_ratio,
             attn_sink=self.attn_sink,
-            save_kv_cache=not self.overlap_store_cache,
+            save_kv_cache=(not self.overlap_store_cache) and (not self._m1_kv_written),
         )
         # NOTE: no-op for pure DP-attention
         o = o[:, tp_slice, :]
