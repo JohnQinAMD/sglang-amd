@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -203,6 +204,13 @@ class Mxfp4Config(QuantizationConfig):
 
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
+
+        # Force Mxfp4MoEMethod packed-uint8 path for AMD hybrid checkpoints
+        # (DSv4-Pro/Flash declare quant_method=fp8 but ship mxfp4 routed-experts).
+        if not is_checkpoint_mxfp4_serialized and os.environ.get(
+            "SGLANG_FORCE_MXFP4_SERIALIZED", "0"
+        ) == "1":
+            is_checkpoint_mxfp4_serialized = True
 
         if _is_hip:
             if mxfp_supported():

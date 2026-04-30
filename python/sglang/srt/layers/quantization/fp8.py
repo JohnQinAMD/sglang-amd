@@ -1489,6 +1489,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 deepseek_v4_moe_code_path_checker.observed += 1
             if self.block_quant:
+                # OPT-IN block_size_M dispatch override for DSv4-Pro-Base FP8.
+                # aiter's auto-dispatcher (tuned for qwen3_235b) leaves ~2×
+                # perf on the table at large M for Pro hidden=7168 /
+                # moe_inter=3072. Microbench (expert_mask=None, EP=1):
+                #   M=512  prod 885us -> bm=128 793us  (1.12x)
+                #   M=2048 prod 2329us -> bm=128 1132us (2.06x)
+                #   M=8192 prod 6988us -> bm=128 2692us (2.60x)
+                # Estimated Pro-FP8 prefill TTFT savings: ~262 ms.
+                #
+                # OPT-IN: enable with SGLANG_DSV4_FP8_MOE_BM=128. The override
+                # caused a HIP segfault during a verify test that ran multiple
+                # M values in the same process — exact trigger unclear, but
+                # standalone microbench is clean. Default left off until the
+                # interaction is fully diagnosed; e2e bench needed to confirm
+                # it's safe at the full-server scale.
+                import os as _os
+                _ovr = _os.environ.get("SGLANG_DSV4_FP8_MOE_BM", "0")
+                _block_size_M = -1
+                if _ovr != "0":
+                    M = x.shape[0]
+                    w1_shape = layer.w13_weight.shape
+                    if (M >= 256
+                        and layer.expert_mask_gpu is None
+                        and len(w1_shape) >= 3
+                        and w1_shape[-1] == 7168
+                        and w1_shape[-2] == 6144):
+                        try:
+                            _block_size_M = int(_ovr)
+                        except ValueError:
+                            _block_size_M = -1
                 return fused_moe(
                     x,
                     layer.w13_weight,
@@ -1504,6 +1534,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         else ActivationType.Gelu
                     ),
                     expert_mask=layer.expert_mask_gpu,
+                    block_size_M=_block_size_M,
                 )
             else:
                 return fused_moe(

@@ -376,6 +376,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Get memory before model loading
         self.total_gpu_memory = self.init_torch_distributed()
 
+        # NOTE (reverted): a previous attempt to enforce mem_fraction_static at
+        # the PyTorch allocator level via torch.cuda.set_per_process_memory_fraction
+        # turned mem_fraction_static into a hard cap. Useful for catching HSA OOM
+        # under heavy configs (TileLang MHC, sparse-MLA decode FP8), but it
+        # _broke_ the baseline Pro mxfp4 production config: cuda graph capture
+        # requested 4 GiB beyond the cap (a borrow that the soft-hint behavior
+        # was silently allowing). Reverted to keep the original soft-cap
+        # behavior; opt in via SGLANG_ENFORCE_MEM_FRACTION_HARD=1 for debugging.
+        import os as _os
+        if (
+            self.device == "cuda"
+            and 0 < self.mem_fraction_static < 1.0
+            and _os.environ.get("SGLANG_ENFORCE_MEM_FRACTION_HARD", "0") == "1"
+        ):
+            torch.cuda.set_per_process_memory_fraction(
+                self.mem_fraction_static, self.gpu_id
+            )
+
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
@@ -1731,13 +1749,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def kernel_warmup(self):
         """
         Warmup and tune kernels before cuda graph capture.
-        Currently only doing FlashInfer autotune.
+
+        On NVIDIA: runs FlashInfer autotune when applicable.
+
+        On AMD: runs a dummy forward pass to pre-allocate kernel scratch
+        in the regular pytorch pool BEFORE cuda graph capture. Without this,
+        first-call kernel scratch (TileLang JITs, aiter HIP modules, CK V32
+        sparse-MLA, indexer kernels) is allocated INSIDE captured graphs and
+        pinned in the graph private mempool. On Pro mxfp4 EP=8 (hidden=7168)
+        this inflates pytorch reservation by ~22 GB and OOMs at production
+        mem-fraction=0.85. Pre-warming moves the allocations to the regular
+        cache so the captured graph references existing addresses.
+        Opt out via SGLANG_SKIP_AMD_KERNEL_WARMUP=1.
         """
         if self.device != "cuda":
             return
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+            return
+
+        # AMD ROCm path: pre-warm with a dummy forward pass.
+        if (
+            torch.version.hip is not None
+            and self.is_generation
+            and os.environ.get("SGLANG_SKIP_AMD_KERNEL_WARMUP", "0") != "1"
+        ):
+            try:
+                logger.info("Pre-warming kernels with dummy forward (AMD path)...")
+                # Use no_grad (NOT inference_mode): inference_mode tensors
+                # can't be modified outside inference_mode (e.g., during
+                # cuda graph capture which doesn't run in inference_mode).
+                with torch.no_grad():
+                    self._dummy_run(batch_size=1)
+                logger.info("AMD kernel warmup complete.")
+            except Exception as e:
+                logger.warning(
+                    f"AMD kernel warmup failed (non-fatal): {e}. "
+                    f"Cuda graph capture may inflate pytorch allocation."
+                )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""

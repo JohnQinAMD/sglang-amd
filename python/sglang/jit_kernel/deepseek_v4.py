@@ -425,6 +425,42 @@ def compress_fused_norm_rope_inplace(
     )
 
 
+def compress_fused_norm_rope_quant(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    freq_cis: torch.Tensor,
+    plan: "CompressorDecodePlan",
+    fp8_dtype: Optional[torch.dtype] = None,
+):
+    """A2-#3: fused norm+rope+per-1x128 fp8 quant — decode mode only.
+
+    Equivalent to ``compress_fused_norm_rope_inplace`` followed by
+    ``aiter_per1x128_quant``, in a single Triton launch. Returns
+    ``(fp8_out [N,head_dim], scale_out [N,head_dim/128])``.
+
+    Falls back to the two-step path on non-HIP backends or for prefill plans.
+    """
+    if fp8_dtype is None:
+        fp8_dtype = torch.float8_e4m3fn
+    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    from sglang.srt.utils import is_hip
+    if is_hip() and isinstance(plan, CompressorDecodePlan):
+        from sglang.jit_kernel.fused_norm_rope_triton import (
+            fused_norm_rope_quant_decode_hip,
+        )
+        return fused_norm_rope_quant_decode_hip(
+            kv, weight, plan[1], freq_cis, eps, plan.compress_ratio,
+            fp8_dtype=fp8_dtype,
+        )
+    # Fallback: two-step path
+    compress_fused_norm_rope_inplace(kv, weight, eps, torch.view_as_complex(
+        freq_cis.view(*freq_cis.shape[:-1], -1, 2)
+    ), plan)
+    # Caller should run aiter_per1x128_quant separately in the fallback path.
+    return None
+
+
 def fused_norm_rope_inplace(
     kv: torch.Tensor,
     weight: torch.Tensor,

@@ -59,6 +59,41 @@ try:
     )
 except Exception:  # pragma: no cover - import-time fallback only
     _aiter_fused_qk_rmsnorm = None
+
+# A2-#1: fuse (rmsnorm + per-1x128 fp8 quant) into one Triton launch on the
+# q_norm → wq_b path. Default OFF; enable via SGLANG_FUSED_RMSNORM_QUANT_PER1x128=1.
+# Microbench (M=8, N=4096, MI355X cuda-graph replay): UNFUSED 12.37 µs → FUSED
+# 10.28 µs (~0.29 ms/step at ~140 callsites). When enabled here we lose the qk
+# rmsnorm fusion (kv_norm runs in its own launch) but eliminate the per-1x128
+# quant launch before wq_b. Stack on remaining callsites in follow-up patches.
+try:
+    from sglang.srt.layers.quantization.fused_rmsnorm_quant import (
+        fused_rmsnorm_per1x128_quant as _fused_rmsnorm_per1x128_quant,
+        fused_rmsnorm_per1x128_quant_dual as _fused_rmsnorm_per1x128_quant_dual,
+    )
+except Exception:  # pragma: no cover
+    _fused_rmsnorm_per1x128_quant = None
+    _fused_rmsnorm_per1x128_quant_dual = None
+_FUSED_RMSNORM_QUANT_PER1x128 = (
+    os.environ.get("SGLANG_FUSED_RMSNORM_QUANT_PER1x128", "0") == "1"
+    and _fused_rmsnorm_per1x128_quant is not None
+)
+# Phase 24: dual-output extension also gated by the same env knob; only fires
+# when the dual entry-point loaded successfully.
+_FUSED_RMSNORM_QUANT_PER1x128_DUAL = (
+    _FUSED_RMSNORM_QUANT_PER1x128
+    and _fused_rmsnorm_per1x128_quant_dual is not None
+)
+# F4 Mode A (2026-04-30): parallel env knob targeting the same q_norm + per-1x128
+# quant fusion as _FUSED_RMSNORM_QUANT_PER1x128, but using the F4-patched kernel
+# (MATCH_BF16_PRODUCTION=True, default) which round-trips `normed` through bf16
+# in registers before per-block fp8 quant — making fp8 codepoints production-
+# equivalent vs the unfused two-launch path. Independent of the older knob so
+# in-flight experiments aren't disturbed. Default OFF.
+_F4_MODE_A = (
+    os.environ.get("SGLANG_F4_MODE_A", "0") == "1"
+    and _fused_rmsnorm_per1x128_quant is not None
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -334,6 +369,84 @@ def hc_post_fused_triton(x, residual, post, comb):
     return out
 
 
+# ===== A2-#2: mhc_post_fused (mul + sum + cast) =====
+@triton.jit
+def _mhc_post_mul_sum_cast_kernel(
+    pre_ptr,     # fp32 [B, HC_MULT]
+    x_flat_ptr,  # fp32 [B, HC_MULT * HIDDEN] (= [B, HC_MULT, HIDDEN] flattened)
+    out_ptr,     # bf16 [B, HIDDEN]
+    B,
+    HIDDEN: tl.constexpr,
+    HC_MULT: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Fused replacement for `(pre.unsqueeze(-1) * x_flat.view(B, HC, H)).sum(1).to(bf16)`.
+
+    Eager chain is 3+ launches (broadcast mul, sum, cast). This kernel keeps
+    the per-(b, d) accumulator in registers; HC_MULT is a small static range
+    (=4 for Pro / Flash-Base). 99.6% HBM-bound on MI355X (microbench).
+    """
+    pid_b = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    b_offs = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    d_offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    b_mask = b_offs < B
+    d_mask = d_offs < HIDDEN
+    bd_mask = b_mask[:, None] & d_mask[None, :]
+
+    hc_offs = tl.arange(0, HC_MULT)
+    pre_offs = b_offs[:, None] * HC_MULT + hc_offs[None, :]
+    pre_block = tl.load(pre_ptr + pre_offs, mask=b_mask[:, None], other=0.0)
+
+    acc = tl.zeros((BLOCK_B, BLOCK_D), dtype=tl.float32)
+    for hc in tl.static_range(0, HC_MULT):
+        pre_col = tl.sum(
+            pre_block * (hc_offs[None, :] == hc).to(tl.float32),
+            axis=1,
+        )
+        x_offs = (
+            b_offs[:, None] * (HC_MULT * HIDDEN)
+            + hc * HIDDEN
+            + d_offs[None, :]
+        )
+        x_block = tl.load(x_flat_ptr + x_offs, mask=bd_mask, other=0.0)
+        acc += pre_col[:, None] * x_block
+
+    out_offs = b_offs[:, None] * HIDDEN + d_offs[None, :]
+    tl.store(out_ptr + out_offs, acc.to(tl.bfloat16), mask=bd_mask)
+
+
+def mhc_post_fused_mul_sum_cast(pre, x_flat, shape, out_dtype):
+    """Fused drop-in for `(pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(1).to(out_dtype)`.
+
+    Args:
+        pre:    (B, 1, HC_MULT) fp32
+        x_flat: (B, HC_MULT*HIDDEN) fp32  (output of hc_pre_fused_triton)
+        shape:  (B, HC_MULT, HIDDEN)
+        out_dtype: bf16
+
+    Returns:
+        (B, HIDDEN) tensor of out_dtype.
+
+    Microbench (B=8192 HC=4 H=7168, MI355X): 561 -> 195 us eager (2.87x),
+    566 -> 212 us cuda-graph (2.68x), 99.6% HBM-bound.
+    """
+    B_, HC_MULT_, HIDDEN_ = shape
+    out = torch.empty(B_, HIDDEN_, dtype=out_dtype, device=pre.device)
+    BLOCK_B, BLOCK_D = 64, 256
+    grid = (triton.cdiv(B_, BLOCK_B), triton.cdiv(HIDDEN_, BLOCK_D))
+    _mhc_post_mul_sum_cast_kernel[grid](
+        pre.squeeze(1).contiguous(),
+        x_flat.contiguous(),
+        out, B_,
+        HIDDEN=HIDDEN_, HC_MULT=HC_MULT_,
+        BLOCK_B=BLOCK_B, BLOCK_D=BLOCK_D,
+    )
+    return out
+
+
 @triton.jit
 def _rms_normalize_kernel(
     x_ptr,
@@ -599,6 +712,7 @@ class Compressor(nn.Module):
         new_tensor = self._ensure_scratch(
             "overlap_xform", (s, 2 * r, d), tensor.dtype, tensor.device,
         )
+        # Item #2 REVERTED for clean-baseline measurement. Restored 3-launch torch path.
         new_tensor.fill_(fill_value)
         new_tensor[:, r:] = tensor[:, :, d:]
         new_tensor[1:, :r] = tensor[:-1, :, :d]
@@ -912,9 +1026,12 @@ class Compressor(nn.Module):
             "extend_output", (out_rows, self.head_dim),
             kv_and_scores.kv.dtype, kv_and_scores.kv.device,
         )
-        # Fill is the original sentinel (10000.0) so misuse still produces an
-        # obvious "very weird" output.
-        compressed_kv_output.fill_(10000.0)
+        # A2-#2: sentinel fill is debug-only ("misuse should produce obvious
+        # junk"). Default OFF — every row is overwritten by the per-request
+        # scatter below, so the fill is purely a defensive invariant check.
+        # Set SGLANG_COMPRESS_SENTINEL=1 to restore.
+        if os.environ.get("SGLANG_COMPRESS_SENTINEL", "0") == "1":
+            compressed_kv_output.fill_(10000.0)
 
         bs = forward_batch.batch_size
         pt = 0
@@ -1249,8 +1366,11 @@ class Compressor(nn.Module):
             "extend_old_output", (kv_and_scores.kv.size(0), self.head_dim),
             kv_and_scores.kv.dtype, kv_and_scores.kv.device,
         )
-        # Sentinel fill (matches original behavior: misuse should produce obvious junk).
-        compressed_kv_output.fill_(10000.0)
+        # A2-#2: sentinel fill is debug-only. Default OFF (every row gets
+        # overwritten by the per-request scatter below); set
+        # SGLANG_COMPRESS_SENTINEL=1 to restore the invariant check.
+        if os.environ.get("SGLANG_COMPRESS_SENTINEL", "0") == "1":
+            compressed_kv_output.fill_(10000.0)
 
         bs = forward_batch.batch_size
         pt = 0
@@ -1303,10 +1423,9 @@ class Compressor(nn.Module):
                 compress_len // self.ratio, self.ratio, -1
             )
             # M2-extend: APE add fuses INTO the megakernel ADD_APE branch on
-            # the no-overlap path (c128 layers, S = ratio = 128). For
-            # overlap=True (c4 layers), overlap_transform reorders elements
-            # between APE-add and softmax, so we keep the explicit add before
-            # the transform.
+            # the no-overlap path (c128 layers, S = ratio = 128). For overlap=True
+            # (c4 layers), overlap_transform reorders elements between APE-add
+            # and softmax, so we keep the explicit add before the transform.
             _fuse_ape_in_kernel = not self.overlap
             if not _fuse_ape_in_kernel:
                 kv_and_score_to_compress.score = (
@@ -1335,13 +1454,14 @@ class Compressor(nn.Module):
 
             # M2-extend megakernel: fuse softmax + mul + sum + RMSNorm + RoPE
             # (+ APE add for no-overlap = 8 ops) into one Triton launch.
-            # Replaces 6 separate launches per call x ~25 calls/step on the
+            # Replaces 6 separate launches per call × ~25 calls/step in the
             # production prefill hot path. Mixed dtype: kv/score bf16 in,
             # kv_compressed fp32 out (kernel internally promotes to fp32).
             from sglang.jit_kernel.compress_decode_megakernel_triton import (
                 compress_decode_full_triton,
             )
             n_blocks = kv_and_score_to_compress.kv.size(0)
+            # Reshape to (n_blocks, S=ratio*coff, D=head_dim) for the megakernel.
             _kv_in = kv_and_score_to_compress.kv.contiguous().view(
                 n_blocks, self.ratio * self.coff, self.head_dim
             )
@@ -1351,7 +1471,7 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == n_blocks, (
                 f"{freqs_cis.shape=} expected first dim = {n_blocks}"
             )
-            _freqs_per_bs = torch.view_as_real(freqs_cis).contiguous()
+            _freqs_per_bs = torch.view_as_real(freqs_cis).contiguous()  # (n_blocks, rope_dim/2, 2)
             _norm_w_fp32 = (
                 self.norm.weight if self.norm.weight.dtype == torch.float32
                 else self.norm.weight.to(torch.float32)
@@ -1373,7 +1493,7 @@ class Compressor(nn.Module):
                 self.norm.eps, self.rope_head_dim,
                 kv_compressed,
             ):
-                # Fallback: original 4-step torch path (Stage1 + RMSNorm + RoPE).
+                # Fallback: original 4-step torch path.
                 _score_for_softmax = kv_and_score_to_compress.score
                 if _fuse_ape_in_kernel:
                     _score_for_softmax = _score_for_softmax + self.ape.unsqueeze(0)
@@ -1471,16 +1591,49 @@ class Compressor(nn.Module):
             bs, self.ratio * self.coff, self.head_dim
         )
 
-        kv_compressed = (
-            kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
-        ).sum(dim=1)
-        self.print_tensor(kv_compressed, "kv_before_norm")
-        kv_compressed = self.norm(kv_compressed)
-        self.print_tensor(kv_compressed, "kv_after_norm")
-        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-        self.print_tensor(freqs_cis, "freqs_cis")
-        apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
-        self.print_tensor(kv_compressed, "kv_after_rope")
+        # M2-Stage2 megakernel: fuse softmax + mul + sum + RMSNorm + RoPE
+        # (7 ops) into one Triton launch. APE was already added above
+        # (line 1523-1525) and baked into score (after overlap_transform_decode
+        # if overlap=True), so pass ape=None. Falls back to torch when S > 16.
+        # v2 framework verdict: SHIP (correctness PASS, eager 7.35×,
+        # graph-replay 5.24× on production shape histogram).
+        from sglang.jit_kernel.compress_decode_megakernel_triton import (
+            compress_decode_full_triton,
+        )
+        _kv_in = kv_and_score_to_compress.kv.contiguous()
+        _score_in = kv_and_score_to_compress.score.contiguous()
+        kv_compressed = torch.empty(
+            (bs, self.head_dim), dtype=_kv_in.dtype, device=_kv_in.device,
+        )
+        _norm_w_fp32 = (
+            self.norm.weight if self.norm.weight.dtype == torch.float32
+            else self.norm.weight.to(torch.float32)
+        )
+        # Pre-compute per-bs freqs lookup (single index_select; same launch
+        # the original code does for `freqs_cis = self.freqs_cis[...]`).
+        _freqs_idx = (seq_lens - 1) // self.ratio * self.ratio
+        _freqs_per_bs = torch.view_as_real(self.freqs_cis[_freqs_idx]).contiguous()  # (bs, rope_dim//2, 2)
+        if compress_decode_full_triton(
+            _kv_in, _score_in, None,
+            _norm_w_fp32, _freqs_per_bs,
+            self.norm.eps, self.rope_head_dim,
+            kv_compressed,
+        ):
+            # Megakernel did softmax+mul+sum + RMSNorm + RoPE in one launch.
+            self.print_tensor(kv_compressed, "kv_after_rope")
+        else:
+            # Fallback: original 4-step torch path (Stage1 + RMSNorm + freqs_idx + RoPE)
+            kv_compressed = (
+                kv_and_score_to_compress.kv
+                * kv_and_score_to_compress.score.softmax(dim=1)
+            ).sum(dim=1)
+            self.print_tensor(kv_compressed, "kv_before_norm")
+            kv_compressed = self.norm(kv_compressed)
+            self.print_tensor(kv_compressed, "kv_after_norm")
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            self.print_tensor(freqs_cis, "freqs_cis")
+            apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
+            self.print_tensor(kv_compressed, "kv_after_rope")
         if self.rotate:
             kv_compressed = rotate_activation(kv_compressed)
 
@@ -1833,8 +1986,11 @@ class MQALayer(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        # Phase 24: caller may stash a (fp8, scale) tuple for wq_a's input.
+        prequant_x = getattr(self, "_prequant_x", None)
+        wq_a_in = prequant_x if prequant_x is not None else x
         # [bs, q_lora_rank]
-        q, _ = self.wq_a(x)
+        q, _ = self.wq_a(wq_a_in)
         # [bs, q_lora_rank]
         q = self.q_norm(q)
         q_lora = q  # only used for indexer
@@ -1868,8 +2024,11 @@ class MQALayer(nn.Module):
         positions: Optional[torch.Tensor] = None,
         freqs_cis: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Phase 24: caller may stash a (fp8, scale) tuple for wkv's input.
+        prequant_x = getattr(self, "_prequant_x", None)
+        wkv_in = prequant_x if prequant_x is not None else x
         # [bs, head_dim]
-        kv, _ = self.wkv(x)
+        kv, _ = self.wkv(wkv_in)
         # [bs, head_dim]
         kv = self.kv_norm(kv)
         if positions is not None:
@@ -1904,6 +2063,10 @@ class MQALayer(nn.Module):
         stream_compressor.wait_stream(current_stream)
         stream_indexer.wait_stream(current_stream)
 
+        # Phase 24: snapshot prequant tuple for use across alt-streams.
+        # _compute_q_a / _compute_kv read self._prequant_x; snapshot ensures
+        # both see the same value even though they run on different streams.
+        # Cleared after both helpers consume it (below).
         # main stream: compute q
         q_lora = self._compute_q_a(x)
         q_lora_ready = current_stream.record_event()
@@ -1931,6 +2094,10 @@ class MQALayer(nn.Module):
                     swa_k=kv,
                     forward_batch=forward_batch,
                 )
+        # Phase 24: clear prequant slot after both q-a and kv have been
+        # dispatched (they ran on different streams; both already grabbed
+        # references to the underlying tensors via wq_a/wkv input).
+        self._prequant_x = None
 
         # alt stream 1: compute compressor
         if self.compressor is not None:
@@ -1954,32 +2121,109 @@ class MQALayer(nn.Module):
         freqs_cis: Optional[torch.Tensor] = None,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Phase 24 (A2-#1 dual-output): if the parent layer pre-fused
+        # input_layernorm into (fp8, scale), feed those directly into wq_a /
+        # wkv. Bypasses the per-1x128 quant launches that would otherwise
+        # fire inside each FP8 GEMM apply. `x` (bf16) is still used downstream
+        # by indexer/compressor — it is the bf16 normed-out from the fused
+        # kernel.
+        prequant_x = getattr(self, "_prequant_x", None)
+        self._prequant_x = None  # clear before consumption (no stale state)
+        wq_a_in = prequant_x if prequant_x is not None else x
+        wkv_in = prequant_x if prequant_x is not None else x
         # [bs, q_lora_rank]
-        q, _ = self.wq_a(x)
+        q, _ = self.wq_a(wq_a_in)
         # [bs, head_dim]
-        kv, _ = self.wkv(x)
-        # Fuse q_norm + kv_norm into a single launch when both are bf16 and
-        # share the leading dim (always true here since they read the same x).
-        # Saves ~1 launch / layer × 61 = ~250-300 µs / decoded token. The aiter
-        # op falls back internally to two rmsnorm2d_fwd calls at M >= 16384.
+        kv, _ = self.wkv(wkv_in)
+        # A2-#1 path: env-gated. Fuses q_norm + per-1x128 fp8 quant into one
+        # Triton launch, then feeds wq_b's FP8 GEMM with pre-quantized input.
+        # This drops the qk_rmsnorm fusion (kv_norm goes through its own
+        # launch), but eliminates the dynamic_per_group_scaled_quant launch
+        # that otherwise fires inside wq_b. Net win on graph replay because
+        # the per-1x128 quant launch dominates kv_norm's cost.
+        # NOTE: q_lora (the indexer input) needs to be the bf16 post-q_norm
+        # output. We get it from the fused kernel's residual-out slot... but
+        # this path has no residual, so we materialise a separate bf16 q_lora.
+        # For now, when the indexer is disabled OR not in this path, just
+        # leave q_lora=None (not used). Future stacking can fold q_lora out.
+        used_fused_q_quant = False
         if (
+            _F4_MODE_A
+            and q.dtype == torch.bfloat16
+            and kv.dtype == torch.bfloat16
+            and q.shape[-1] % 128 == 0
+        ):
+            # F4 Mode A: same shape as _FUSED_RMSNORM_QUANT_PER1x128 branch but
+            # uses the F4-patched kernel (MATCH_BF16_PRODUCTION=True). The patch
+            # round-trips `normed` through bf16 in registers before fp8 quant so
+            # fp8 codepoints match the unfused two-launch production path
+            # (within fp32 mul-order ULP). v2 microbench: 5.86x worst-mode
+            # speedup on 5 production shapes; profile: 3.17 us/launch vs 6.68 us
+            # unfused sum (2.11x). Drops qk_rmsnorm fusion same as the older knob.
+            kv = self.kv_norm(kv)
+            if getattr(self, "indexer", None) is not None:
+                # Indexer needs bf16 post-q_norm q_lora; fall back this layer.
+                q = self.q_norm(q)
+                q_lora = q
+                used_fused_q_quant = False
+            else:
+                q_fp8, q_scale = _fused_rmsnorm_per1x128_quant(
+                    q, self.q_norm.weight, self.eps,
+                    match_bf16_production=True,
+                )
+                q_lora = None  # only used for indexer; unused on this branch
+                q, _ = self.wq_b((q_fp8, q_scale))
+                used_fused_q_quant = True
+        elif (
+            _FUSED_RMSNORM_QUANT_PER1x128
+            and q.dtype == torch.bfloat16
+            and kv.dtype == torch.bfloat16
+            and q.shape[-1] % 128 == 0
+        ):
+            # kv_norm runs separately (no fusion lever for kv_b on this path).
+            kv = self.kv_norm(kv)
+            # Materialise bf16 q_lora for indexer (only if compress_ratio == 4).
+            # We need bf16 post-q_norm. Cheapest: do plain rmsnorm in fp32 then
+            # store, while ALSO emitting the fp8 prequant. But to keep the
+            # fusion benefit (single launch over q), we accept one extra
+            # rmsnorm-of-q for the indexer when present.
+            if getattr(self, "indexer", None) is not None:
+                # Indexer present — needs bf16 post-q_norm q_lora. Fall back
+                # to non-fused for safety on this layer.
+                q = self.q_norm(q)
+                q_lora = q
+                used_fused_q_quant = False
+            else:
+                q_fp8, q_scale = _fused_rmsnorm_per1x128_quant(
+                    q, self.q_norm.weight, self.eps,
+                )
+                q_lora = None  # only used for indexer; unused on this branch
+                q, _ = self.wq_b((q_fp8, q_scale))
+                used_fused_q_quant = True
+        elif (
             _aiter_fused_qk_rmsnorm is not None
             and q.dtype == torch.bfloat16
             and kv.dtype == torch.bfloat16
             and q.size(0) == kv.size(0)
         ):
+            # Fuse q_norm + kv_norm into a single launch when both are bf16
+            # and share the leading dim (always true here since they read
+            # the same x). Saves ~1 launch / layer × 61 = ~250-300 µs / token.
+            # The aiter op falls back internally to two rmsnorm2d_fwd calls
+            # at M >= 16384.
             q, kv = _aiter_fused_qk_rmsnorm(
                 q, self.q_norm.weight, self.eps,
                 kv, self.kv_norm.weight, self.eps,
             )
+            q_lora = q  # only used for indexer (post-q_norm, pre-wq_b — unchanged)
         else:
-            # [bs, q_lora_rank]
             q = self.q_norm(q)
-            # [bs, head_dim]
             kv = self.kv_norm(kv)
-        q_lora = q  # only used for indexer (post-q_norm, pre-wq_b — unchanged)
-        # [bs, n_local_heads, head_dim]
-        q, _ = self.wq_b(q)
+            q_lora = q  # only used for indexer (post-q_norm, pre-wq_b — unchanged)
+
+        if not used_fused_q_quant:
+            # [bs, n_local_heads, head_dim]
+            q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         # [bs, n_local_heads, head_dim]
         # Fused unweighted rmsnorm + RoPE on Q in one launch (saves ~25us/call,
@@ -2321,14 +2565,33 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         from sglang.srt.layers.mhc import hc_split_sinkhorn
 
-        pre, post, comb = hc_split_sinkhorn(
+        B = mixes.shape[0]
+        pre = mixes.new_empty((B, 1, self.hc_mult), dtype=torch.float32)
+        post = mixes.new_empty((B, 1, self.hc_mult), dtype=torch.float32)
+        comb = mixes.new_empty((B, 1, self.hc_mult, self.hc_mult), dtype=torch.float32)
+        hc_split_sinkhorn(
             mixes,
             hc_scale,
             hc_base,
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
+            pre,
+            post,
+            comb,
+            hc_mult=self.hc_mult,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            eps=self.hc_eps,
         )
+        # A2-#2: fuse (pre * x_flat).sum(1).to(dtype) into one kernel.
+        # Default OFF (preserve Phase 13 behavior). Only valid when fused
+        # hc_pre path emitted x_flat as fp32 [B, HC_MULT*HIDDEN] AND the
+        # caller wants bf16 output (the only path on Flash-Base FP8).
+        if (os.environ.get("SGLANG_FUSED_MHC_POST", "0") == "1"
+            and dtype == torch.bfloat16
+            and x_flat.dtype == torch.float32
+            and pre.dtype == torch.float32
+            and x_flat.dim() == 2
+            and x_flat.shape == (shape[0], shape[1] * shape[2])):
+            y_bf16 = mhc_post_fused_mul_sum_cast(pre, x_flat, shape, torch.bfloat16)
+            return y_bf16, post.squeeze(1), comb.squeeze(1)
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
         return y.to(dtype), post.squeeze(1), comb.squeeze(1)
 
@@ -2392,7 +2655,31 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states, post, comb = self.hc_pre(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )  # -> [n, d]
-        hidden_states = self.input_layernorm(hidden_states)
+        # Phase 24 (A2-#1 dual-output): when the env knob is on, fuse
+        # input_layernorm + per-1x128 fp8 quant into a single launch and
+        # stash the (fp8, scale) tuple on self.self_attn for wq_a/wkv to
+        # consume directly. The bf16 normed-out is reused as `hidden_states`
+        # for indexer/compressor (non-fp8 consumers). One launch eliminates
+        # the two redundant per-1x128 quants that would otherwise fire inside
+        # wq_a and wkv's FP8 GEMM apply paths.
+        if (
+            _FUSED_RMSNORM_QUANT_PER1x128_DUAL
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[-1] % 128 == 0
+        ):
+            x_fp8, x_scale, hidden_states = _fused_rmsnorm_per1x128_quant_dual(
+                hidden_states,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+            )
+            # Stash for self_attn._forward_prepare{,_multi_stream} to consume.
+            # The attribute is read+cleared inside _forward_prepare; setting it
+            # here scopes its lifetime to this single self_attn call. (No
+            # data_ptr-keyed cache; just a per-step transient slot.)
+            self.self_attn._prequant_x = (x_fp8, x_scale)
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
+            self.self_attn._prequant_x = None
 
         if _trace:
             sys.stderr.write(f"[trace] L{self.layer_id} pre-attn\n"); sys.stderr.flush()

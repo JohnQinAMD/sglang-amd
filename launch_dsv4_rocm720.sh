@@ -75,8 +75,30 @@ docker exec -d "$CONTAINER" bash -c "
   export PORT=30012
   export MODEL=/hf/DeepSeek-V4-Flash-Base-srt
   export SGLANG_HIP_CK_V32_TWO_SHOT=1
-  export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
+  # Phase 23: route through aiter single-kernel Triton path
+  # (-0.97 ms TPOT vs Phase 13). Pro variants have used AITER=1 since 2026-04-27;
+  # Flash-Base finally flipped 2026-04-29 EOD. See PLAN_DSV4_CLOSE_GAP.md §11.
+  export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=0
+  export SGLANG_FP8_PAGED_MQA_LOGITS_AITER=1
   export SGLANG_FP8_PAGED_MQA_LOGITS_FUSED_TRITON=0
+  # AITER_XBFLOAT16=1 enables 1-stage bf16-bf16 fmoe at prefill (token>32 gate).
+  # Bench (2026-04-28 EOD on chi2774, Flash-Base FP8 max=6): output 116.14 -> 121.00 tok/s
+  # (+4.18%); bench duration 324 -> 301 s (-7.1%); decode TPOT unchanged (32.10 ms).
+  # 1-stage path skips per-token activation quant; decode still uses 2-stage fp8 path.
+  export AITER_XBFLOAT16=1
+  # Item #1b (2026-04-29): REVERTED. Flipping SGLANG_OPT_USE_OLD_COMPRESSOR=false
+  # for Flash-Base FP8 caused TPOT regression 32.10 -> 51.57 ms (+60.7%) in
+  # aligned bench on chi2811. The "OLD=false + RADIX=0" combination leaves
+  # compress_decode/extend in an under-tested state for the `compressed`
+  # attention backend used by Flash-Base FP8. Pro launchers can use OLD=false
+  # because they run through different attention/MoE paths that don't depend
+  # on the compress_extend code path the same way.
+  # The Triton kernel for set_state_by_state_loc (compress_state.py:188) is
+  # still in place but inert for Flash-Base FP8 since the OLD path bypasses
+  # CompressStatePool. To capture the OLD path's 1,698 launches, the right
+  # next step is patching compress_extend_old's local-view __setitem__/clear
+  # calls directly (deepseek_v4.py:1384, 1392, 1393, 1399).
+  # Default (OLD=true) preserved.
   echo \"[\$(date)] starting sglang ($PRESET) in $CONTAINER\"
   exec bash launch_dsv4.sh $PRESET > /tmp/dsv4_server.log 2>&1
 "

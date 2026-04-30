@@ -102,6 +102,20 @@ def _ensure_scratch(scratch_dict, name, shape, dtype, device):
 _FP8_PAGED_SCRATCH_CAPTURED: dict = {}
 _FP8_PAGED_SCRATCH_EAGER: dict = {}
 
+# Cache for the per-call `pt_expanded` tensor built inside
+# `fp8_paged_mqa_logits_aiter`. `page_table` is shared across every c4
+# indexer layer in a single decode step, so the arange + broadcast + copy
+# that produces `pt_expanded` only needs to run once per step. We key on
+# `page_table.data_ptr()` + shape + dtype + block_size, which uniquely
+# identifies the input bytes; when the page_table buffer rotates (e.g.
+# eager calls or a new graph capture replaces the persistent buffer),
+# the data_ptr changes and we rebuild.
+#
+# Stored as `(int_key) -> (pt_expanded_tensor, arange_buf_tensor)`. Cache
+# is bounded — cleared when it grows beyond 16 entries (well above the
+# steady-state of one capture-mode buffer + one eager buffer per shape).
+_PT_EXPANDED_CACHE: dict = {}
+
 
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
@@ -323,7 +337,12 @@ def fp8_paged_mqa_logits_aiter(
         torch.float32,
         device,
     )
-    out.fill_(float("-inf"))
+    if not envs.SGLANG_INDEXER_SKIP_OUT_PREFILL.get():
+        # Default-on safe path: the deepgemm aiter kernel writes per-batch
+        # only up to context_length (see `_deepgemm_fp8_paged_mqa_logits*`
+        # store loop). Anything past per-batch seq_lens[b] would carry stale
+        # values without this fill, breaking downstream top-K masking.
+        out.fill_(float("-inf"))
 
     # On HIP with Triton 3.4.0, aiter's `_deepgemm_fp8_paged_mqa_logits` only
     # supports KVBlockSize=1 (the Gluon path that handles 64 needs Triton 3.5+).
@@ -333,27 +352,76 @@ def fp8_paged_mqa_logits_aiter(
     kv_flat = kvcache_fp8.view(-1, 1, 1, kvcache_fp8.shape[-1])
 
     max_pages = page_table.shape[1]
-    pt_expanded = _ensure_scratch(
-        _paged_scratch,
-        "pt_aiter_expanded",
-        (batch_size, max_pages * block_size),
-        page_table.dtype,
-        device,
-    )
-    arange_buf = _ensure_scratch(
-        _paged_scratch,
-        "pt_aiter_arange",
-        (block_size,),
-        page_table.dtype,
-        device,
-    )
-    torch.arange(block_size, dtype=page_table.dtype, device=device, out=arange_buf)
-    # expanded[b, j*block_size + t] = page_table[b, j] * block_size + t
-    pt_expanded.copy_(
-        (page_table.unsqueeze(-1) * block_size + arange_buf.view(1, 1, -1)).view(
-            batch_size, -1
+
+    # Cached path: `page_table` is the same object across every c4 indexer
+    # layer in one decode step, so `pt_expanded` is identical every call.
+    # Key on (data_ptr, batch, max_pages, dtype-id, block_size, device) so a
+    # rotated page_table buffer (different storage) misses and rebuilds.
+    # CRITICAL: only enable when caller guarantees `page_table` is read-only
+    # within a step (true for DSv4 — the global page table is set once at
+    # forward-pass start). When unsafe (eager rebuild between layers), the
+    # data_ptr will differ and the cache will rebuild correctly anyway.
+    if envs.SGLANG_INDEXER_PT_EXPANDED_CACHED.get():
+        # Capture-mode flag is part of the key: a captured graph's allocations
+        # bind to the capture pool. Replaying a captured graph that holds a
+        # cached eager-allocated tensor (or vice-versa) would read freed
+        # memory (HSA 0x29). Keep capture and eager caches strictly disjoint.
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        cache_key = (
+            page_table.data_ptr(),
+            batch_size,
+            max_pages,
+            page_table.dtype,
+            block_size,
+            device.index if device.index is not None else -1,
+            bool(is_capturing),
         )
-    )
+        cached = _PT_EXPANDED_CACHE.get(cache_key)
+        if cached is None:
+            # Bound the cache so a long-running process with many distinct
+            # page_table buffers (e.g. many capture replays + eager) can't
+            # leak memory. Clear when it grows past a small threshold.
+            if len(_PT_EXPANDED_CACHE) > 16:
+                _PT_EXPANDED_CACHE.clear()
+            pt_expanded = torch.empty(
+                (batch_size, max_pages * block_size),
+                dtype=page_table.dtype,
+                device=device,
+            )
+            arange_buf = torch.arange(
+                block_size, dtype=page_table.dtype, device=device
+            )
+            # expanded[b, j*block_size + t] = page_table[b, j] * block_size + t
+            pt_expanded.copy_(
+                (page_table.unsqueeze(-1) * block_size + arange_buf.view(1, 1, -1)).view(
+                    batch_size, -1
+                )
+            )
+            _PT_EXPANDED_CACHE[cache_key] = pt_expanded
+        else:
+            pt_expanded = cached
+    else:
+        pt_expanded = _ensure_scratch(
+            _paged_scratch,
+            "pt_aiter_expanded",
+            (batch_size, max_pages * block_size),
+            page_table.dtype,
+            device,
+        )
+        arange_buf = _ensure_scratch(
+            _paged_scratch,
+            "pt_aiter_arange",
+            (block_size,),
+            page_table.dtype,
+            device,
+        )
+        torch.arange(block_size, dtype=page_table.dtype, device=device, out=arange_buf)
+        # expanded[b, j*block_size + t] = page_table[b, j] * block_size + t
+        pt_expanded.copy_(
+            (page_table.unsqueeze(-1) * block_size + arange_buf.view(1, 1, -1)).view(
+                batch_size, -1
+            )
+        )
 
     deepgemm_fp8_paged_mqa_logits(
         q_fp8=q_fp8,
