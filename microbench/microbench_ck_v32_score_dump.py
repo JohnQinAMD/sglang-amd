@@ -155,7 +155,69 @@ torch.cuda.synchronize()
 # Compute PER-BATCH oracle: each batch has its own q AND its own valid kv_idx.
 k_pool = kv_fp8.float()
 
-print(f"\n=== Kernel reduce vs PER-BATCH oracle ===")
+print(f"\n=== Performance bench: CK V32 + reduce vs torch ref ===")
+import time
+
+# Benchmark CK V32 + reduce path (production fast path).
+def bench_ck_v32(iters=100):
+    for _ in range(5):  # warmup
+        ck.mla_decode_fwd_ck_sparse_fp8(
+            q_2d, kv_4d, split_data, split_lse,
+            qo_indptr, kv_indptr, idx_flat,
+            float(sm_scale), int(num_splits), 1.0,
+        )
+        aiter.mla_reduce_v1(partial_output, partial_lse,
+                            reduce_indptr, reduce_final_map, reduce_partial_map,
+                            1, final_output, final_lse)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        ck.mla_decode_fwd_ck_sparse_fp8(
+            q_2d, kv_4d, split_data, split_lse,
+            qo_indptr, kv_indptr, idx_flat,
+            float(sm_scale), int(num_splits), 1.0,
+        )
+        aiter.mla_reduce_v1(partial_output, partial_lse,
+                            reduce_indptr, reduce_final_map, reduce_partial_map,
+                            1, final_output, final_lse)
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e6  # µs
+
+# Benchmark a torch BF16 reference (the current production fall-through).
+def bench_torch_ref(iters=100):
+    k_pool_bf16 = kv_fp8.float().to(torch.bfloat16)  # bf16 dequant once outside loop
+    out_bf16 = torch.empty((B*S_q, H, V), dtype=torch.bfloat16, device=device)
+    def step():
+        for b in range(B):
+            idx_raw = indices[b, 0].long()
+            invalid = idx_raw < 0
+            idx_safe = torch.clamp(idx_raw, min=0)
+            k_g = k_pool_bf16[idx_safe, :D]
+            v_g = k_pool_bf16[idx_safe, :V]
+            q_h = q[b, 0]   # bf16 [H, D]
+            scores = (q_h.float() @ k_g.float().T) * sm_scale
+            scores = torch.where(invalid.view(1, -1),
+                                  torch.tensor(float("-inf"), device=device), scores)
+            attn = torch.softmax(scores, dim=-1)
+            out_bf16[b] = (attn @ v_g.float()).to(torch.bfloat16)
+    for _ in range(5):
+        step()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        step()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e6  # µs
+
+us_ck = bench_ck_v32()
+us_ref = bench_torch_ref()
+print(f"  CK V32 + reduce (production fast path):  {us_ck:8.2f} µs/call")
+print(f"  Torch BF16 ref (fall-through path):      {us_ref:8.2f} µs/call")
+print(f"  Speedup:                                 {us_ref / us_ck:6.2f}x")
+print(f"  At 60 layers × 64 decode tokens / req:   {(us_ref - us_ck) * 60 / 1000:.2f} ms saved per request")
+print()
+
+print(f"=== Kernel reduce vs PER-BATCH oracle ===")
 for b in range(B):
     kv0 = 128 + b * 13
     kv1 = 129 + b * 13

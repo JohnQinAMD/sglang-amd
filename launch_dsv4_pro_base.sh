@@ -24,14 +24,14 @@
 #     -v /path/to/hf:/hf -v /path/to/sglang_v4_pr:/sgl-pr \
 #     -v /path/to/jitcache:/sgl-workspace/aiter/aiter/jit \
 #     -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-#     rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129 \
+#     rocm/sgl-dev:rocm720-deepseek-v4-mi35x \
 #     bash /sgl-pr/launch_dsv4_pro_base.sh
 set -euo pipefail
 
 PORT="${PORT:-30010}"
 MODEL="${MODEL:-/hf/DeepSeek-V4-Pro-Base-srt}"
-MEM_FRACTION="${MEM_FRACTION:-0.85}"
-MAX_RUNNING_REQ="${MAX_RUNNING_REQ:-64}"
+MEM_FRACTION="${MEM_FRACTION_OVERRIDE:-0.85}"   # Hardcoded 0.85 (override with MEM_FRACTION_OVERRIDE)
+MAX_RUNNING_REQ="${MAX_RUNNING_REQ:-4}"
 CONTEXT_LEN="${CONTEXT_LEN:-1048576}"
 INDEXER_CAP="${INDEXER_CAP:-4096}"
 CUDA_GRAPH_BS="${CUDA_GRAPH_BS:-1 2 4 8 16 32}"
@@ -48,6 +48,26 @@ export SGLANG_OPT_USE_TILELANG_SWA_PREPARE=false
 export SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=false
 export SGLANG_OPT_USE_FUSED_HASH_TOPK=false
 export SGLANG_HACK_FLASHMLA_BACKEND=torch
+# MoE bm=128 microbench showed 2.6× at M=8192 but FLAT at e2e c=8 isl=osl=1024
+# (chunked-prefill chunks closer to M=1024 where win is only 1.12×).
+# Re-enable with: export SGLANG_DSV4_FP8_MOE_BM=128
+# export SGLANG_DSV4_FP8_MOE_BM=128
+# CK V32 sparse MLA decode kernel is now default-on in source code
+# (debug_flash_mla_adapter.py); env override removed so we can validate
+# the e2e bench without the new code paths. Re-enable with
+#   export SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1
+# (this is also the new default if the env is unset).
+# export SGLANG_HIP_SPARSE_MLA_DECODE_FP8=1
+
+# Phase E (2026-04-28) — same combine-kernel gates as Flash-Base FP8.
+# Pro-Base shapes (TP=8, more layers) hit the same PREFILL combine path; the
+# work-score gate (8192) keeps decode on CK and steers PREFILL to Triton at
+# q*S_a >= 8192. See phase_e/STATUS.md for measured numbers + roofline.
+export SGLANG_CK_V32_TRITON_COMBINE="${SGLANG_CK_V32_TRITON_COMBINE:-1}"
+export SGLANG_CK_V32_TRITON_COMBINE_NWAY="${SGLANG_CK_V32_TRITON_COMBINE_NWAY:-1}"
+export SGLANG_CK_V32_TRITON_COMBINE_MIN_WORK="${SGLANG_CK_V32_TRITON_COMBINE_MIN_WORK:-8192}"
+export SGLANG_CK_V32_TRITON_COMBINE_BLOCK_V="${SGLANG_CK_V32_TRITON_COMBINE_BLOCK_V:-256}"
+export SGLANG_CK_V32_TRITON_COMBINE_NUM_WARPS="${SGLANG_CK_V32_TRITON_COMBINE_NUM_WARPS:-4}"
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=false
 export SGLANG_OPT_USE_TILELANG_MHC_PRE=false
 export SGLANG_OPT_USE_TILELANG_MHC_POST=false
