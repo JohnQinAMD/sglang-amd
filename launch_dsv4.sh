@@ -296,6 +296,13 @@ case "$PRESET" in
     # output throughput 33.01 → 37.15 tok/s (+12.5%). Microbench: ~8x graph-replay
     # speedup. Owns >92% of index_elementwise budget per agent attribution audit.
     export SGLANG_FUSED_COMPRESS_DECODE_KV_POOL="${SGLANG_FUSED_COMPRESS_DECODE_KV_POOL:-1}"
+    # 2026-05-01 Phase 2: absorbs overlap_transform_decode into the kv_pool kernel.
+    # Bench A/B on chi2774 c=1 random 2048/256:
+    #   V1 only:        TPOT 24.70 ms / 38.16 tok/s
+    #   V2 (this):      TPOT 24.32 ms / 38.72 tok/s
+    #   delta:          -0.38 ms TPOT, +1.5% throughput
+    # Combined stack vs origin: TPOT 28.73 → 24.32 ms (-4.41 ms / -15.4%), +17.3% tput.
+    export SGLANG_FUSED_COMPRESS_DECODE_KV_POOL_V2="${SGLANG_FUSED_COMPRESS_DECODE_KV_POOL_V2:-1}"
     # 2026-05-01: hc_pre decode-shape Triton kernel default-ON. Replaces
     # _hc_pre_torch_impl (5-7 launch RMSNorm+Linear chain) at decode shapes
     # (M=1-8) with 3-launch path: Triton per-row RMSNorm + torch.matmul + mul.

@@ -66,33 +66,35 @@ def _hc_pre_decode_rmsnorm_kernel(
     HIDDEN: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """One program per row. Reads HIDDEN/BLOCK_K tiles, accumulates sum_sq,
-    writes x_flat (fp32 cast) along the way, computes rsqrt at the end.
+    """One program per row (BLOCK_M=1). Reads HIDDEN/BLOCK_K tiles, accumulates
+    sum_sq, writes x_flat (fp32 cast) along the way, computes rsqrt at end.
 
-    grid = (M,)
+    grid = (M,). Uses 2D arange (BLOCK_M=1 in the m dim) so all tl.load/store
+    pointers are block type — Triton-AMD requires this.
     """
     pid_m = tl.program_id(0)
     if pid_m >= M:
         return
 
+    # 2D pointer arithmetic with BLOCK_M=1 m-dim. m_offs is (1,), k_offs is (BLOCK_K,).
+    # x_offs is (1, BLOCK_K) — a proper block pointer.
+    m_offs = pid_m + tl.arange(0, 1)  # shape (1,), value [pid_m]
     sum_sq = tl.zeros((1,), dtype=tl.float32)
-    row_offset = pid_m * HIDDEN
 
     for k_start in range(0, HIDDEN, BLOCK_K):
         k_offs = k_start + tl.arange(0, BLOCK_K)
         k_mask = k_offs < HIDDEN
-        x_block = tl.load(
-            x_ptr + row_offset + k_offs, mask=k_mask, other=0.0
-        ).to(tl.float32)
-        # Persist x_flat (fp32 cast of input row)
-        tl.store(
-            x_flat_out_ptr + row_offset + k_offs, x_block, mask=k_mask
-        )
-        # Accumulate sum of squares (sum over the BLOCK_K axis returns scalar)
-        sum_sq += tl.sum(x_block * x_block, axis=0)
+        offs_2d = m_offs[:, None] * HIDDEN + k_offs[None, :]
+        mask_2d = (m_offs[:, None] < M) & k_mask[None, :]
+        x_block = tl.load(x_ptr + offs_2d, mask=mask_2d, other=0.0).to(tl.float32)
+        tl.store(x_flat_out_ptr + offs_2d, x_block, mask=mask_2d)
+        # x_block shape (1, BLOCK_K). Sum across both axes returns scalar
+        sum_sq += tl.sum(x_block * x_block).to(tl.float32)
 
     rsqrt = tl.rsqrt(sum_sq / HIDDEN + eps)
-    tl.store(rsqrt_out_ptr + pid_m, rsqrt)
+    # Store one fp32 to rsqrt_out_ptr[pid_m]
+    rsqrt_offs = pid_m + tl.arange(0, 1)
+    tl.store(rsqrt_out_ptr + rsqrt_offs, rsqrt, mask=rsqrt_offs < M)
 
 
 def hc_pre_decode_triton(
