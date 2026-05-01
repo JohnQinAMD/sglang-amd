@@ -2643,6 +2643,25 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and x.shape[1] * x.shape[2] == hc_fn.shape[1]
                 and hc_fn.shape[0] == x.shape[1]):
                 x_flat, mixes = hc_pre_fused_triton(x, hc_fn, self.rms_norm_eps)
+            elif (
+                # 2026-05-01: decode-shape fallback. Replaces _hc_pre_torch_impl
+                # with a decode-tuned RMSNorm kernel + torch GEMM + broadcast mul.
+                # Per the post-fused-pool agent attribution, _hc_pre_torch_impl
+                # owns ~5 ms cpu_dispatch / 602 calls in the eager profile (top
+                # remaining after compress_decode_old fusion shipped).
+                # Default OFF; gated by SGLANG_HC_PRE_DECODE_TRITON=1.
+                # NOTE: the v1 attempt extending the prefill kernel REGRESSED +60 ms
+                # at decode (kernel optimized for M=8192 prefill, slow at M=1-8).
+                # This is a fundamentally different kernel (grid over M, not
+                # 1-program-with-loop); see hc_pre_decode_triton.py.
+                os.environ.get("SGLANG_HC_PRE_DECODE_TRITON", "0") == "1"
+                and x.dtype == torch.bfloat16
+                and hc_fn.dtype == torch.float32
+                and x.shape[1] * x.shape[2] == hc_fn.shape[1]
+                and x.shape[0] <= 32  # decode regime only
+            ):
+                from sglang.jit_kernel.hc_pre_decode_triton import hc_pre_decode_triton
+                x_flat, mixes = hc_pre_decode_triton(x, hc_fn, self.rms_norm_eps)
             else:
                 # Naive Torch implementation
                 x_flat, mixes = _hc_pre_torch_impl(x, hc_fn, self.rms_norm_eps)

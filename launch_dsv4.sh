@@ -296,6 +296,16 @@ case "$PRESET" in
     # output throughput 33.01 → 37.15 tok/s (+12.5%). Microbench: ~8x graph-replay
     # speedup. Owns >92% of index_elementwise budget per agent attribution audit.
     export SGLANG_FUSED_COMPRESS_DECODE_KV_POOL="${SGLANG_FUSED_COMPRESS_DECODE_KV_POOL:-1}"
+    # 2026-05-01: hc_pre decode-shape Triton kernel default-ON. Replaces
+    # _hc_pre_torch_impl (5-7 launch RMSNorm+Linear chain) at decode shapes
+    # (M=1-8) with 3-launch path: Triton per-row RMSNorm + torch.matmul + mul.
+    # Bench-validated on chi2774 c=1 random 2048/256:
+    #   kv_pool ONLY:               TPOT 25.43 ms / 37.12 tok/s
+    #   kv_pool + hc_pre_decode:    TPOT 24.63 ms / 38.26 tok/s   (-0.80 ms)
+    # Combined stack vs original baseline: TPOT 28.73 → 24.63 ms (-4.10 ms, -14.3%),
+    # output throughput +15.9%. Different from the v1 attempt which used the
+    # prefill-tuned hc_pre_fused_triton kernel (regressed +60 ms at decode).
+    export SGLANG_HC_PRE_DECODE_TRITON="${SGLANG_HC_PRE_DECODE_TRITON:-1}"
     # Phase 17: capture bs=3 explicitly so c=4 bench (which hits bs={1,2,3,4})
     # never pads to bs=4. Per launch-overhead microbench (3.68 us/launch eager,
     # 1.46 us graphed), every kernel forced into eager pad fallback costs ~3 ms.
