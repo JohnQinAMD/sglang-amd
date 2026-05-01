@@ -289,6 +289,13 @@ case "$PRESET" in
     # kernel (2.91× graph-replay microbench worst-mode). Wire-in stub at
     # deepseek_v4.py L2154+L2725; falls back to torch path on shape mismatch.
     export SGLANG_DECODE_BODY_BLOCK_A="${SGLANG_DECODE_BODY_BLOCK_A:-1}"
+    # 2026-05-01: compress_decode_old fused kv_pool kernel default-ON. Replaces
+    # 5+ launch chain (advanced index_put + advanced gather + overlap shift +
+    # APE add) at deepseek_v4.py:1582-1612 with one Triton kernel. Bench-validated
+    # on chi2774 c=1 random 2048/256: TPOT 28.73 → 25.41 ms (-3.32 ms / -11.6%),
+    # output throughput 33.01 → 37.15 tok/s (+12.5%). Microbench: ~8x graph-replay
+    # speedup. Owns >92% of index_elementwise budget per agent attribution audit.
+    export SGLANG_FUSED_COMPRESS_DECODE_KV_POOL="${SGLANG_FUSED_COMPRESS_DECODE_KV_POOL:-1}"
     # Phase 17: capture bs=3 explicitly so c=4 bench (which hits bs={1,2,3,4})
     # never pads to bs=4. Per launch-overhead microbench (3.68 us/launch eager,
     # 1.46 us graphed), every kernel forced into eager pad fallback costs ~3 ms.
