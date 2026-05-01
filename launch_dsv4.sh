@@ -282,6 +282,13 @@ case "$PRESET" in
     # those buffers are left stale. M3 alone is GREEN. See
     # rocm-dynamo/handoff-baseline-garbage-token-FOUND.md for the full bisect.
     _M3_INDEXER=1; _M1_KV_WRITE_ROPE=0
+    # 2026-05-01: Decode-body Block A Phase 2 megakernel (commit c619ba9d1)
+    # default-ON. Bench-validated -1.79 ms TPOT / +69% throughput on chi2774
+    # (40 prompts × ISL=1024 OSL=1024 × c=4 × greedy temp=0). Replaces the
+    # 4-op rmsnorm + per-1×128 quant + wq_a + wkv_a chain with one Triton
+    # kernel (2.91× graph-replay microbench worst-mode). Wire-in stub at
+    # deepseek_v4.py L2154+L2725; falls back to torch path on shape mismatch.
+    export SGLANG_DECODE_BODY_BLOCK_A="${SGLANG_DECODE_BODY_BLOCK_A:-1}"
     # Phase 17: capture bs=3 explicitly so c=4 bench (which hits bs={1,2,3,4})
     # never pads to bs=4. Per launch-overhead microbench (3.68 us/launch eager,
     # 1.46 us graphed), every kernel forced into eager pad fallback costs ~3 ms.
