@@ -58,15 +58,21 @@ def _compress_decode_kv_pool_reference(
     seq_lens: torch.Tensor,          # [bs] int32
     new_kv: torch.Tensor,            # [bs, D] — value to write at write_pos
     new_score: torch.Tensor,         # [bs, D]
-    ape_score: torch.Tensor,         # [T, D] fp32 — added to score after gather
+    ape_score: torch.Tensor,         # [ratio, D] fp32 — added to score after L1621 view+L1625 broadcast
     ratio: int,
     overlap: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Returns (kv_to_compress_kv, kv_to_compress_score) AFTER the L1625 APE add.
+    """Returns (kv_to_compress_kv, kv_to_compress_score) at shape (bs, T=coff*ratio, D)
+    with APE already added per the production L1621-L1625 view+broadcast semantics:
+        view(-1, ratio, D) → score + ape.unsqueeze(0) → view(bs, T, D)
+    Equivalent to: out_score[b, t, d] = pool[b, t, d] + ape[t % ratio, d]
 
     Side effects: writes to kv_pool_kv and kv_pool_score in place (matches
-    production semantics).
+    production L1598 + L1607 semantics).
     """
+    bs = req_indices.shape[0]
+    T, D = kv_pool_kv.shape[1], kv_pool_kv.shape[2]
+    coff = T // ratio
     # L1597
     write_pos = (seq_lens - 1) % ratio + (ratio if overlap else 0)
     # L1598
@@ -78,7 +84,6 @@ def _compress_decode_kv_pool_reference(
     if overlap:
         # L1604-1618
         should_shift = (seq_lens % ratio == 0)
-        # Shift kv_pool[req, :ratio] = (kv_to_compress[:, ratio:] if should else kv_to_compress[:, :ratio])
         kv_pool_kv[req_indices, :ratio] = torch.where(
             should_shift[:, None, None],
             kv_to_compress_kv[:, ratio:],
@@ -89,8 +94,10 @@ def _compress_decode_kv_pool_reference(
             kv_to_compress_score[:, ratio:],
             kv_to_compress_score[:, :ratio],
         )
-    # L1625 — APE add (broadcast on time dim)
-    kv_to_compress_score = kv_to_compress_score + ape_score.unsqueeze(0)
+    # L1621-L1625 — view to (bs*coff, ratio, D), add APE, view back to (bs, T, D)
+    kv_to_compress_score = (
+        kv_to_compress_score.view(bs * coff, ratio, D) + ape_score.unsqueeze(0)
+    ).view(bs, T, D)
     return kv_to_compress_kv, kv_to_compress_score
 
 
@@ -167,8 +174,10 @@ def _compress_decode_kv_pool_kernel(
     snap_kv = tl.where(is_write_slot, new_kv_b, orig_kv_t)
     snap_score = tl.where(is_write_slot, new_score_b, orig_score_t)
 
-    # Add APE to score for output
-    ape_t = tl.load(ape_score_ptr + pid_t * ape_stride_t + d_offs * ape_stride_d, mask=d_mask, other=0.0)
+    # Add APE to score for output. Production APE has shape (ratio, D); the
+    # add happens in the (bs*coff, ratio, D) view, so APE indexes by pid_t % RATIO.
+    ape_idx = pid_t % RATIO
+    ape_t = tl.load(ape_score_ptr + ape_idx * ape_stride_t + d_offs * ape_stride_d, mask=d_mask, other=0.0)
     out_score = snap_score.to(tl.float32) + ape_t
 
     out_base = pid_b * out_stride_b + pid_t * out_stride_t
@@ -235,7 +244,10 @@ def compress_decode_kv_pool_fused(
     )
     assert new_kv.shape == (bs, D), f"new_kv {new_kv.shape} expected ({bs}, {D})"
     assert new_score.shape == (bs, D), f"new_score {new_score.shape} expected ({bs}, {D})"
-    assert ape_score.shape == (T, D), f"ape {ape_score.shape} expected ({T}, {D})"
+    assert ape_score.shape == (ratio, D), (
+        f"ape {ape_score.shape} expected ({ratio}, {D}) — production APE is per-ratio not per-T"
+    )
+    assert T % ratio == 0, f"T={T} must be multiple of ratio={ratio}"
 
     out_kv = torch.empty(bs, T, D, dtype=kv_pool_kv.dtype, device=kv_pool_kv.device)
     out_score = torch.empty(bs, T, D, dtype=kv_pool_score.dtype, device=kv_pool_score.device)

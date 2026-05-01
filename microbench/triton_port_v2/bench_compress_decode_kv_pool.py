@@ -34,7 +34,7 @@ def make_inputs(num_reqs, bs, ratio, overlap, head_dim, dtype=torch.bfloat16, se
     seq_lens = torch.randint(1, 1024, (bs,), dtype=torch.int32, device=device)
     new_kv = torch.randn(bs, D, dtype=dtype, device=device)
     new_score = torch.randn(bs, D, dtype=dtype, device=device)
-    ape_score = torch.randn(T, D, dtype=torch.float32, device=device)
+    ape_score = torch.randn(ratio, D, dtype=torch.float32, device=device)
     return kv_pool_kv, kv_pool_score, req_indices, seq_lens, new_kv, new_score, ape_score, ratio, overlap
 
 
