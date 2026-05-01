@@ -74,7 +74,14 @@ docker exec -d "$CONTAINER" bash -c "
   export PYTHONPATH=/sgl-pr/python:\${PYTHONPATH:-}
   export PORT=30012
   export MODEL=/hf/DeepSeek-V4-Flash-Base-srt
-  export SGLANG_HIP_CK_V32_TWO_SHOT=1
+  # Use "auto" (default) — enables two-shot only for prefill (s_q>1) where it's safe.
+  # DO NOT set =1 for Flash-Base FP8 decode: bypasses the singleshot gate at
+  # debug_flash_mla_adapter.py:638 and exposes the labeled-transpose bug at s_q=1
+  # (cumulative sub-bf16-ULP drift, permanently blocked at kernel level — see
+  # feedback_ck_v32_accuracy_block.md). Result: garbage tokens at greedy decode.
+  # =1 is only correct for paths that supply extra_k_cache (e.g. Pro mxfp4 dual-attn).
+  # See handoff-baseline-garbage-token-FOUND-followup.md for the full analysis.
+  export SGLANG_HIP_CK_V32_TWO_SHOT=auto
   # Phase 23: route through aiter single-kernel Triton path
   # (-0.97 ms TPOT vs Phase 13). Pro variants have used AITER=1 since 2026-04-27;
   # Flash-Base finally flipped 2026-04-29 EOD. See PLAN_DSV4_CLOSE_GAP.md §11.
