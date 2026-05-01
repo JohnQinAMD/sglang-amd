@@ -90,7 +90,13 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_HIP="${SGLANG_FP8_PAGED_MQA_LOGITS_HIP:-0}"
 export SGLANG_DSV4_FP4_EXPERTS=false
 export SGLANG_OPT_DPSK_V4_RADIX="${SGLANG_OPT_DPSK_V4_RADIX:-0}"
 export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=false
-export SGLANG_OPT_USE_FUSED_STORE_CACHE=false
+# 2026-05-01 lever 12a: bench-verified -1.99 ms TPOT / +70% throughput at greedy
+# c=4. Routes act_quant + _set_k_and_s_triton through the already-shipped fused
+# C++ path (set_index_k_fused / set_extra_key_buffer_fused). environ.py default
+# is True; the previous explicit =false override (inherited from a 5-day-old
+# launcher consolidation) was the only thing keeping it off. See
+# rocm-dynamo/lever-12a-fused-store-cache-plan.md and the M1=0 baseline bench.
+export SGLANG_OPT_USE_FUSED_STORE_CACHE=true
 # Sparse MLA decode kernel.
 #   DSv4-Flash-Base (qk_head_dim=512): use torch ref + R5 stack (gather-first
 #     dequant + Triton fusion + bf16 inner BMM); enable
@@ -267,10 +273,15 @@ case "$PRESET" in
     _TOPK_TORCH=0; _FORCE_TRITON_MOE=0; _INDEXER_CAP=4096
     _MULTI_STREAM=0; _DISABLE_COMPILE=1
     _MHC_PRE=0; _MHC_POST=1
-    # 2026-04-30: M3 indexer megakernel (commit 56538ae0e) -0.34 ms TPOT, +1.05% throughput
-    # 2026-04-30: M1 kv_write_with_rope megakernel (commit f9f100efd) -0.41 ms TPOT, TTFT -151 ms
-    # Both validated on chi2774 stacked-best, default-OFF env knobs flipped to ON in this preset.
-    _M3_INDEXER=1; _M1_KV_WRITE_ROPE=1
+    # 2026-04-30: M3 indexer megakernel (commit 56538ae0e) -0.34 ms TPOT, +1.05% throughput.
+    # 2026-05-01: M1 kv_write_with_rope (commit f9f100efd) DISABLED — chi2811 bisect proved
+    # M1=1 alone produces garbage tokens at greedy decode on Flash-Base FP8 (random unicode:
+    # Arabic/Chinese tokens) despite bit-exact microbench. Wire-in only writes the SWA pool
+    # but DSv4 Flash-Base FP8 has additional cache buffers (indexer + compress) that the
+    # backend's save_kv_cache=True normally populates; M1 forces save_kv_cache=False so
+    # those buffers are left stale. M3 alone is GREEN. See
+    # rocm-dynamo/handoff-baseline-garbage-token-FOUND.md for the full bisect.
+    _M3_INDEXER=1; _M1_KV_WRITE_ROPE=0
     # Phase 17: capture bs=3 explicitly so c=4 bench (which hits bs={1,2,3,4})
     # never pads to bs=4. Per launch-overhead microbench (3.68 us/launch eager,
     # 1.46 us graphed), every kernel forced into eager pad fallback costs ~3 ms.
