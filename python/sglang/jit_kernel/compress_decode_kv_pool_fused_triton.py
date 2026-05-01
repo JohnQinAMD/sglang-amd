@@ -269,3 +269,233 @@ def compress_decode_kv_pool_fused(
         BLOCK_D=BLOCK_D,
     )
     return out_kv, out_score
+
+
+# ===========================================================================
+# Phase 2 — extend kernel to absorb overlap_transform_decode (deepseek_v4.py:761)
+# ---------------------------------------------------------------------------
+# Phase 1 outputs (bs, T=coff*ratio, D=coff*head_dim). Production then runs:
+#   if overlap:
+#     out.kv = overlap_transform_decode(out.kv)        # (bs, T, head_dim)
+#     out.score = overlap_transform_decode(out.score)  # (bs, T, head_dim)
+# where overlap_transform_decode does:
+#   ret = torch.cat((tensor[:, :r, :d], tensor[:, r:, d:]), dim=1)
+# i.e., for output[b, t, d_out_idx]:
+#   - if t < r: take input[b, t, d_out_idx]      (lower half d)
+#   - if t >= r: take input[b, t, d_out_idx + d] (upper half d)
+#
+# This Phase 2 kernel writes that transformed output directly. For overlap=False
+# (c128 path), output is identical to Phase 1 (D == head_dim).
+#
+# Microbench-validated -3.32 ms ship in Phase 1; Phase 2 adds another -0.2 to
+# -0.4 ms est. by eliminating 2 cat launches per NSA layer.
+# ===========================================================================
+
+
+def _compress_decode_kv_pool_v2_reference(
+    kv_pool_kv: torch.Tensor,
+    kv_pool_score: torch.Tensor,
+    req_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    new_kv: torch.Tensor,
+    new_score: torch.Tensor,
+    ape_score: torch.Tensor,
+    ratio: int,
+    overlap: bool,
+    head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference: phase 1 kernel + overlap_transform_decode(kv) + overlap_transform_decode(score).
+
+    Returns out_kv, out_score at shape (bs, T=coff*ratio, head_dim).
+    For overlap=False, head_dim == D (no transform); for overlap=True, head_dim = D//2.
+    """
+    # Phase 1 step
+    out_kv_p1, out_score_p1 = _compress_decode_kv_pool_reference(
+        kv_pool_kv, kv_pool_score,
+        req_indices, seq_lens,
+        new_kv, new_score,
+        ape_score,
+        ratio, overlap,
+    )
+    # out_p1 shape: (bs, T=coff*ratio, D=coff*head_dim)
+    if overlap:
+        # overlap_transform_decode: cat((t[:, :r, :d], t[:, r:, d:]), dim=1)
+        # Result shape: (bs, T, head_dim) where T = 2*ratio
+        r = ratio
+        d = head_dim
+        out_kv_xform = torch.cat((out_kv_p1[:, :r, :d], out_kv_p1[:, r:, d:]), dim=1)
+        out_score_xform = torch.cat((out_score_p1[:, :r, :d], out_score_p1[:, r:, d:]), dim=1)
+        return out_kv_xform, out_score_xform
+    else:
+        # overlap=False: head_dim == D, no transform
+        return out_kv_p1, out_score_p1
+
+
+@triton.jit
+def _compress_decode_kv_pool_kernel_v2(
+    kv_pool_kv_ptr,
+    kv_pool_score_ptr,
+    req_indices_ptr,
+    seq_lens_ptr,
+    new_kv_ptr,
+    new_score_ptr,
+    ape_score_ptr,
+    out_kv_ptr,
+    out_score_ptr,
+    pool_stride_req, pool_stride_t, pool_stride_d,
+    new_stride_b, new_stride_d,
+    ape_stride_t, ape_stride_d,
+    out_stride_b, out_stride_t, out_stride_d_out,
+    bs,
+    T: tl.constexpr,
+    D: tl.constexpr,            # input pool d-dim (coff*head_dim)
+    HEAD_DIM: tl.constexpr,     # output d-dim (head_dim if overlap else D)
+    RATIO: tl.constexpr,
+    OVERLAP: tl.constexpr,
+    BLOCK_D: tl.constexpr,      # tile size on FULL pool d-dim (D), same as Phase 1
+):
+    """Phase 2: per (pid_b, pid_t, pid_d). Grid = (bs, T, cdiv(D, BLOCK_D)) — same as Phase 1.
+
+    Pool side-effects use full d_offs in [0, D) (covers all pool slots).
+    Output writes are SELECTIVE based on overlap_transform_decode logic:
+      - overlap=False: out[b, t, d_offs] = snap (full d, identity transform)
+      - overlap=True, pid_t < RATIO: out[b, t, d_offs] = snap, ONLY where d_offs < HEAD_DIM
+      - overlap=True, pid_t >= RATIO: out[b, t, d_offs - HEAD_DIM] = snap,
+                                       ONLY where d_offs >= HEAD_DIM
+                                       (maps source upper-half to output lower-half — overlap_transform_decode)
+    """
+    pid_b = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    pid_d = tl.program_id(2)
+
+    d_offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
+
+    req = tl.load(req_indices_ptr + pid_b)
+    seq = tl.load(seq_lens_ptr + pid_b)
+    write_pos = (seq - 1) % RATIO + (RATIO if OVERLAP else 0)
+    should_shift = (seq % RATIO == 0) if OVERLAP else False
+
+    pool_base_t = req * pool_stride_req + pid_t * pool_stride_t
+
+    # Read original pool at (pid_t, d_offs)
+    orig_kv = tl.load(kv_pool_kv_ptr + pool_base_t + d_offs * pool_stride_d, mask=d_mask, other=0.0)
+    orig_score = tl.load(kv_pool_score_ptr + pool_base_t + d_offs * pool_stride_d, mask=d_mask, other=0.0)
+
+    # Read new value at (pid_b, d_offs)
+    new_kv_b = tl.load(new_kv_ptr + pid_b * new_stride_b + d_offs * new_stride_d, mask=d_mask, other=0.0).to(orig_kv.dtype)
+    new_score_b = tl.load(new_score_ptr + pid_b * new_stride_b + d_offs * new_stride_d, mask=d_mask, other=0.0).to(orig_score.dtype)
+
+    # Snapshot at pid_t (before shift) for OUTPUT
+    is_write_slot = (pid_t == write_pos)
+    snap_kv = tl.where(is_write_slot, new_kv_b, orig_kv)
+    snap_score = tl.where(is_write_slot, new_score_b, orig_score)
+
+    # APE add (production indexes APE by t % RATIO)
+    ape_idx = pid_t % RATIO
+    ape = tl.load(ape_score_ptr + ape_idx * ape_stride_t + d_offs * ape_stride_d, mask=d_mask, other=0.0)
+    out_score = snap_score.to(tl.float32) + ape
+
+    # ---- Selective output writes (overlap_transform_decode applied inline) ----
+    if OVERLAP:
+        # output_d_offs and out_write_mask depend on (pid_t < RATIO, d_offs)
+        d_out_offs = tl.where(pid_t < RATIO, d_offs, d_offs - HEAD_DIM)
+        out_write_mask = d_mask & tl.where(
+            pid_t < RATIO,
+            d_offs < HEAD_DIM,
+            d_offs >= HEAD_DIM,
+        )
+    else:
+        d_out_offs = d_offs
+        out_write_mask = d_mask
+
+    out_base = pid_b * out_stride_b + pid_t * out_stride_t
+    tl.store(out_kv_ptr + out_base + d_out_offs * out_stride_d_out, snap_kv, mask=out_write_mask)
+    tl.store(
+        out_score_ptr + out_base + d_out_offs * out_stride_d_out,
+        out_score.to(snap_score.dtype),
+        mask=out_write_mask,
+    )
+
+    # ---- Pool side-effects (identical to Phase 1) — full d-dim ----
+    if OVERLAP:
+        if should_shift and pid_t < RATIO:
+            src_t = pid_t + RATIO
+            shift_base = req * pool_stride_req + src_t * pool_stride_t
+            src_kv = tl.load(kv_pool_kv_ptr + shift_base + d_offs * pool_stride_d, mask=d_mask, other=0.0)
+            src_score = tl.load(kv_pool_score_ptr + shift_base + d_offs * pool_stride_d, mask=d_mask, other=0.0)
+            src_is_write = (src_t == write_pos)
+            shift_kv = tl.where(src_is_write, new_kv_b, src_kv)
+            shift_score = tl.where(src_is_write, new_score_b, src_score)
+            tl.store(kv_pool_kv_ptr + pool_base_t + d_offs * pool_stride_d, shift_kv, mask=d_mask)
+            tl.store(kv_pool_score_ptr + pool_base_t + d_offs * pool_stride_d, shift_score, mask=d_mask)
+        elif is_write_slot:
+            tl.store(kv_pool_kv_ptr + pool_base_t + d_offs * pool_stride_d, new_kv_b, mask=d_mask)
+            tl.store(kv_pool_score_ptr + pool_base_t + d_offs * pool_stride_d, new_score_b, mask=d_mask)
+    else:
+        if is_write_slot:
+            tl.store(kv_pool_kv_ptr + pool_base_t + d_offs * pool_stride_d, new_kv_b, mask=d_mask)
+            tl.store(kv_pool_score_ptr + pool_base_t + d_offs * pool_stride_d, new_score_b, mask=d_mask)
+
+
+def compress_decode_kv_pool_fused_v2(
+    kv_pool_kv: torch.Tensor,
+    kv_pool_score: torch.Tensor,
+    req_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    new_kv: torch.Tensor,
+    new_score: torch.Tensor,
+    ape_score: torch.Tensor,
+    ratio: int,
+    overlap: bool,
+    head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Phase 2: includes overlap_transform_decode in the kernel.
+
+    Output shape: (bs, T=coff*ratio, head_dim).
+    For overlap=False: head_dim == D, no transform applied.
+    For overlap=True: output is the post-overlap-transform shape (skips the cat ops).
+
+    IMPORTANT: caller MUST stop calling overlap_transform_decode separately.
+    """
+    bs = req_indices.shape[0]
+    num_reqs, T, D = kv_pool_kv.shape
+    assert kv_pool_score.shape == kv_pool_kv.shape
+    assert new_kv.shape == (bs, D)
+    assert new_score.shape == (bs, D)
+    assert ape_score.shape == (ratio, D), (
+        f"ape {ape_score.shape} expected ({ratio}, {D})"
+    )
+
+    if overlap:
+        coff = T // ratio
+        assert coff == 2, f"v2 only handles coff=2 (overlap=True ratio=4)"
+        assert head_dim * coff == D, f"head_dim*coff={head_dim*coff} vs D={D}"
+        OUT_D = head_dim
+    else:
+        assert head_dim == D, f"overlap=False requires head_dim={D} (D); got {head_dim}"
+        OUT_D = D
+
+    out_kv = torch.empty(bs, T, OUT_D, dtype=kv_pool_kv.dtype, device=kv_pool_kv.device)
+    out_score = torch.empty(bs, T, OUT_D, dtype=kv_pool_score.dtype, device=kv_pool_score.device)
+
+    # Phase 2 grid sizes by FULL D (same as Phase 1) so pool side-effects
+    # cover the entire d-dim. Output writes are selectively masked to the
+    # transformed positions.
+    BLOCK_D = min(triton.next_power_of_2(D), 512)
+    grid = (bs, T, triton.cdiv(D, BLOCK_D))
+
+    _compress_decode_kv_pool_kernel_v2[grid](
+        kv_pool_kv, kv_pool_score,
+        req_indices, seq_lens,
+        new_kv, new_score,
+        ape_score,
+        out_kv, out_score,
+        kv_pool_kv.stride(0), kv_pool_kv.stride(1), kv_pool_kv.stride(2),
+        new_kv.stride(0), new_kv.stride(1),
+        ape_score.stride(0), ape_score.stride(1),
+        out_kv.stride(0), out_kv.stride(1), out_kv.stride(2),
+        bs, T=T, D=D, HEAD_DIM=OUT_D, RATIO=ratio, OVERLAP=overlap,
+        BLOCK_D=BLOCK_D,
+    )
+    return out_kv, out_score

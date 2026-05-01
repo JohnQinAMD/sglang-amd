@@ -157,28 +157,160 @@ def perf_compare(name, num_reqs, bs, ratio, overlap, head_dim):
         print(f"  GRAPH: skipped ({type(e).__name__}: {e})")
 
 
+# Main __main__ block at end of file; runs both Phase 1 + Phase 2 if available
+
+
+# ===========================================================================
+# Phase 2 — extend to absorb overlap_transform_decode
+# ===========================================================================
+def correctness_v2(name, num_reqs, bs, ratio, overlap, head_dim):
+    print(f"\n=== V2 {name}: bs={bs} ratio={ratio} overlap={overlap} head_dim={head_dim} ===")
+    args = make_inputs(num_reqs, bs, ratio, overlap, head_dim)
+    pool_kv_ref = args[0].clone()
+    pool_score_ref = args[1].clone()
+    pool_kv_t = args[0].clone()
+    pool_score_t = args[1].clone()
+    req_indices, seq_lens, new_kv, new_score, ape_score, ratio_, overlap_ = args[2:]
+
+    from sglang.jit_kernel.compress_decode_kv_pool_fused_triton import (
+        _compress_decode_kv_pool_v2_reference,
+        compress_decode_kv_pool_fused_v2,
+    )
+
+    out_kv_ref, out_score_ref = _compress_decode_kv_pool_v2_reference(
+        pool_kv_ref, pool_score_ref,
+        req_indices, seq_lens,
+        new_kv, new_score,
+        ape_score, ratio_, overlap_, head_dim,
+    )
+    out_kv_t, out_score_t = compress_decode_kv_pool_fused_v2(
+        pool_kv_t, pool_score_t,
+        req_indices, seq_lens,
+        new_kv, new_score,
+        ape_score, ratio_, overlap_, head_dim,
+    )
+
+    print(f"  ref shapes:    kv={tuple(out_kv_ref.shape)} score={tuple(out_score_ref.shape)}")
+    print(f"  triton shapes: kv={tuple(out_kv_t.shape)} score={tuple(out_score_t.shape)}")
+
+    assert out_kv_t.shape == out_kv_ref.shape
+    assert out_score_t.shape == out_score_ref.shape
+
+    diff_out_kv = (out_kv_ref.float() - out_kv_t.float()).abs()
+    diff_out_score = (out_score_ref.float() - out_score_t.float()).abs()
+    diff_pool_kv = (pool_kv_ref.float() - pool_kv_t.float()).abs()
+    diff_pool_score = (pool_score_ref.float() - pool_score_t.float()).abs()
+
+    print(f"  out_kv:    max={diff_out_kv.max().item():.2e}")
+    print(f"  out_score: max={diff_out_score.max().item():.2e}")
+    print(f"  pool_kv:   max={diff_pool_kv.max().item():.2e}")
+    print(f"  pool_score:max={diff_pool_score.max().item():.2e}")
+
+    ULP = 1e-2
+    PASS = (
+        diff_out_kv.max().item() <= ULP
+        and diff_out_score.max().item() <= 5e-2
+        and diff_pool_kv.max().item() <= ULP
+        and diff_pool_score.max().item() <= ULP
+    )
+    print(f"  RESULT: {'PASS' if PASS else 'FAIL'}")
+    return PASS
+
+
+def perf_compare_v2(name, num_reqs, bs, ratio, overlap, head_dim):
+    print(f"\n--- V2 perf {name}: bs={bs} ratio={ratio} ---")
+    args = make_inputs(num_reqs, bs, ratio, overlap, head_dim)
+
+    from sglang.jit_kernel.compress_decode_kv_pool_fused_triton import (
+        _compress_decode_kv_pool_v2_reference,
+        compress_decode_kv_pool_fused_v2,
+        compress_decode_kv_pool_fused,
+    )
+
+    def _ref():
+        pool_kv = args[0].clone()
+        pool_score = args[1].clone()
+        return _compress_decode_kv_pool_v2_reference(
+            pool_kv, pool_score, args[2], args[3], args[4], args[5], args[6],
+            args[7], args[8], head_dim,
+        )
+
+    def _v2():
+        pool_kv = args[0].clone()
+        pool_score = args[1].clone()
+        return compress_decode_kv_pool_fused_v2(
+            pool_kv, pool_score, args[2], args[3], args[4], args[5], args[6],
+            args[7], args[8], head_dim,
+        )
+
+    def _v1_then_xform():
+        # Phase 1 + manual overlap_transform_decode (the SHIPPED path)
+        pool_kv = args[0].clone()
+        pool_score = args[1].clone()
+        out_kv, out_score = compress_decode_kv_pool_fused(
+            pool_kv, pool_score, args[2], args[3], args[4], args[5], args[6],
+            args[7], args[8],
+        )
+        if overlap:
+            r, d = ratio, head_dim
+            out_kv = torch.cat((out_kv[:, :r, :d], out_kv[:, r:, d:]), dim=1)
+            out_score = torch.cat((out_score[:, :r, :d], out_score[:, r:, d:]), dim=1)
+        return out_kv, out_score
+
+    us_ref_e = time_kernel_eager(_ref)
+    us_v1_e = time_kernel_eager(_v1_then_xform)
+    us_v2_e = time_kernel_eager(_v2)
+    print(f"  EAGER: ref={us_ref_e:.2f} us  v1+xform={us_v1_e:.2f} us  v2={us_v2_e:.2f} us  speedup_v2/v1={us_v1_e/us_v2_e:.2f}x")
+
+    try:
+        us_ref_g = time_kernel_graph(_ref, ())
+        us_v1_g = time_kernel_graph(_v1_then_xform, ())
+        us_v2_g = time_kernel_graph(_v2, ())
+        print(f"  GRAPH: ref={us_ref_g:.2f} us  v1+xform={us_v1_g:.2f} us  v2={us_v2_g:.2f} us  speedup_v2/v1={us_v1_g/us_v2_g:.2f}x")
+    except Exception as e:
+        print(f"  GRAPH: skipped ({e})")
+
+
 if __name__ == "__main__":
-    # G0 — correctness on production-aligned shapes
-    head_dim = 192  # DSv4 head_dim (128 nope + 64 rope)
-    results = []
-    for bs in (1, 2, 4, 6, 8):
-        # ratio=4 overlap=True (the c4 path — dominant)
-        results.append(("c4_r4", bs, correctness(f"c4_r4 bs={bs}", 1024, bs, 4, True, head_dim)))
-    # ratio=128 overlap=False (the c128 path)
-    for bs in (1, 4):
-        results.append(("c128", bs, correctness(f"c128 bs={bs}", 256, bs, 128, False, head_dim)))
+    head_dim = 192
+    do_v1 = "v2" not in sys.argv  # default: run v1; "--v2-only" suppresses
+    do_v2 = True  # always run v2 if available
 
-    print("\n=== correctness summary ===")
-    for n, bs, ok in results:
-        print(f"  {n:8s} bs={bs:2d}  {'PASS' if ok else 'FAIL'}")
-    all_pass = all(r[2] for r in results)
-    print(f"OVERALL CORRECTNESS: {'PASS' if all_pass else 'FAIL'}")
+    if do_v1:
+        # ----- V1 (Phase 1) -----
+        results = []
+        for bs in (1, 2, 4, 6, 8):
+            results.append(("c4_r4", bs, correctness(f"c4_r4 bs={bs}", 1024, bs, 4, True, head_dim)))
+        for bs in (1, 4):
+            results.append(("c128", bs, correctness(f"c128 bs={bs}", 256, bs, 128, False, head_dim)))
+        print("\n=== V1 correctness summary ===")
+        for n, bs, ok in results:
+            print(f"  {n:8s} bs={bs:2d}  {'PASS' if ok else 'FAIL'}")
+        all_v1 = all(r[2] for r in results)
+        print(f"V1 OVERALL: {'PASS' if all_v1 else 'FAIL'}")
+        if all_v1:
+            print("\n========== V1 PERF ==========")
+            for bs in (1, 4, 8):
+                perf_compare(f"c4_r4 bs={bs}", 1024, bs, 4, True, head_dim)
 
-    if not all_pass:
-        sys.exit(1)
+    if do_v2:
+        # ----- V2 (Phase 2) -----
+        print("\n========== V2 CORRECTNESS ==========")
+        v2_results = []
+        for bs in (1, 2, 4, 6, 8):
+            v2_results.append(("c4_r4", bs, correctness_v2(f"c4_r4 bs={bs}", 1024, bs, 4, True, head_dim)))
+        for bs in (1, 4):
+            v2_results.append(("c128", bs, correctness_v2(f"c128 bs={bs}", 256, bs, 128, False, head_dim)))
 
-    # G1 — perf compare (only run if correctness PASS)
-    print("\n\n========== PERF ==========")
-    for bs in (1, 4, 8):
-        perf_compare(f"c4_r4 bs={bs}", 1024, bs, 4, True, head_dim)
+        print("\n=== V2 correctness summary ===")
+        for n, bs, ok in v2_results:
+            print(f"  {n:8s} bs={bs:2d}  {'PASS' if ok else 'FAIL'}")
+        all_v2 = all(r[2] for r in v2_results)
+        print(f"V2 OVERALL: {'PASS' if all_v2 else 'FAIL'}")
+
+        if all_v2:
+            print("\n========== V2 PERF ==========")
+            for bs in (1, 4, 8):
+                perf_compare_v2(f"c4_r4 bs={bs}", 1024, bs, 4, True, head_dim)
+
     sys.exit(0)

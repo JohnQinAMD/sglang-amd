@@ -1572,7 +1572,36 @@ class Compressor(nn.Module):
         _use_fused_pool = (
             os.environ.get("SGLANG_FUSED_COMPRESS_DECODE_KV_POOL", "0") == "1"
         )
-        if _use_fused_pool:
+        # 2026-05-01 Phase 2: V2 absorbs overlap_transform_decode into the kernel.
+        # Microbench-validated 1.84-2.33x graph-replay speedup vs V1+xform on
+        # c4 ratio=4 production shapes. Default OFF; gated by env knob.
+        # When ON, output is already at (bs, ratio*coff, head_dim) shape and the
+        # downstream `if self.overlap: ... overlap_transform_decode ...` block
+        # at L1641-1651 is skipped (output shape doesn't need transform).
+        _use_fused_pool_v2 = (
+            os.environ.get("SGLANG_FUSED_COMPRESS_DECODE_KV_POOL_V2", "0") == "1"
+        )
+        # V2 implies V1 path (V2 builds on V1's kernel)
+        if _use_fused_pool_v2:
+            _use_fused_pool = True
+        if _use_fused_pool and _use_fused_pool_v2:
+            from sglang.jit_kernel.compress_decode_kv_pool_fused_triton import (
+                compress_decode_kv_pool_fused_v2,
+            )
+            out_kv, out_score = compress_decode_kv_pool_fused_v2(
+                kv_and_score_states_pool.kv,
+                kv_and_score_states_pool.score,
+                req_pool_indices,
+                seq_lens,
+                kv_and_scores.kv,
+                kv_and_scores.score,
+                self.ape,
+                self.ratio,
+                self.overlap,
+                self.head_dim,
+            )
+            kv_and_score_to_compress = KVAndScoreOld(kv=out_kv, score=out_score)
+        elif _use_fused_pool:
             from sglang.jit_kernel.compress_decode_kv_pool_fused_triton import (
                 compress_decode_kv_pool_fused,
             )
@@ -1620,7 +1649,10 @@ class Compressor(nn.Module):
                 kv_and_score_to_compress.score + self.ape.unsqueeze(0)
             )
 
-        if self.overlap:
+        if self.overlap and not _use_fused_pool_v2:
+            # V2 absorbs overlap_transform_decode into the fused kernel —
+            # output is already at (bs, ratio*coff, head_dim) so this block
+            # is skipped when V2 is on.
             # shape: [bs, coff * ratio, coff * head_dim]
             kv_and_score_to_compress = kv_and_score_to_compress.view(
                 bs, self.coff * self.ratio, self.coff * self.head_dim
