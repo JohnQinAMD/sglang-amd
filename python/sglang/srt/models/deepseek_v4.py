@@ -1562,36 +1562,63 @@ class Compressor(nn.Module):
         req_pool_indices = forward_batch.req_pool_indices
 
         bs = kv_and_scores.kv.size(0)
-        write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
-        kv_and_score_states_pool[req_pool_indices, write_pos] = kv_and_scores
 
-        # NOTE: need to copy out before modifying overlap states
-        # kv_states: [bs, coff * ratio, coff * head_dim]
-        kv_and_score_to_compress = kv_and_score_states_pool[req_pool_indices]
-
-        if self.overlap:
-            # Shift just compressed kv states left by ratio
-            should_shift = seq_lens % self.ratio == 0
-            kv_and_score_states_pool[req_pool_indices, : self.ratio] = KVAndScore(
-                kv=torch.where(
-                    should_shift[:, None, None],
-                    kv_and_score_to_compress.kv[:, self.ratio :],
-                    kv_and_score_to_compress.kv[:, : self.ratio],
-                ),
-                score=torch.where(
-                    should_shift[:, None, None],
-                    kv_and_score_to_compress.score[:, self.ratio :],
-                    kv_and_score_to_compress.score[:, : self.ratio],
-                ),
+        # 2026-05-01: optional fused kv_pool maintain + gather + APE add Triton
+        # kernel (compress_decode_kv_pool_fused). Replaces 5+ launches with 1.
+        # Microbench-validated 8x graph-replay speedup on c4 ratio=4 production
+        # shapes. Default OFF; gated by SGLANG_FUSED_COMPRESS_DECODE_KV_POOL=1.
+        # Pending E2E live smoke + TPOT bench gate (per the M1/B-pre/hc_pre
+        # microbench-pass-but-E2E-fail lessons).
+        _use_fused_pool = (
+            os.environ.get("SGLANG_FUSED_COMPRESS_DECODE_KV_POOL", "0") == "1"
+        )
+        if _use_fused_pool:
+            from sglang.jit_kernel.compress_decode_kv_pool_fused_triton import (
+                compress_decode_kv_pool_fused,
             )
+            out_kv, out_score = compress_decode_kv_pool_fused(
+                kv_and_score_states_pool.kv,
+                kv_and_score_states_pool.score,
+                req_pool_indices,
+                seq_lens,
+                kv_and_scores.kv,
+                kv_and_scores.score,
+                self.ape,
+                self.ratio,
+                self.overlap,
+            )
+            kv_and_score_to_compress = KVAndScoreOld(kv=out_kv, score=out_score)
+        else:
+            write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
+            kv_and_score_states_pool[req_pool_indices, write_pos] = kv_and_scores
 
-        # shape: [bs * coff, ratio, coff * head_dim]
-        kv_and_score_to_compress = kv_and_score_to_compress.view(
-            -1, self.ratio, self.coff * self.head_dim
-        )
-        kv_and_score_to_compress.score = (
-            kv_and_score_to_compress.score + self.ape.unsqueeze(0)
-        )
+            # NOTE: need to copy out before modifying overlap states
+            # kv_states: [bs, coff * ratio, coff * head_dim]
+            kv_and_score_to_compress = kv_and_score_states_pool[req_pool_indices]
+
+            if self.overlap:
+                # Shift just compressed kv states left by ratio
+                should_shift = seq_lens % self.ratio == 0
+                kv_and_score_states_pool[req_pool_indices, : self.ratio] = KVAndScore(
+                    kv=torch.where(
+                        should_shift[:, None, None],
+                        kv_and_score_to_compress.kv[:, self.ratio :],
+                        kv_and_score_to_compress.kv[:, : self.ratio],
+                    ),
+                    score=torch.where(
+                        should_shift[:, None, None],
+                        kv_and_score_to_compress.score[:, self.ratio :],
+                        kv_and_score_to_compress.score[:, : self.ratio],
+                    ),
+                )
+
+            # shape: [bs * coff, ratio, coff * head_dim]
+            kv_and_score_to_compress = kv_and_score_to_compress.view(
+                -1, self.ratio, self.coff * self.head_dim
+            )
+            kv_and_score_to_compress.score = (
+                kv_and_score_to_compress.score + self.ape.unsqueeze(0)
+            )
 
         if self.overlap:
             # shape: [bs, coff * ratio, coff * head_dim]
