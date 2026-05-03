@@ -208,7 +208,13 @@ def triton_sparse_attn_decode(
 
     q = q.contiguous()
     gathered_kv = gathered_kv.contiguous()
-    invalid_mask_u8 = invalid_mask.to(torch.uint8).contiguous()
+    # bool tensor and uint8 share itemsize=1; use .view() (bit-reinterpret, free)
+    # instead of .to(uint8) (allocates + copies). Skip the trailing .contiguous()
+    # too — bool→uint8 view preserves contiguity, and upstream callers always
+    # produce contiguous masks (M3 megakernel buf, ref.py compute path).
+    invalid_mask_u8 = invalid_mask.view(torch.uint8)
+    if not invalid_mask_u8.is_contiguous():
+        invalid_mask_u8 = invalid_mask_u8.contiguous()
 
     out = torch.empty((BS, Hq, d_v), dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((BS, Hq), dtype=torch.float32, device=q.device)
@@ -457,7 +463,13 @@ def triton_sparse_attn_decode_split_k(
 
     q = q.contiguous()
     gathered_kv = gathered_kv.contiguous()
-    invalid_mask_u8 = invalid_mask.to(torch.uint8).contiguous()
+    # bool tensor and uint8 share itemsize=1; use .view() (bit-reinterpret, free)
+    # instead of .to(uint8) (allocates + copies). Skip the trailing .contiguous()
+    # too — bool→uint8 view preserves contiguity, and upstream callers always
+    # produce contiguous masks (M3 megakernel buf, ref.py compute path).
+    invalid_mask_u8 = invalid_mask.view(torch.uint8)
+    if not invalid_mask_u8.is_contiguous():
+        invalid_mask_u8 = invalid_mask_u8.contiguous()
 
     # Staging buffers
     m_part = torch.empty((BS, Hq, SPLIT_K), dtype=torch.float32, device=q.device)
