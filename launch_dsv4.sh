@@ -85,6 +85,14 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_HIP="${SGLANG_FP8_PAGED_MQA_LOGITS_HIP:-0}"
 #   knob ON (aiter): TPOT 24.60 / total 316.83 tok/s / output 157.35 tok/s  (-1.06 ms / +10%)
 # Recovers the doc TL;DR's 24.52 / 316.47 / 157.17 numbers exactly within noise (±0.13 ms TPOT).
 export SGLANG_FP8_PAGED_MQA_LOGITS_AITER="${SGLANG_FP8_PAGED_MQA_LOGITS_AITER:-1}"
+# 2026-05-03: SGLANG_PHASE_G_FOLD=1 default-ON. Folds the page-index math chain
+# (clamp_min + // + %) into `_fused_gather_dequant_model1_kernel_g_fold` epilogue,
+# eliminating ~6 elementwise launches per sparse-attn layer (clamp + div_floor +
+# remainder + Compare + BitwiseOr) at flashmla_tests/quant.py:458-460. Block_size
+# in production = 256 (pow2), so the bit-shift fast path is enabled. Expected
+# −0.5 to −1.0 ms TPOT per profile analysis (43 layers × ~6 us/layer dispatch
+# overhead saved). A/B verified 2026-05-03 (see daily-updates/2026-05-03.md).
+export SGLANG_PHASE_G_FOLD="${SGLANG_PHASE_G_FOLD:-1}"
 # E2E A/B (chi2811 c=4 max=6, ISL=OSL=1024 num=16, 16/16 successful):
 #   torch (default):       TPOT 45.25 ms   throughput 85.95 tok/s
 #   FUSED_TRITON:          TPOT 49.81 ms   throughput 78.25 tok/s   (+4.6 ms)

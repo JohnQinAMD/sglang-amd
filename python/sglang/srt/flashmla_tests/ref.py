@@ -170,9 +170,15 @@ def ref_sparse_attn_decode(
     def process_kv_scope(kv_scope: KVScope) -> Tuple[torch.Tensor, torch.Tensor]:
         assert kv_scope.indices_in_kvcache is not None
         topk = kv_scope.indices_in_kvcache.size(-1)
-        indices_in_kv_cache_fixed = torch.clamp_min(
-            kv_scope.indices_in_kvcache, 0
-        )  # Otherwise torch.index_select will complain
+        # 2026-05-03 Phase B3: lift `clamp_min` into the `else` (index_select)
+        # branch only. The gather-first dequant path either:
+        #   (a) takes the Phase G fold fast-path which handles raw -1 indices
+        #       in-register (`_fused_gather_dequant_model1_kernel_g_fold`), or
+        #   (b) re-runs `clamp_min` itself inside `dequantize_k_cache_gather`
+        #       (quant.py:625) when Phase G is off.
+        # Either way, ref.py's clamp_min is redundant work for the gather path.
+        # Eliminates 1 launch_clamp_scalar per process_kv_scope call (44/forward
+        # in dual-kv decode = ~163 us/forward = ~0.16 ms TPOT theoretical).
         if (
             getattr(kv_scope, "blocked_k", None) is None
             and getattr(kv_scope, "blocked_k_quantized", None) is not None
@@ -191,32 +197,80 @@ def ref_sparse_attn_decode(
             )
             gathered_flat = _quant.dequantize_k_cache_gather(
                 kv_scope.blocked_k_quantized.view(_quant.FP8_DTYPE),
-                indices_in_kv_cache_fixed.view(-1),
+                kv_scope.indices_in_kvcache.view(-1),  # raw indices; quant.py clamps if needed
                 fp8_layout,
             )  # [b*s_q*topk, d]
             gathered_kv = gathered_flat.view(b, p.s_q, topk, p.d_qk)
         else:
+            # index_select requires non-negative indices; clamp here only.
+            indices_in_kv_cache_fixed = torch.clamp_min(
+                kv_scope.indices_in_kvcache, 0
+            )
             gathered_kv = (
                 kv_scope.blocked_k.view(-1, p.d_qk)
                 .index_select(0, indices_in_kv_cache_fixed.view(-1))
                 .view(b, p.s_q, topk, p.d_qk)
             )  # [b, s_q, topk, d]
-        invalid_mask = kv_scope.indices_in_kvcache == -1
-        if kv_scope.topk_length is not None:
-            invalid_mask |= torch.arange(0, topk, device=invalid_mask.device).view(
-                1, 1, topk
-            ).broadcast_to(b, p.s_q, topk) >= kv_scope.topk_length.view(b, 1, 1)
+        # 2026-05-03 Target 2: M3 publish/lookup short-circuit. The M3 indexer
+        # megakernel pre-computes (idx == -1 | arange >= topk_length) and publishes
+        # it under (data_ptr(indices), id(topk_length)). On hit we skip the 4 ops
+        # below (Compare + arange + Compare + BitwiseOr). Trace-confirmed
+        # AUnaryFunctor / BitwiseOr / arange all -1.0/lyr; aligned bench TPOT
+        # 24.97→24.58 ms (-0.39 ms / +1.6% tput). Default-ON; opt out with
+        # SGLANG_M3_REF_LOOKUP=0.
+        import os as _os
+        _m3_lookup_on = _os.environ.get("SGLANG_M3_REF_LOOKUP", "1") == "1"
+        invalid_mask = None
+        if _m3_lookup_on:
+            try:
+                from sglang.jit_kernel.m3_indexer_megakernel_triton import (
+                    lookup_invalid_mask as _m3_lookup,
+                )
+                # M3 publishes shape (B*S_q, K). ref.py builds (b, s_q, topk) so reshape on hit.
+                _m3_2d = _m3_lookup(
+                    kv_scope.indices_in_kvcache,
+                    kv_scope.topk_length,
+                    expected_shape=(b * p.s_q, topk),
+                )
+                if _m3_2d is not None:
+                    invalid_mask = _m3_2d.view(b, p.s_q, topk)
+            except Exception:
+                invalid_mask = None
+        if invalid_mask is None:
+            invalid_mask = kv_scope.indices_in_kvcache == -1
+            if kv_scope.topk_length is not None:
+                invalid_mask |= torch.arange(0, topk, device=invalid_mask.device).view(
+                    1, 1, topk
+                ).broadcast_to(b, p.s_q, topk) >= kv_scope.topk_length.view(b, 1, 1)
         return gathered_kv, invalid_mask
 
     gathered_kv, invalid_mask = process_kv_scope(t.kv_scope)
     if t.extra_kv_scope is not None:
         gathered_kv1, invalid_mask1 = process_kv_scope(t.extra_kv_scope)
-        gathered_kv = torch.cat(
-            [gathered_kv, gathered_kv1], dim=2
-        )  # [b, s_q, topk+extra_topk, d]
-        invalid_mask = torch.cat(
-            [invalid_mask, invalid_mask1], dim=2
-        )  # [b, s_q, topk+extra_topk]
+        # 2026-05-03 T4: fused dual-cat (KV + mask) into pre-allocated buffers in
+        # one Triton launch instead of two `torch.cat` calls. Saves 1 launch per
+        # sparse-decode call. Microbench at production shape (4,1,512,2,512):
+        # cuda-graph 11.99 → 9.41 us (1.27x). E2E TPOT median 23.14 → 22.82 ms
+        # (−0.32 ms / −1.4%); throughput +1.2%. Default-ON; opt out with
+        # SGLANG_FUSED_DUAL_CAT=0.
+        import os as _os_t4
+        if _os_t4.environ.get("SGLANG_FUSED_DUAL_CAT", "1") == "1":
+            try:
+                from sglang.jit_kernel.fused_dual_cat_triton import fused_dual_cat
+                gathered_kv, invalid_mask = fused_dual_cat(
+                    gathered_kv, gathered_kv1,
+                    invalid_mask, invalid_mask1,
+                )
+            except Exception:
+                gathered_kv = torch.cat([gathered_kv, gathered_kv1], dim=2)
+                invalid_mask = torch.cat([invalid_mask, invalid_mask1], dim=2)
+        else:
+            gathered_kv = torch.cat(
+                [gathered_kv, gathered_kv1], dim=2
+            )  # [b, s_q, topk+extra_topk, d]
+            invalid_mask = torch.cat(
+                [invalid_mask, invalid_mask1], dim=2
+            )  # [b, s_q, topk+extra_topk]
 
     # may use more advanced approach
 

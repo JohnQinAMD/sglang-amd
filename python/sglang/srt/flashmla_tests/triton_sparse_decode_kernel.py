@@ -206,9 +206,22 @@ def triton_sparse_attn_decode(
             waves_per_eu=2, matrix_instr_nonkdim=16,
         )
 
-    q = q.contiguous()
-    gathered_kv = gathered_kv.contiguous()
-    invalid_mask_u8 = invalid_mask.to(torch.uint8).contiguous()
+    # 2026-05-03 Phase A3: skip `.contiguous()` when the tensor is already
+    # contiguous (the production case: ref.py:75-82 already runs `.contiguous()`
+    # on q + gathered_kv before calling here). Preserves correctness via the
+    # `is_contiguous()` guard while cutting Python overhead and any redundant
+    # bf16_copy launches if upstream ever produces a non-contig input.
+    if not q.is_contiguous():
+        q = q.contiguous()
+    if not gathered_kv.is_contiguous():
+        gathered_kv = gathered_kv.contiguous()
+    # bool tensor and uint8 share itemsize=1; use .view() (bit-reinterpret, free)
+    # instead of .to(uint8) (allocates + copies). Skip the trailing .contiguous()
+    # too — bool→uint8 view preserves contiguity, and upstream callers always
+    # produce contiguous masks (M3 megakernel buf, ref.py compute path).
+    invalid_mask_u8 = invalid_mask.view(torch.uint8)
+    if not invalid_mask_u8.is_contiguous():
+        invalid_mask_u8 = invalid_mask_u8.contiguous()
 
     out = torch.empty((BS, Hq, d_v), dtype=torch.bfloat16, device=q.device)
     lse = torch.empty((BS, Hq), dtype=torch.float32, device=q.device)
@@ -455,9 +468,22 @@ def triton_sparse_attn_decode_split_k(
     BS2, Topk, _ = gathered_kv.shape
     assert BS == BS2
 
-    q = q.contiguous()
-    gathered_kv = gathered_kv.contiguous()
-    invalid_mask_u8 = invalid_mask.to(torch.uint8).contiguous()
+    # 2026-05-03 Phase A3: skip `.contiguous()` when the tensor is already
+    # contiguous (the production case: ref.py:75-82 already runs `.contiguous()`
+    # on q + gathered_kv before calling here). Preserves correctness via the
+    # `is_contiguous()` guard while cutting Python overhead and any redundant
+    # bf16_copy launches if upstream ever produces a non-contig input.
+    if not q.is_contiguous():
+        q = q.contiguous()
+    if not gathered_kv.is_contiguous():
+        gathered_kv = gathered_kv.contiguous()
+    # bool tensor and uint8 share itemsize=1; use .view() (bit-reinterpret, free)
+    # instead of .to(uint8) (allocates + copies). Skip the trailing .contiguous()
+    # too — bool→uint8 view preserves contiguity, and upstream callers always
+    # produce contiguous masks (M3 megakernel buf, ref.py compute path).
+    invalid_mask_u8 = invalid_mask.view(torch.uint8)
+    if not invalid_mask_u8.is_contiguous():
+        invalid_mask_u8 = invalid_mask_u8.contiguous()
 
     # Staging buffers
     m_part = torch.empty((BS, Hq, SPLIT_K), dtype=torch.float32, device=q.device)

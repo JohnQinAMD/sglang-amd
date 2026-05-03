@@ -35,6 +35,7 @@ from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_contex
 from sglang.srt.layers.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     fused_rmsnorm_rope_q_triton,
+    fused_rmsnorm_rope_q_triton_to_out,
 )
 # M1 megakernel — fuses kv-side RoPE + per-tile FP8 quant + paged scatter.
 # Gated by envs.SGLANG_M1_KV_WRITE_WITH_ROPE (default OFF).
@@ -67,6 +68,24 @@ try:
     )
 except Exception:  # pragma: no cover - import-time fallback only
     _aiter_fused_qk_rmsnorm = None
+
+# 2026-05-02: aiter `fused_qk_rmsnorm_group_quant` fuses ALL THREE in one launch:
+# q_norm + per-128 fp8 quant on q + kv_norm. Strict superset of both
+# `_aiter_fused_qk_rmsnorm` (only norms, no quant) and `_fused_rmsnorm_per1x128_quant`
+# (only q's norm+quant, kv_norm fires separately). Output:
+#   q_out_quantized: fp8 [bs, q_dim]      → wq_b((fp8, scale))
+#   q_out_scale:     fp32 [bs, q_dim/128]
+#   k_out:           bf16 [bs, kv_dim]     → kv path (rope + attn) unchanged
+#   q_out_unquantized (optional): bf16 q   → q_lora for indexer
+# Gated via SGLANG_AITER_QK_RMSNORM_GROUP_QUANT=1; default OFF.
+try:
+    from aiter import fused_qk_rmsnorm_group_quant as _aiter_fused_qk_rmsnorm_group_quant
+except Exception:  # pragma: no cover - import-time fallback only
+    _aiter_fused_qk_rmsnorm_group_quant = None
+_AITER_QK_RMSNORM_GROUP_QUANT = (
+    os.environ.get("SGLANG_AITER_QK_RMSNORM_GROUP_QUANT", "0") == "1"
+    and _aiter_fused_qk_rmsnorm_group_quant is not None
+)
 
 # A2-#1: fuse (rmsnorm + per-1x128 fp8 quant) into one Triton launch on the
 # q_norm → wq_b path. Default OFF; enable via SGLANG_FUSED_RMSNORM_QUANT_PER1x128=1.
@@ -116,6 +135,24 @@ try:
     )
 except Exception:
     _decode_body_block_a_megakernel = None
+
+# Decode-body megakernel — Block B-pre (wo_b prologue). Phase 2 wire-in stub.
+# Replaces the 2-op chain (per-1x128 quant → wo_b fp8 GEMM) with one Triton
+# kernel. Default OFF; gated by SGLANG_DECODE_BODY_BLOCK_B_PRE=1. Microbench
+# at chi2774 GPU 0 shows G0 PASS (5 shapes, max_abs_diff <= 0.0137 bf16 ULP
+# floor) and 5.41x graph-replay weighted speedup over the 2-op torch path.
+# E2E activation gated by user — wo_b's downstream is AllReduce, so per-step
+# kernel-time savings may be absorbed by the cross-rank rendezvous (see
+# `feedback_critical_path_gate_before_fusion_wire_in.md`). Block A landed
+# despite the same concern via concurrency-saturation; B-pre needs the same
+# E2E proof before flipping default-ON.
+_DECODE_BODY_BLOCK_B_PRE = os.environ.get("SGLANG_DECODE_BODY_BLOCK_B_PRE", "0") == "1"
+try:
+    from sglang.jit_kernel.decode_body_b_pre_wo_triton import (
+        b_pre_wo_megakernel as _decode_body_block_b_pre_megakernel,
+    )
+except Exception:
+    _decode_body_block_b_pre_megakernel = None
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -1692,8 +1729,23 @@ class Compressor(nn.Module):
         )
         # Pre-compute per-bs freqs lookup (single index_select; same launch
         # the original code does for `freqs_cis = self.freqs_cis[...]`).
-        _freqs_idx = (seq_lens - 1) // self.ratio * self.ratio
-        _freqs_per_bs = torch.view_as_real(self.freqs_cis[_freqs_idx]).contiguous()  # (bs, rope_dim//2, 2)
+        # 2026-05-01: tried per-step memoization (SGLANG_FREQS_IDX_CACHE) keyed
+        # on id(forward_batch). REVERTED — Paris smoke returned "London" instead
+        # of "Paris" because Python's id() reuses memory addresses after objects
+        # are freed, causing stale-cache hits across decode steps. Same trap
+        # as feedback_data_ptr_caching_unsafe.md. Getting cross-step caching
+        # safe requires either content-hash key (sync, breaks cuda graph) or
+        # precompute-in-metadata-builder (multi-file refactor).
+        # 2026-05-02: kernel-level fusion (B200-style). One Triton kernel
+        # replaces the 4-launch chain (sub + floor_divide + mul + index_select)
+        # with a single per-batch program. Yield est: 22 layers × 3 launches
+        # eliminated × 1.5 us = 0.10 ms TPOT. Gated by SGLANG_FUSED_FREQS_IDX_GATHER=1.
+        if os.environ.get("SGLANG_FUSED_FREQS_IDX_GATHER", "0") == "1":
+            from sglang.jit_kernel.freqs_idx_gather_triton import freqs_idx_gather_triton
+            _freqs_per_bs = freqs_idx_gather_triton(seq_lens, self.freqs_cis, self.ratio)
+        else:
+            _freqs_idx = (seq_lens - 1) // self.ratio * self.ratio
+            _freqs_per_bs = torch.view_as_real(self.freqs_cis[_freqs_idx]).contiguous()  # (bs, rope_dim//2, 2)
         if compress_decode_full_triton(
             _kv_in, _score_in, None,
             _norm_w_fp32, _freqs_per_bs,
@@ -2238,6 +2290,44 @@ class MQALayer(nn.Module):
         # leave q_lora=None (not used). Future stacking can fold q_lora out.
         used_fused_q_quant = False
         if (
+            _AITER_QK_RMSNORM_GROUP_QUANT
+            and q.dtype == torch.bfloat16
+            and kv.dtype == torch.bfloat16
+            and q.shape[-1] % 128 == 0
+            # `fused_qk_rmsnorm_group_quant` runs the kv path with `k_out=bf16`,
+            # so kv stays bf16 for downstream rope+attn. Output q is fp8 +
+            # per-128 scales (consumed directly by wq_b's tuple-accept path).
+        ):
+            n = q.size(0)
+            q_dim = q.size(-1)
+            kv_dim = kv.size(-1)
+            # aiter's fused_qk_rmsnorm_group_quant requires fp8/fp4x2;
+            # use float8_e4m3fn (matches `_fused_rmsnorm_per1x128_quant` default).
+            q_fp8 = torch.empty(
+                (n, q_dim), dtype=torch.float8_e4m3fn, device=q.device
+            )
+            q_scale = torch.empty(
+                (n, q_dim // 128), dtype=torch.float32, device=q.device
+            )
+            kv_out = torch.empty_like(kv)
+            need_q_lora_bf16 = getattr(self, "indexer", None) is not None
+            q_unq = torch.empty_like(q) if need_q_lora_bf16 else None
+            _aiter_fused_qk_rmsnorm_group_quant(
+                q_fp8, q_scale,
+                q, self.q_norm.weight, self.eps,
+                q_out_unquantized=q_unq,
+                k_out=kv_out,
+                k=kv, k_weight=self.kv_norm.weight, k_epsilon=self.eps,
+                group_size=128,
+            )
+            kv = kv_out
+            if need_q_lora_bf16:
+                q_lora = q_unq
+            else:
+                q_lora = None
+            q, _ = self.wq_b((q_fp8, q_scale))
+            used_fused_q_quant = True
+        elif (
             _F4_MODE_A
             and q.dtype == torch.bfloat16
             and kv.dtype == torch.bfloat16
@@ -2316,11 +2406,22 @@ class MQALayer(nn.Module):
             q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         # [bs, n_local_heads, head_dim]
-        # Fused unweighted rmsnorm + RoPE on Q in one launch (saves ~25us/call,
-        # microbench 1.42x vs unfused at decode bs=8). KV rope still runs separately.
-        fused_rmsnorm_rope_q_triton(
-            q, self.freqs_cis, positions, self.eps, self.qk_rope_head_dim,
+        # 2026-05-03 Phase A1: when q_out is set (TP>1), defer RoPE until just
+        # before the q_out write — fuse rmsnorm+RoPE+strided-write into one kernel
+        # via fused_rmsnorm_rope_q_triton_to_out. Eliminates the trailing
+        # `q_out.copy_(q)` launch (~22 bf16_copy events/forward).
+        # Gated by SGLANG_FUSED_ROPE_Q_TO_OUT=1 (default OFF until E2E validates).
+        # When q_out is None (TP=1) or knob OFF, keep the existing in-place RoPE.
+        _rope_to_out_active = (
+            q_out is not None
+            and os.environ.get("SGLANG_FUSED_ROPE_Q_TO_OUT", "0") == "1"
         )
+        if not _rope_to_out_active:
+            # Fused unweighted rmsnorm + RoPE on Q in one launch (saves ~25us/call,
+            # microbench 1.42x vs unfused at decode bs=8). KV rope still runs separately.
+            fused_rmsnorm_rope_q_triton(
+                q, self.freqs_cis, positions, self.eps, self.qk_rope_head_dim,
+            )
         # M1 megakernel: fuse apply_rotary_emb_triton + quant_pack + paged scatter
         # into one Triton launch. When ON, kv-cache write happens here so the
         # downstream attn_backend.forward(save_kv_cache=...) must be False.
@@ -2390,7 +2491,14 @@ class MQALayer(nn.Module):
             )
 
         if q_out is not None:
-            q_out.copy_(q)
+            if _rope_to_out_active:
+                # Phase A1: fuse rmsnorm+RoPE+strided-write into one kernel.
+                # Replaces (in-place rope at line ~2410) + (q_out.copy_) two-launch chain.
+                fused_rmsnorm_rope_q_triton_to_out(
+                    q, q_out, self.freqs_cis, positions, self.eps, self.qk_rope_head_dim,
+                )
+            else:
+                q_out.copy_(q)
         return q, kv
 
     def forward(
@@ -2520,7 +2628,44 @@ class MQALayer(nn.Module):
         # Skipped per the task spec ("If cross-layer wiring is too invasive,
         # implement just the fused AllReduce + RMSNorm... If that's also too
         # messy, SKIP with a thorough comment").
-        o, _ = self.wo_b(o.flatten(1))
+
+        # Decode-body megakernel — Block B-pre (wo_b prologue) wire-in stub.
+        # Replaces `per-1x128 quant + wo_b fp8 GEMM` (2 launches) with one
+        # Triton kernel. AllReduce stays out-of-kernel (cross-rank).
+        # Default OFF; gated by SGLANG_DECODE_BODY_BLOCK_B_PRE=1. Microbench
+        # shows 5.41x graph-replay speedup on the 5 production shapes; E2E
+        # NOT yet measured. Activation is a separate commit.
+        o_in = o.flatten(1)
+        if (
+            _DECODE_BODY_BLOCK_B_PRE
+            and _decode_body_block_b_pre_megakernel is not None
+            and o_in.dtype == torch.bfloat16
+            and o_in.shape[-1] % 128 == 0
+            and getattr(self.wo_b, "weight_scale_inv", None) is not None
+            and self.wo_b.weight.dtype == torch.float8_e4m3fn
+        ):
+            mk_out = _decode_body_block_b_pre_megakernel(
+                o_in,
+                self.wo_b.weight,
+                self.wo_b.weight_scale_inv,
+            )
+            if mk_out is not None:
+                # Megakernel produced the pre-AR (T, hidden) bf16 output. Run
+                # AllReduce manually if reduce_results is on.
+                if (
+                    self.wo_b.reduce_results
+                    and self.wo_b.tp_size > 1
+                ):
+                    from sglang.srt.distributed import (
+                        tensor_model_parallel_all_reduce,
+                    )
+                    o = tensor_model_parallel_all_reduce(mk_out)
+                else:
+                    o = mk_out
+            else:
+                o, _ = self.wo_b(o_in)
+        else:
+            o, _ = self.wo_b(o_in)
 
         return o
 

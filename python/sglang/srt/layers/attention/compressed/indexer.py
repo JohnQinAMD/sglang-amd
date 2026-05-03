@@ -338,11 +338,20 @@ def fp8_paged_mqa_logits_aiter(
         device,
     )
     if not envs.SGLANG_INDEXER_SKIP_OUT_PREFILL.get():
-        # Default-on safe path: the deepgemm aiter kernel writes per-batch
-        # only up to context_length (see `_deepgemm_fp8_paged_mqa_logits*`
-        # store loop). Anything past per-batch seq_lens[b] would carry stale
-        # values without this fill, breaking downstream top-K masking.
-        out.fill_(float("-inf"))
+        # 2026-05-03 Target 5: all three downstream consumers
+        # (`m3_indexer_megakernel`, `topk_transform_512_triton`,
+        # `topk_transform_512_pytorch_vectorized`) mask positions past
+        # `seq_lens[b]` to -inf in their score load, so the per-call prefill
+        # of the persistent scratch is redundant. Skip when an seq_len-aware
+        # consumer is going to run; keep the fill for unknown future
+        # consumers via SGLANG_INDEXER_SKIP_OUT_PREFILL=0 force-on.
+        _seq_len_aware_consumer = (
+            os.environ.get("SGLANG_M3_INDEXER_MEGAKERNEL", "0") == "1"
+            or is_hip()  # HIP routes to topk_transform_512_triton (also masks)
+            or envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+        )
+        if not _seq_len_aware_consumer:
+            out.fill_(float("-inf"))
 
     # On HIP with Triton 3.4.0, aiter's `_deepgemm_fp8_paged_mqa_logits` only
     # supports KVBlockSize=1 (the Gluon path that handles 64 needs Triton 3.5+).
@@ -361,7 +370,25 @@ def fp8_paged_mqa_logits_aiter(
     # within a step (true for DSv4 — the global page table is set once at
     # forward-pass start). When unsafe (eager rebuild between layers), the
     # data_ptr will differ and the cache will rebuild correctly anyway.
-    if envs.SGLANG_INDEXER_PT_EXPANDED_CACHED.get():
+    # 2026-05-03 Phase A2: single sglang Triton kernel for `pt_expanded` compute.
+    # Replaces the 3-launch chain (mul + add + copy) with one fused kernel.
+    # Microbench at production (b=4, mp=64, bs=64): cuda-graph 14.17 → 9.13 us
+    # (1.55x). Saves ~5 us/c4-call × 22 c4-calls/forward = ~0.11 ms TPOT theoretical.
+    # Default-OFF; opt in via SGLANG_PT_EXPAND_TRITON=1 until E2E validates.
+    _pt_expand_triton_on = os.environ.get("SGLANG_PT_EXPAND_TRITON", "0") == "1"
+    if _pt_expand_triton_on:
+        # Always use the persistent eager-mode scratch buffer. (The cached path
+        # is unsafe per feedback_data_ptr_caching_unsafe.md and stays disabled.)
+        pt_expanded = _ensure_scratch(
+            _paged_scratch,
+            "pt_aiter_expanded",
+            (batch_size, max_pages * block_size),
+            page_table.dtype,
+            device,
+        )
+        from sglang.jit_kernel.pt_expand_triton import pt_expand as _pt_expand_kernel
+        _pt_expand_kernel(page_table, block_size, out=pt_expanded)
+    elif envs.SGLANG_INDEXER_PT_EXPANDED_CACHED.get():
         # Capture-mode flag is part of the key: a captured graph's allocations
         # bind to the capture pool. Replaying a captured graph that holds a
         # cached eager-allocated tensor (or vice-versa) would read freed
@@ -415,7 +442,15 @@ def fp8_paged_mqa_logits_aiter(
             page_table.dtype,
             device,
         )
-        torch.arange(block_size, dtype=page_table.dtype, device=device, out=arange_buf)
+        # 2026-05-03 Target 3: arange content is a pure function of block_size
+        # (constant during a run), so it's stable for the lifetime of the
+        # scratch tensor. Skip the kernel launch on subsequent calls — identity
+        # check picks up reallocations from `_ensure_scratch` (different shape
+        # / dtype / device) and refills correctly. Saves ~1 arange/lyr in the
+        # AITER hot path.
+        if _paged_scratch.get("pt_aiter_arange__filled_for") is not arange_buf:
+            torch.arange(block_size, dtype=page_table.dtype, device=device, out=arange_buf)
+            _paged_scratch["pt_aiter_arange__filled_for"] = arange_buf
         # expanded[b, j*block_size + t] = page_table[b, j] * block_size + t
         pt_expanded.copy_(
             (page_table.unsqueeze(-1) * block_size + arange_buf.view(1, 1, -1)).view(
