@@ -338,11 +338,20 @@ def fp8_paged_mqa_logits_aiter(
         device,
     )
     if not envs.SGLANG_INDEXER_SKIP_OUT_PREFILL.get():
-        # Default-on safe path: the deepgemm aiter kernel writes per-batch
-        # only up to context_length (see `_deepgemm_fp8_paged_mqa_logits*`
-        # store loop). Anything past per-batch seq_lens[b] would carry stale
-        # values without this fill, breaking downstream top-K masking.
-        out.fill_(float("-inf"))
+        # 2026-05-03 Target 5: all three downstream consumers
+        # (`m3_indexer_megakernel`, `topk_transform_512_triton`,
+        # `topk_transform_512_pytorch_vectorized`) mask positions past
+        # `seq_lens[b]` to -inf in their score load, so the per-call prefill
+        # of the persistent scratch is redundant. Skip when an seq_len-aware
+        # consumer is going to run; keep the fill for unknown future
+        # consumers via SGLANG_INDEXER_SKIP_OUT_PREFILL=0 force-on.
+        _seq_len_aware_consumer = (
+            os.environ.get("SGLANG_M3_INDEXER_MEGAKERNEL", "0") == "1"
+            or is_hip()  # HIP routes to topk_transform_512_triton (also masks)
+            or envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+        )
+        if not _seq_len_aware_consumer:
+            out.fill_(float("-inf"))
 
     # On HIP with Triton 3.4.0, aiter's `_deepgemm_fp8_paged_mqa_logits` only
     # supports KVBlockSize=1 (the Gluon path that handles 64 needs Triton 3.5+).
