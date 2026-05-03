@@ -170,9 +170,15 @@ def ref_sparse_attn_decode(
     def process_kv_scope(kv_scope: KVScope) -> Tuple[torch.Tensor, torch.Tensor]:
         assert kv_scope.indices_in_kvcache is not None
         topk = kv_scope.indices_in_kvcache.size(-1)
-        indices_in_kv_cache_fixed = torch.clamp_min(
-            kv_scope.indices_in_kvcache, 0
-        )  # Otherwise torch.index_select will complain
+        # 2026-05-03 Phase B3: lift `clamp_min` into the `else` (index_select)
+        # branch only. The gather-first dequant path either:
+        #   (a) takes the Phase G fold fast-path which handles raw -1 indices
+        #       in-register (`_fused_gather_dequant_model1_kernel_g_fold`), or
+        #   (b) re-runs `clamp_min` itself inside `dequantize_k_cache_gather`
+        #       (quant.py:625) when Phase G is off.
+        # Either way, ref.py's clamp_min is redundant work for the gather path.
+        # Eliminates 1 launch_clamp_scalar per process_kv_scope call (44/forward
+        # in dual-kv decode = ~163 us/forward = ~0.16 ms TPOT theoretical).
         if (
             getattr(kv_scope, "blocked_k", None) is None
             and getattr(kv_scope, "blocked_k_quantized", None) is not None
@@ -191,11 +197,15 @@ def ref_sparse_attn_decode(
             )
             gathered_flat = _quant.dequantize_k_cache_gather(
                 kv_scope.blocked_k_quantized.view(_quant.FP8_DTYPE),
-                indices_in_kv_cache_fixed.view(-1),
+                kv_scope.indices_in_kvcache.view(-1),  # raw indices; quant.py clamps if needed
                 fp8_layout,
             )  # [b*s_q*topk, d]
             gathered_kv = gathered_flat.view(b, p.s_q, topk, p.d_qk)
         else:
+            # index_select requires non-negative indices; clamp here only.
+            indices_in_kv_cache_fixed = torch.clamp_min(
+                kv_scope.indices_in_kvcache, 0
+            )
             gathered_kv = (
                 kv_scope.blocked_k.view(-1, p.d_qk)
                 .index_select(0, indices_in_kv_cache_fixed.view(-1))
