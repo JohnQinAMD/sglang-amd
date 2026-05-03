@@ -201,11 +201,37 @@ def ref_sparse_attn_decode(
                 .index_select(0, indices_in_kv_cache_fixed.view(-1))
                 .view(b, p.s_q, topk, p.d_qk)
             )  # [b, s_q, topk, d]
-        invalid_mask = kv_scope.indices_in_kvcache == -1
-        if kv_scope.topk_length is not None:
-            invalid_mask |= torch.arange(0, topk, device=invalid_mask.device).view(
-                1, 1, topk
-            ).broadcast_to(b, p.s_q, topk) >= kv_scope.topk_length.view(b, 1, 1)
+        # 2026-05-03 Target 2: M3 publish/lookup short-circuit. The M3 indexer
+        # megakernel pre-computes (idx == -1 | arange >= topk_length) and publishes
+        # it under (data_ptr(indices), id(topk_length)). On hit we skip the 4 ops
+        # below (Compare + arange + Compare + BitwiseOr). Trace-confirmed
+        # AUnaryFunctor / BitwiseOr / arange all -1.0/lyr; aligned bench TPOT
+        # 24.97→24.58 ms (-0.39 ms / +1.6% tput). Default-ON; opt out with
+        # SGLANG_M3_REF_LOOKUP=0.
+        import os as _os
+        _m3_lookup_on = _os.environ.get("SGLANG_M3_REF_LOOKUP", "1") == "1"
+        invalid_mask = None
+        if _m3_lookup_on:
+            try:
+                from sglang.jit_kernel.m3_indexer_megakernel_triton import (
+                    lookup_invalid_mask as _m3_lookup,
+                )
+                # M3 publishes shape (B*S_q, K). ref.py builds (b, s_q, topk) so reshape on hit.
+                _m3_2d = _m3_lookup(
+                    kv_scope.indices_in_kvcache,
+                    kv_scope.topk_length,
+                    expected_shape=(b * p.s_q, topk),
+                )
+                if _m3_2d is not None:
+                    invalid_mask = _m3_2d.view(b, p.s_q, topk)
+            except Exception:
+                invalid_mask = None
+        if invalid_mask is None:
+            invalid_mask = kv_scope.indices_in_kvcache == -1
+            if kv_scope.topk_length is not None:
+                invalid_mask |= torch.arange(0, topk, device=invalid_mask.device).view(
+                    1, 1, topk
+                ).broadcast_to(b, p.s_q, topk) >= kv_scope.topk_length.view(b, 1, 1)
         return gathered_kv, invalid_mask
 
     gathered_kv, invalid_mask = process_kv_scope(t.kv_scope)
