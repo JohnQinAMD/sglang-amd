@@ -237,11 +237,27 @@ def ref_sparse_attn_decode(
             except Exception:
                 invalid_mask = None
         if invalid_mask is None:
-            invalid_mask = kv_scope.indices_in_kvcache == -1
-            if kv_scope.topk_length is not None:
-                invalid_mask |= torch.arange(0, topk, device=invalid_mask.device).view(
-                    1, 1, topk
-                ).broadcast_to(b, p.s_q, topk) >= kv_scope.topk_length.view(b, 1, 1)
+            # 2026-05-03 Phase C1: fused Triton kernel for the chain
+            #   (idx == -1) | (arange >= topk_length)
+            # Replaces 4 launches (eq + arange + ge + bitwise_or) with 1.
+            # Default ON via SGLANG_FUSED_INVALID_MASK=1 (env-gated for safety
+            # rollback). Falls through to the legacy chain on any exception.
+            _fim_on = _os.environ.get("SGLANG_FUSED_INVALID_MASK", "1") == "1"
+            if _fim_on:
+                try:
+                    from sglang.jit_kernel.fused_invalid_mask_triton import fused_invalid_mask as _fim
+                    invalid_mask = _fim(
+                        kv_scope.indices_in_kvcache,
+                        kv_scope.topk_length,
+                    )
+                except Exception:
+                    invalid_mask = None
+            if invalid_mask is None:
+                invalid_mask = kv_scope.indices_in_kvcache == -1
+                if kv_scope.topk_length is not None:
+                    invalid_mask |= torch.arange(0, topk, device=invalid_mask.device).view(
+                        1, 1, topk
+                    ).broadcast_to(b, p.s_q, topk) >= kv_scope.topk_length.view(b, 1, 1)
         return gathered_kv, invalid_mask
 
     gathered_kv, invalid_mask = process_kv_scope(t.kv_scope)
