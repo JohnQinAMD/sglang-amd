@@ -342,9 +342,104 @@ def _try_import_triton_dequant():
                 mask=rmask[:, None],
             )
 
+        # ------------------------------------------------------------------
+        # Phase G fold: explicit bit-shift + mask version of the gather kernel.
+        # When BLOCK_SIZE is a power of 2 (DSv4 production: 256 = 2^8), the
+        # `idx // BLOCK_SIZE` and `idx % BLOCK_SIZE` ops are reducible to a
+        # right-shift and a bit-mask. Triton's compiler usually does this on
+        # constexpr power-of-2 divisors, but encoding it explicitly removes
+        # ambiguity and lets us also drop the redundant Python-side preamble
+        # (clamp_min + // + %) at the wrapper. See `_fused_gather_dequant_
+        # model1_triton` and `dequantize_k_cache_gather` in this file for the
+        # SGLANG_PHASE_G_FOLD wire-in.
+        #
+        # Behavior contract: identical to the non-fold kernel. Negative input
+        # indices are clamped to 0 (same as the old wrapper's clamp_min) and
+        # produce row-0 data in the output — the downstream consumer masks
+        # these rows out via `invalid_mask` at the attn step, so the kernel
+        # output for invalid rows is "don't care" garbage. The kernel is
+        # bit-exact with the non-fold kernel + clamp+div+rem preamble for
+        # ALL inputs (negative or otherwise).
+        # ------------------------------------------------------------------
+        @triton.jit
+        def _fused_gather_dequant_model1_kernel_g_fold(
+            packed_u8_ptr,    # uint8*  packed KV, strided layout
+            indices_ptr,      # int*    [G]  flat per-row index, possibly-negative
+            out_ptr,          # bf16*   [G, D_OUT]
+            g_n: tl.int32,
+            size_per_block: tl.int64,
+            out_stride_0: tl.int64,
+            BLOCK_SIZE: tl.constexpr,        # MUST be a power of 2
+            BLOCK_SIZE_LOG2: tl.constexpr,   # log2(BLOCK_SIZE)
+            D_NOPE: tl.constexpr,
+            D_ROPE: tl.constexpr,
+            NUM_TILES: tl.constexpr,
+            TILE_SIZE: tl.constexpr,
+            BLOCK_G: tl.constexpr,
+        ):
+            """G-fold variant: explicit `>>` and `&` for index decomposition.
+
+            Equivalent to:
+              idx = max(idx_raw, 0)
+              block_idx = idx >> BLOCK_SIZE_LOG2     # idx // BLOCK_SIZE
+              pos_idx   = idx & (BLOCK_SIZE - 1)     # idx %  BLOCK_SIZE
+
+            Allows the caller to skip the Python `torch.clamp_min + // + %`
+            preamble (3 elementwise launches per call). Output bit-equality
+            with the original kernel + Python preamble is preserved.
+            """
+            pid = tl.program_id(0)
+            rows = pid * BLOCK_G + tl.arange(0, BLOCK_G)
+            rmask = rows < g_n
+
+            idx_raw = tl.load(indices_ptr + rows, mask=rmask, other=0)
+            # In-register clamp + bit-shift decomposition. Operates on the
+            # native dtype of indices_ptr; promotes to int64 for byte address
+            # arithmetic to avoid 32-bit overflow on `block_idx * size_per_block`
+            # (size_per_block can exceed 2^15 bytes, num_blocks can be 4096+).
+            idx = tl.maximum(idx_raw, 0)
+            block_idx = (idx >> BLOCK_SIZE_LOG2).to(tl.int64)
+            pos_idx   = (idx &  (BLOCK_SIZE - 1)).to(tl.int64)
+
+            nr_stride  = D_NOPE + 2 * D_ROPE
+            row_base   = block_idx * size_per_block
+            nope_base  = row_base + pos_idx * nr_stride
+            rope_base  = nope_base + D_NOPE
+            scale_base = row_base + BLOCK_SIZE * nr_stride + pos_idx * 8
+
+            # --- nope: dequant tile-by-tile ---
+            for tile_idx in tl.static_range(NUM_TILES):
+                s_u8 = tl.load(packed_u8_ptr + scale_base + tile_idx, mask=rmask, other=0)
+                s_bf = tl.exp2(s_u8.to(tl.float32) - 127.0).to(tl.bfloat16)
+
+                tile_cols = tile_idx * TILE_SIZE + tl.arange(0, TILE_SIZE)
+                nope_u8 = tl.load(
+                    packed_u8_ptr + nope_base[:, None] + tile_cols[None, :],
+                    mask=rmask[:, None],
+                )
+                nope_fp8 = nope_u8.to(tl.float8e4b8, bitcast=True)
+                tl.store(
+                    out_ptr + rows[:, None] * out_stride_0 + tile_cols[None, :],
+                    nope_fp8.to(tl.bfloat16) * s_bf[:, None],
+                    mask=rmask[:, None],
+                )
+
+            # --- rope: bf16 bytes → direct copy via u8+u8 -> u16 bitcast to bf16 ---
+            rope_i = tl.arange(0, D_ROPE)
+            lo = tl.load(packed_u8_ptr + rope_base[:, None] + (2 * rope_i)[None, :],     mask=rmask[:, None])
+            hi = tl.load(packed_u8_ptr + rope_base[:, None] + (2 * rope_i + 1)[None, :], mask=rmask[:, None])
+            u16 = lo.to(tl.uint16) | (hi.to(tl.uint16) << 8)
+            rope_bf = u16.to(tl.bfloat16, bitcast=True)
+            tl.store(
+                out_ptr + rows[:, None] * out_stride_0 + (D_NOPE + rope_i)[None, :],
+                rope_bf,
+                mask=rmask[:, None],
+            )
+
         return (
             {"nope_only": _dequant_nope_kernel,
-             "fused_model1": _fused_gather_dequant_model1_kernel},
+             "fused_model1": _fused_gather_dequant_model1_kernel,
+             "fused_model1_g_fold": _fused_gather_dequant_model1_kernel_g_fold},
             True,
         )
     except Exception:
@@ -356,6 +451,22 @@ if _DEQUANT_TRITON:
     _DEQUANT_KERNELS, _DEQUANT_KERNEL_OK = _try_import_triton_dequant()
 _DEQUANT_KERNEL = _DEQUANT_KERNELS.get("nope_only")              # backward-compat alias used by P1-a code path
 _FUSED_MODEL1_KERNEL = _DEQUANT_KERNELS.get("fused_model1")      # P1-c
+# Phase G fold: explicit shift+mask kernel; only valid when block_size is pow2.
+# Wrapper falls back to the non-fold kernel + Python preamble when the env knob
+# is OFF or block_size is not a power of 2.
+_FUSED_MODEL1_KERNEL_G_FOLD = _DEQUANT_KERNELS.get("fused_model1_g_fold")
+_PHASE_G_FOLD = os.environ.get("SGLANG_PHASE_G_FOLD", "0") == "1"
+
+
+def _ilog2_pow2(x: int) -> int:
+    """Return log2(x) for positive power-of-two `x`, else -1."""
+    if x <= 0 or (x & (x - 1)) != 0:
+        return -1
+    n = 0
+    while x > 1:
+        x >>= 1
+        n += 1
+    return n
 
 
 def _dequant_nope_triton(
@@ -393,6 +504,14 @@ def _fused_gather_dequant_model1_triton(
     """P1-c path: single kernel does the two Python advanced-index gathers
     (nope+rope region gather, scale region gather) AND the per-tile dequant
     AND the rope bf16 copy. No intermediate tensors.
+
+    Phase G fold (`SGLANG_PHASE_G_FOLD=1`): when the env knob is set AND
+    block_size is a power of 2 AND the g_fold kernel compiled, dispatches
+    to `_fused_gather_dequant_model1_kernel_g_fold` which uses explicit
+    `>>` and `&` for the index decomposition. The wrapper signature is
+    UNCHANGED — callers see no difference. The fold removes the redundant
+    `clamp_min + // + %` Python preamble that lives at the call-site
+    (`dequantize_k_cache_gather`); see that function for the detail.
     """
     G = indices_flat.numel()
     if G == 0:
@@ -405,6 +524,35 @@ def _fused_gather_dequant_model1_triton(
     # int64 indices for safer arithmetic in kernel
     if indices_flat.dtype != torch.int64:
         indices_flat = indices_flat.to(torch.int64)
+
+    # Phase G fold dispatch: only fires when knob is on AND block_size is pow2
+    # (DSv4 production: block_size=256 = 2^8). Falls back to the original
+    # kernel otherwise so behavior is identical for non-pow2 block sizes.
+    log2_bs = _ilog2_pow2(block_size)
+    use_g_fold = (
+        _PHASE_G_FOLD
+        and _FUSED_MODEL1_KERNEL_G_FOLD is not None
+        and log2_bs >= 0
+    )
+    if use_g_fold:
+        _FUSED_MODEL1_KERNEL_G_FOLD[grid](
+            packed_u8,
+            indices_flat,
+            result,
+            G,
+            size_per_block,
+            result.stride(0),
+            BLOCK_SIZE=block_size,
+            BLOCK_SIZE_LOG2=log2_bs,
+            D_NOPE=d_nope,
+            D_ROPE=d_rope,
+            NUM_TILES=num_tiles,
+            TILE_SIZE=tile_size,
+            BLOCK_G=BLOCK_G,
+            num_warps=4,
+            num_stages=2,
+        )
+        return
 
     _FUSED_MODEL1_KERNEL[grid](
         packed_u8,
@@ -455,9 +603,28 @@ def dequantize_k_cache_gather(
     G = indices_flat.numel()
     device = quant_k_cache.device
 
-    idx_flat = torch.clamp_min(indices_flat, 0).to(torch.int64)
-    block_idx = idx_flat // block_size
-    pos_idx = idx_flat % block_size
+    # Phase G fold: when the env knob is set, the MODEL1 fused kernel does
+    # the clamp+div+rem in-register so the Python preamble below is dead
+    # work for that fast path. We skip it when we know we'll take the fused
+    # fast path; the V32 path and BF16 fallback still need block_idx /
+    # pos_idx tensors so they recompute lazily.
+    _g_fold_active = (
+        _PHASE_G_FOLD
+        and kvcache_layout == FP8KVCacheLayout.MODEL1_FP8Sparse
+        and _FUSED_MODEL1_KERNEL_G_FOLD is not None
+        and _ilog2_pow2(block_size) >= 0
+        and G > 0
+        and os.environ.get("SGLANG_DISABLE_FUSED_MODEL1_KERNEL", "0") != "1"
+    )
+    if _g_fold_active:
+        # Skip the Python clamp_min + // + % preamble — kernel does it in-register.
+        idx_flat = None
+        block_idx = None
+        pos_idx = None
+    else:
+        idx_flat = torch.clamp_min(indices_flat, 0).to(torch.int64)
+        block_idx = idx_flat // block_size
+        pos_idx = idx_flat % block_size
 
     if kvcache_layout == FP8KVCacheLayout.MODEL1_FP8Sparse:
         # P1-c fast path: ONE triton kernel handles gather + dequant + rope
@@ -482,6 +649,12 @@ def dequantize_k_cache_gather(
                 tile_size=tile_size,
             )
             return result
+        # Non-fused path needs the (block_idx, pos_idx) tensors that the
+        # g_fold preamble skipped. Compute lazily here.
+        if block_idx is None:
+            idx_flat = torch.clamp_min(indices_flat, 0).to(torch.int64)
+            block_idx = idx_flat // block_size
+            pos_idx = idx_flat % block_size
 
         # P1-a fallback: gather in Python, one kernel for dequant.
         # Layout per block:
