@@ -2414,7 +2414,7 @@ class MQALayer(nn.Module):
         # When q_out is None (TP=1) or knob OFF, keep the existing in-place RoPE.
         _rope_to_out_active = (
             q_out is not None
-            and os.environ.get("SGLANG_FUSED_ROPE_Q_TO_OUT", "0") == "1"
+            and os.environ.get("SGLANG_FUSED_ROPE_Q_TO_OUT", "1") == "1"
         )
         if not _rope_to_out_active:
             # Fused unweighted rmsnorm + RoPE on Q in one launch (saves ~25us/call,
