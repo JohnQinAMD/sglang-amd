@@ -200,6 +200,103 @@ def fused_rmsnorm_rope_q_triton(
 
 
 @triton.jit
+def _fused_rmsnorm_rope_q_to_out_kernel(
+    q_in_ptr,          # bf16 [bs, n_local_heads, head_dim] read-only
+    q_out_ptr,         # bf16 [bs, n_local_heads, head_dim] (slice view; strided)
+    freqs_real_ptr,    # fp32 [max_pos, rope_dim] (real/imag interleaved)
+    positions_ptr,     # int64 [bs]
+    eps,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    sIn_b, sIn_h,
+    sOut_b, sOut_h,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """2-pointer fused rmsnorm + RoPE: reads q_in, writes RoPE'd output to q_out (different strides).
+
+    Phase A1: fuses the post-attention `q_out.copy_(q)` into the RoPE kernel
+    by writing RoPE output directly to q_out's strided slice. Eliminates 1
+    bf16_copy launch per attention layer (~22/forward).
+    """
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    in_base = pid_b * sIn_b + pid_h * sIn_h
+    out_base = pid_b * sOut_b + pid_h * sOut_h
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < HEAD_DIM
+    x = tl.load(q_in_ptr + in_base + offs, mask=mask, other=0.0).to(tl.float32)
+    sumsq = tl.sum(x * x, axis=0)
+    rms_inv = tl.rsqrt(sumsq / HEAD_DIM + eps)
+    x_norm = x * rms_inv
+
+    position = tl.load(positions_ptr + pid_b)
+    rope_offs = tl.arange(0, ROPE_DIM // 2)
+    rope_mask = rope_offs < (ROPE_DIM // 2)
+    nope_offset = HEAD_DIM - ROPE_DIM
+    real_in_head = nope_offset + rope_offs * 2
+    imag_in_head = nope_offset + rope_offs * 2 + 1
+
+    freq_real = tl.load(
+        freqs_real_ptr + position * ROPE_DIM + rope_offs * 2,
+        mask=rope_mask, other=0.0,
+    )
+    freq_imag = tl.load(
+        freqs_real_ptr + position * ROPE_DIM + rope_offs * 2 + 1,
+        mask=rope_mask, other=0.0,
+    )
+
+    # Re-load rope segment from q_in, apply rms scale + rotation
+    x_real_raw = tl.load(q_in_ptr + in_base + real_in_head, mask=rope_mask, other=0.0).to(tl.float32)
+    x_imag_raw = tl.load(q_in_ptr + in_base + imag_in_head, mask=rope_mask, other=0.0).to(tl.float32)
+    x_real = x_real_raw * rms_inv
+    x_imag = x_imag_raw * rms_inv
+    out_real = x_real * freq_real - x_imag * freq_imag
+    out_imag = x_real * freq_imag + x_imag * freq_real
+
+    # Write to q_out (different storage + strides). Full normalized row first,
+    # then overwrite rope lanes with rotated values.
+    tl.store(q_out_ptr + out_base + offs, x_norm, mask=mask)
+    tl.store(q_out_ptr + out_base + real_in_head, out_real, mask=rope_mask)
+    tl.store(q_out_ptr + out_base + imag_in_head, out_imag, mask=rope_mask)
+
+
+def fused_rmsnorm_rope_q_triton_to_out(
+    q_in: torch.Tensor,
+    q_out: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    rope_dim: int,
+) -> None:
+    """Out-of-place fused rmsnorm + RoPE: reads q_in, writes to q_out.
+
+    Both must have shape [bs, n_local_heads, head_dim]. q_out may be a strided
+    slice of a larger TP-padded buffer (stride along head dim must be 1).
+
+    Replaces the post-attention `q_out.copy_(q)` chain (RoPE in-place + copy
+    into TP-padded slice = 2 launches) with one fused kernel.
+    """
+    assert q_in.shape == q_out.shape, f"shape mismatch: {q_in.shape} vs {q_out.shape}"
+    assert q_in.dtype == q_out.dtype == torch.bfloat16
+    bs, n_heads, head_dim = q_in.shape
+    # within-head must be contiguous (stride 1) for both
+    assert q_in.stride(2) == 1 and q_out.stride(2) == 1, (
+        f"head-dim stride must be 1: in={q_in.stride()}, out={q_out.stride()}"
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    BLOCK_SIZE = triton.next_power_of_2(head_dim)
+    grid = (bs, n_heads)
+    _fused_rmsnorm_rope_q_to_out_kernel[grid](
+        q_in, q_out, freqs_real, positions, eps,
+        HEAD_DIM=head_dim, ROPE_DIM=rope_dim,
+        sIn_b=q_in.stride(0), sIn_h=q_in.stride(1),
+        sOut_b=q_out.stride(0), sOut_h=q_out.stride(1),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
+@triton.jit
 def apply_rotary_emb_triton_kernel(
     x_ptr,
     freqs_ptr,

@@ -35,6 +35,7 @@ from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_contex
 from sglang.srt.layers.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     fused_rmsnorm_rope_q_triton,
+    fused_rmsnorm_rope_q_triton_to_out,
 )
 # M1 megakernel — fuses kv-side RoPE + per-tile FP8 quant + paged scatter.
 # Gated by envs.SGLANG_M1_KV_WRITE_WITH_ROPE (default OFF).
@@ -2405,11 +2406,22 @@ class MQALayer(nn.Module):
             q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         # [bs, n_local_heads, head_dim]
-        # Fused unweighted rmsnorm + RoPE on Q in one launch (saves ~25us/call,
-        # microbench 1.42x vs unfused at decode bs=8). KV rope still runs separately.
-        fused_rmsnorm_rope_q_triton(
-            q, self.freqs_cis, positions, self.eps, self.qk_rope_head_dim,
+        # 2026-05-03 Phase A1: when q_out is set (TP>1), defer RoPE until just
+        # before the q_out write — fuse rmsnorm+RoPE+strided-write into one kernel
+        # via fused_rmsnorm_rope_q_triton_to_out. Eliminates the trailing
+        # `q_out.copy_(q)` launch (~22 bf16_copy events/forward).
+        # Gated by SGLANG_FUSED_ROPE_Q_TO_OUT=1 (default OFF until E2E validates).
+        # When q_out is None (TP=1) or knob OFF, keep the existing in-place RoPE.
+        _rope_to_out_active = (
+            q_out is not None
+            and os.environ.get("SGLANG_FUSED_ROPE_Q_TO_OUT", "0") == "1"
         )
+        if not _rope_to_out_active:
+            # Fused unweighted rmsnorm + RoPE on Q in one launch (saves ~25us/call,
+            # microbench 1.42x vs unfused at decode bs=8). KV rope still runs separately.
+            fused_rmsnorm_rope_q_triton(
+                q, self.freqs_cis, positions, self.eps, self.qk_rope_head_dim,
+            )
         # M1 megakernel: fuse apply_rotary_emb_triton + quant_pack + paged scatter
         # into one Triton launch. When ON, kv-cache write happens here so the
         # downstream attn_backend.forward(save_kv_cache=...) must be False.
@@ -2479,7 +2491,14 @@ class MQALayer(nn.Module):
             )
 
         if q_out is not None:
-            q_out.copy_(q)
+            if _rope_to_out_active:
+                # Phase A1: fuse rmsnorm+RoPE+strided-write into one kernel.
+                # Replaces (in-place rope at line ~2410) + (q_out.copy_) two-launch chain.
+                fused_rmsnorm_rope_q_triton_to_out(
+                    q, q_out, self.freqs_cis, positions, self.eps, self.qk_rope_head_dim,
+                )
+            else:
+                q_out.copy_(q)
         return q, kv
 
     def forward(
