@@ -240,7 +240,9 @@ def _compress_decode_full_kernel(
         # Pair i (cols 2i, 2i+1) is in the rope half if 2i >= rope_offset.
         rope_offset = D - ROPE_DIM
         pair_i = tl.arange(0, BLOCK_D // 2)
-        is_rope_pair = (pair_i * 2) >= rope_offset
+        # Clamp at D: padding pairs (BLOCK_D > D case) have pair_i*2 >= D
+        # and must NOT be marked as rope (would OOB-read freqs).
+        is_rope_pair = ((pair_i * 2) >= rope_offset) & ((pair_i * 2) < D)
         # Local index within rope half (0..ROPE_DIM/2-1 for valid pairs;
         # garbage for non-rope pairs but masked out via is_rope_pair).
         rope_pair_idx = pair_i - rope_offset // 2
@@ -354,7 +356,9 @@ def _compress_decode_full_kernel_large_s(
 
         rope_offset = D - ROPE_DIM
         pair_i = tl.arange(0, BLOCK_D // 2)
-        is_rope_pair = (pair_i * 2) >= rope_offset
+        # Clamp at D: padding pairs (BLOCK_D > D case) have pair_i*2 >= D
+        # and must NOT be marked as rope (would OOB-read freqs).
+        is_rope_pair = ((pair_i * 2) >= rope_offset) & ((pair_i * 2) < D)
         rope_pair_idx = pair_i - rope_offset // 2
 
         freq_real_off = pid_b * s_freqsb + rope_pair_idx * s_freqsd * 2
@@ -394,11 +398,16 @@ def compress_decode_full_triton(
     # S must be reachable by EITHER variant: small-S (S ≤ 16, power of 2)
     # OR large-S (any S, processed via streaming online softmax with
     # S_CHUNK-tiled loop).
-    if D > 256 or D & (D - 1) != 0:
-        return False  # need BLOCK_D = D as power-of-2 ≤ 256
+    # 2026-05-02: previously required D power-of-2 ≤ 256; now handles arbitrary
+    # D ≤ 512 by padding BLOCK_D to next_power_of_2(D) and masking via col_mask.
+    # Unblocks DSv4 MQALayer compressor where head_dim = qk_rope + qk_nope =
+    # 64 + 448 = 512 (in 2604 mode), which previously fell back to the
+    # 4-launch torch chain (softmax + sum + RMSNorm + RoPE).
+    if D > 512:
+        return False
     if rope_dim & 1 != 0 or rope_dim > D:
         return False
-    BLOCK_D = D
+    BLOCK_D = triton.next_power_of_2(D)
 
     add_ape = ape is not None
     ape_arg = ape if add_ape else score

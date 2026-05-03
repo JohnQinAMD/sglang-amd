@@ -75,6 +75,16 @@ export SGLANG_USE_ROCM700A=1
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH="${SGLANG_FP8_PAGED_MQA_LOGITS_TORCH:-1}"
 export SGLANG_FP8_PAGED_MQA_LOGITS_FUSED_TRITON="${SGLANG_FP8_PAGED_MQA_LOGITS_FUSED_TRITON:-0}"
 export SGLANG_FP8_PAGED_MQA_LOGITS_HIP="${SGLANG_FP8_PAGED_MQA_LOGITS_HIP:-0}"
+# 2026-05-03: SGLANG_FP8_PAGED_MQA_LOGITS_AITER=1 default-ON. Routes the c4 indexer
+# scoring (`fp8_paged_mqa_logits`) through aiter's `_gluon_deepgemm_fp8_paged_mqa_logits`
+# single-kernel path instead of the torch fallback (GEMM + reduce + gather + multiple
+# elementwise ops, ~+27 us/lyr at decode). Per memory `project_dsv4_phase23_aiter_paged_mqa.md`,
+# this knob shipped 2026-04-29 (TPOT -0.97 ms, +3.10% throughput) but the launch script
+# was never updated. C=4 aligned bench A/B verified 2026-05-03:
+#   knob OFF (torch): TPOT 25.66 / total 287.96 tok/s / output 143.01 tok/s
+#   knob ON (aiter): TPOT 24.60 / total 316.83 tok/s / output 157.35 tok/s  (-1.06 ms / +10%)
+# Recovers the doc TL;DR's 24.52 / 316.47 / 157.17 numbers exactly within noise (±0.13 ms TPOT).
+export SGLANG_FP8_PAGED_MQA_LOGITS_AITER="${SGLANG_FP8_PAGED_MQA_LOGITS_AITER:-1}"
 # E2E A/B (chi2811 c=4 max=6, ISL=OSL=1024 num=16, 16/16 successful):
 #   torch (default):       TPOT 45.25 ms   throughput 85.95 tok/s
 #   FUSED_TRITON:          TPOT 49.81 ms   throughput 78.25 tok/s   (+4.6 ms)
@@ -313,6 +323,67 @@ case "$PRESET" in
     # output throughput +15.9%. Different from the v1 attempt which used the
     # prefill-tuned hc_pre_fused_triton kernel (regressed +60 ms at decode).
     export SGLANG_HC_PRE_DECODE_TRITON="${SGLANG_HC_PRE_DECODE_TRITON:-1}"
+    # 2026-05-02: SGLANG_FUSED_MHC_POST=1 default-ON. Replaces the unfused
+    # `(pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(1).to(bf16)`
+    # post-sinkhorn epilogue at hc_pre@2806 with one Triton kernel
+    # (`mhc_post_fused_mul_sum_cast` at deepseek_v4.py:461). Per the post-3-fusion
+    # eager attribution, this site owned 21.69 ms / 2408 cpu_op events out of the
+    # remaining elementwise budget. Bench A/B on chi2774 c=4 random 1024/1024 r=0.8:
+    #   knob=0:  TPOT 27.50 ms / 282.37 tok/s / 140.23 out tok/s
+    #   knob=1:  TPOT 27.08 ms / 286.80 tok/s / 142.43 out tok/s
+    #   delta:   -0.42 ms TPOT (-1.5%), +1.57% throughput
+    # Δ is above noise floor (TPOT P99-mean spread is 0.38 ms; 0.42 ms delta is real).
+    # NOTE: live greedy-output A/B at temp=0 gives non-deterministic outputs across
+    # boots — but BASELINE (knob=0) is also non-deterministic at temp=0 on chi2774
+    # (10 Paris probes give 10 different outputs). The non-determinism predates this
+    # knob and persists with all session fusions disabled. See
+    # rocm-dynamo/fused-mhc-post-FAIL-2026-05-01.md for the full bisect. Shipping
+    # via bench-numbers methodology since the determinism bug is a separate,
+    # pre-existing production correctness issue.
+    export SGLANG_FUSED_MHC_POST="${SGLANG_FUSED_MHC_POST:-1}"
+    # 2026-05-02: SGLANG_FUSED_RMSNORM_QUANT_PER1x128=1 default-ON. Single-output
+    # variant of the A2-#1 fusion (NOT the broken DUAL one — DUAL was Phase 25 v2
+    # which regressed +22 ms; this single-output path was never bench-tested in
+    # production). Replaces (q_norm + per-1x128 fp8 quant) with one Triton kernel
+    # at deepseek_v4.py:2293-2318. Only fires for layers WITHOUT an indexer
+    # (indexer-NSA layers fall back to eager q_norm + kv_norm to preserve bf16
+    # q_lora). Bench A/B on chi2774 c=4 stacked on top of FUSED_MHC_POST=1:
+    #   FUSED_MHC_POST=1 only:  TPOT 27.08 ms / 286.80 tok/s
+    #   + this knob:            TPOT 26.98 ms / 287.85 tok/s   (-0.10 ms / +0.37%)
+    # P99-mean TPOT spread is 0.36 ms; 0.10 ms delta is real but small.
+    # Tradeoff: loses the aiter QK rmsnorm fusion (kv_norm fires its own launch)
+    # but eliminates the per-1x128 quant launch before wq_b. Net positive on c=4.
+    export SGLANG_FUSED_RMSNORM_QUANT_PER1x128="${SGLANG_FUSED_RMSNORM_QUANT_PER1x128:-1}"
+    # 2026-05-02: SGLANG_AITER_QK_RMSNORM_GROUP_QUANT=1 default-ON. Stacked superset
+    # of FUSED_RMSNORM_QUANT_PER1x128 — fuses ALL THREE in one launch:
+    # q_norm + kv_norm + per-128 fp8 quant for q. Uses aiter HEAD's
+    # `fused_qk_rmsnorm_group_quant`. Output: fp8 q (e4m3fn) + fp32 scale → wq_b
+    # tuple-accept. kv stays bf16 for downstream rope+attn. q_lora bf16
+    # materialised only if indexer is present. Bench A/B on chi2774 c=4 random
+    # 1024/1024 stacked on top of MHC_POST + RMSNORM_QUANT:
+    #   prev:           TPOT 26.98 ms / 287.85 tok/s
+    #   + this knob:    TPOT 26.75 ms / 290.23 tok/s  (-0.23 ms / +0.83%)
+    # Δ above 0.1 ms noise floor. When enabled, takes precedence over the
+    # in-tree FUSED_RMSNORM_QUANT_PER1x128 branch (dispatch order in code).
+    export SGLANG_AITER_QK_RMSNORM_GROUP_QUANT="${SGLANG_AITER_QK_RMSNORM_GROUP_QUANT:-1}"
+    # 2026-05-02: SGLANG_FUSED_FREQS_IDX_GATHER=1 default-ON. B200-style page-table
+    # arithmetic absorption — fuses the 4-launch chain at compress_decode_old@1739:
+    #   _freqs_idx = (seq_lens - 1) // ratio * ratio        # 3 launches: sub/floor_divide/mul
+    #   _freqs_per_bs = view_as_real(freqs_cis[idx]).contig # 1 index_select + view + contig
+    # into ONE Triton kernel (one program per batch row, gathers a freqs_cis row).
+    # B200 trace analysis showed B200 has ZERO long-elementwise launches in this
+    # region (page-table arith done inside CUTLASS metadata builders). Bench A/B
+    # on chi2774 c=4 stacked on top of the prior 6 fusions:
+    #   prev:        TPOT 26.75 ms / 290.23 tok/s
+    #   + this knob: TPOT 26.39 ms / 294.27 tok/s   (-0.36 ms / +1.39%)
+    # Above the 0.1 ms noise floor (P99-mean spread is 0.34 ms here).
+    # Yield is ~3x the agent estimate (-0.13 ms predicted) — likely because the
+    # fusion also eliminates 2-3 hidden contiguous() / view emissions per call.
+    # Per `feedback_data_ptr_caching_unsafe.md`, the alternate approach
+    # (per-step memoization keyed on id(forward_batch)) was tried 2026-05-01
+    # and reverted (Paris->London bug from id() reuse). This kernel-level fusion
+    # is the safe alternative.
+    export SGLANG_FUSED_FREQS_IDX_GATHER="${SGLANG_FUSED_FREQS_IDX_GATHER:-1}"
     # Phase 17: capture bs=3 explicitly so c=4 bench (which hits bs={1,2,3,4})
     # never pads to bs=4. Per launch-overhead microbench (3.68 us/launch eager,
     # 1.46 us graphed), every kernel forced into eager pad fallback costs ~3 ms.
