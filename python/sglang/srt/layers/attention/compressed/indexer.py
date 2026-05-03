@@ -415,7 +415,15 @@ def fp8_paged_mqa_logits_aiter(
             page_table.dtype,
             device,
         )
-        torch.arange(block_size, dtype=page_table.dtype, device=device, out=arange_buf)
+        # 2026-05-03 Target 3: arange content is a pure function of block_size
+        # (constant during a run), so it's stable for the lifetime of the
+        # scratch tensor. Skip the kernel launch on subsequent calls — identity
+        # check picks up reallocations from `_ensure_scratch` (different shape
+        # / dtype / device) and refills correctly. Saves ~1 arange/lyr in the
+        # AITER hot path.
+        if _paged_scratch.get("pt_aiter_arange__filled_for") is not arange_buf:
+            torch.arange(block_size, dtype=page_table.dtype, device=device, out=arange_buf)
+            _paged_scratch["pt_aiter_arange__filled_for"] = arange_buf
         # expanded[b, j*block_size + t] = page_table[b, j] * block_size + t
         pt_expanded.copy_(
             (page_table.unsqueeze(-1) * block_size + arange_buf.view(1, 1, -1)).view(
