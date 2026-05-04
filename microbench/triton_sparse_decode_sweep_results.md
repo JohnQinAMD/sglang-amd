@@ -60,3 +60,51 @@ T=2048): ~0.10 ms per call × ~5 calls per chunk = 0.5 ms TTFT.
 Post-fix expected TPOT on chi2774 Flash mxfp4 c=4 num=8: 33.69 → ~33.5 ms
 (within noise of the just-shipped MHC_PRE=0 baseline). Lift compounds with
 Lever 4 (decode-body megakernel) when it lands.
+
+---
+
+## v3b sweep — 2026-05-03 chi2811 (post-stack baseline)
+
+The 04-29 round only swept up to Topk=2048 with `BLOCK_H ∈ {4, 8}`. v3b adds
+`BLOCK_H ∈ {16, 32, 64}` against the post-2026-05-03 baseline (T1-T7 + A1/A3
+/B3/C1 + MEGA-3' Stage 1+2 + fused_lonely_q + Lever G all default-on).
+
+### Result table (production decode, Flash D_QK=D_V=512, Hq=64)
+
+| Shape | 04-29 winner | 04-29 us | v3b winner | v3b us | Speedup vs 04-29 |
+|---|---|---:|---|---:|---:|
+| B=2 T=2048 | BH=8  SK=16 | 26.18 | **BH=16 SK=32** | 19.07 | **1.37×** |
+| B=4 T=2048 | BH=8  SK=16 | 26.71 | **BH=16 SK=16** | 21.75 | **1.23×** |
+| B=8 T=2048 | BH=8  SK=16 | 42.41 | BH=32 SK=16 | 27.37 | 1.55× (BH=16 SK=16: 27.93, near-tie) |
+| B=4 T=1024 | BH=8  SK=16 | 19.81 | **BH=16 SK=16** | 17.00 | **1.17×** |
+| B=8 T=1024 | BH=8  SK=16 | 28.96 | BH=32 SK=16 | 20.05 | 1.45× (BH=16 SK=16: 20.38, near-tie) |
+
+### Why BH=16 was missed in 04-29
+
+04-29 set BH=8 as the universal big-topk choice based on B=4 T=512 results
+(where BH=16 wasn't materially better). At T=2048 the per-program work is 4×
+larger and BH=16's H-axis MFMA amortization wins decisively — but T=2048 wasn't
+swept at BH=16 in 04-29. Same root cause as the 04-29 BLOCK_D fix: hardcoded
+defaults from a small-shape sweep don't generalize to big-topk decode.
+
+### Universal v3b pattern
+
+**BH=16 SK=16 within 6% of best on every shape tested.** Adopted as the
+universal Topk≥1024 path (vs picking BH=32 only at B=8 — more dispatch
+complexity for ≤2% extra). Dispatch table at
+[python/sglang/srt/flashmla_tests/triton_sparse_decode_kernel.py:185-220](python/sglang/srt/flashmla_tests/triton_sparse_decode_kernel.py#L185).
+
+Env knob `SGLANG_SPARSE_DECODE_BH16_BIG_TOPK=0` rolls back to 04-29 dispatch.
+
+### Correctness gate
+
+20 (B, Topk) shape combinations vs BH=8 SK=16 reference. All PASS. Production
+decode shapes (B≥4, Topk≥1024) **bit-exact** (max_diff = 0.0). Other shapes
+within bf16-ULP rounding noise (max_diff ≤ 1e-4).
+
+### Estimated TPOT delta
+
+40 stage1 calls/iter × 5 us/call savings (B=4 T=2048: 26.71→21.75 = -4.96 us)
+= 198 us/iter gross. Critical-path-adjusted (75% credit for kernel overlap)
+≈ 0.15 ms TPOT. **Above the 0.13 ms median noise floor**. Aligned E2E bench
+on chi2811 confirms (see daily-updates/2026-05-03.md "stage1 BH=16" entry).
