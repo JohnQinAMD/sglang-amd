@@ -330,12 +330,42 @@ def ref_sparse_attn_decode(
     # forces a GPU->CPU sync and breaks CUDA graph capture
     # (HIP error: operation not permitted when stream is capturing). We now
     # always apply the where; it's a no-op when the mask is all-False.
-    lonely_q_mask = lse == float("-inf")
-    output = torch.where(
-        lonely_q_mask.unsqueeze(-1).expand_as(output),
-        torch.zeros_like(output),
-        output,
-    )
-    lse = torch.where(lonely_q_mask, torch.full_like(lse, float("+inf")), lse)
+    #
+    # 2026-05-04 fused_lonely_q_correction: 7-launch chain (eq + 4-op where for
+    # output + 2-op where for lse) → 1 Triton launch with in-place updates.
+    # Direct successor to C1 (which fused the mask construction; this fuses the
+    # masked materialization). Eliminates the (s_q, h_q, d_v) intermediate
+    # `zeros_like + where` HBM materialization. Default-on (`SGLANG_FUSED_LONELY_Q=1`)
+    # — safe because in-place semantics match the original `output = torch.where(...)`
+    # since output is a fresh tensor returned from `_sparse_attn_decode_inner`.
+    import os as _os_lq
+    if _os_lq.environ.get("SGLANG_FUSED_LONELY_Q", "1") == "1":
+        try:
+            from sglang.jit_kernel.fused_lonely_q_correction_triton import (
+                fused_lonely_q_correction_triton,
+            )
+            # output is shape (b, s_q, h_q, d_v); collapse b * s_q for kernel.
+            # Triton kernel operates on shape (s_q', h_q, d_v) where s_q' = b*s_q.
+            _flat_output = output.view(-1, output.shape[-2], output.shape[-1])
+            _flat_lse = lse.view(-1, lse.shape[-1])
+            _fired = fused_lonely_q_correction_triton(_flat_output, _flat_lse)
+        except Exception:
+            _fired = False
+        if not _fired:
+            lonely_q_mask = lse == float("-inf")
+            output = torch.where(
+                lonely_q_mask.unsqueeze(-1).expand_as(output),
+                torch.zeros_like(output),
+                output,
+            )
+            lse = torch.where(lonely_q_mask, torch.full_like(lse, float("+inf")), lse)
+    else:
+        lonely_q_mask = lse == float("-inf")
+        output = torch.where(
+            lonely_q_mask.unsqueeze(-1).expand_as(output),
+            torch.zeros_like(output),
+            output,
+        )
+        lse = torch.where(lonely_q_mask, torch.full_like(lse, float("+inf")), lse)
 
     return output, lse.transpose(1, 2)
