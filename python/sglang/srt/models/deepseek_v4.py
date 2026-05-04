@@ -87,7 +87,7 @@ _AITER_QK_RMSNORM_GROUP_QUANT = (
     and _aiter_fused_qk_rmsnorm_group_quant is not None
 )
 
-# A2-#1: fuse (rmsnorm + per-1x128 fp8 quant) into one Triton launch on the
+# Fuse (rmsnorm + per-1x128 fp8 quant) into one Triton launch on the
 # q_norm → wq_b path. Default OFF; enable via SGLANG_FUSED_RMSNORM_QUANT_PER1x128=1.
 # Microbench (M=8, N=4096, MI355X cuda-graph replay): UNFUSED 12.37 µs → FUSED
 # 10.28 µs (~0.29 ms/step at ~140 callsites). When enabled here we lose the qk
@@ -105,7 +105,7 @@ _FUSED_RMSNORM_QUANT_PER1x128 = (
     os.environ.get("SGLANG_FUSED_RMSNORM_QUANT_PER1x128", "0") == "1"
     and _fused_rmsnorm_per1x128_quant is not None
 )
-# Phase 24: dual-output extension also gated by the same env knob; only fires
+# Dual-output (q + kv) extension gated by the same env knob; only fires
 # when the dual entry-point loaded successfully.
 _FUSED_RMSNORM_QUANT_PER1x128_DUAL = (
     _FUSED_RMSNORM_QUANT_PER1x128
@@ -1085,9 +1085,9 @@ class Compressor(nn.Module):
             "extend_output", (out_rows, self.head_dim),
             kv_and_scores.kv.dtype, kv_and_scores.kv.device,
         )
-        # A2-#2: sentinel fill is debug-only ("misuse should produce obvious
-        # junk"). Default OFF — every row is overwritten by the per-request
-        # scatter below, so the fill is purely a defensive invariant check.
+        # Sentinel fill is debug-only ("misuse should produce obvious junk").
+        # Default OFF — every row is overwritten by the per-request scatter
+        # below, so the fill is purely a defensive invariant check.
         # Set SGLANG_COMPRESS_SENTINEL=1 to restore.
         if os.environ.get("SGLANG_COMPRESS_SENTINEL", "0") == "1":
             compressed_kv_output.fill_(10000.0)
@@ -1425,9 +1425,9 @@ class Compressor(nn.Module):
             "extend_old_output", (kv_and_scores.kv.size(0), self.head_dim),
             kv_and_scores.kv.dtype, kv_and_scores.kv.device,
         )
-        # A2-#2: sentinel fill is debug-only. Default OFF (every row gets
-        # overwritten by the per-request scatter below); set
-        # SGLANG_COMPRESS_SENTINEL=1 to restore the invariant check.
+        # Sentinel fill is debug-only. Default OFF (every row gets overwritten
+        # by the per-request scatter below); set SGLANG_COMPRESS_SENTINEL=1 to
+        # restore the invariant check.
         if os.environ.get("SGLANG_COMPRESS_SENTINEL", "0") == "1":
             compressed_kv_output.fill_(10000.0)
 
@@ -1561,9 +1561,10 @@ class Compressor(nn.Module):
                 pt += extend_lens[i]
                 continue
 
-            # MEGA-3' Stage 2 path: Stage 2 kernel already produced flat (n_out, 2R, D)
-            # tensors with APE+overlap_transform+drop-first applied. Read this request's
-            # slice directly. Skip the per-request torch APE+overlap_transform compute.
+            # compress_extend_old per-request loop fusion (Stage 2 path):
+            # the Stage 2 kernel already produced flat (n_out, 2R, D) tensors
+            # with APE-add + overlap_transform + drop-first-block applied.
+            # Read this request's slice directly and skip the torch fallback.
             if _mega3_stage2_out is not None:
                 _out_kv, _out_score, _out_block_offsets_cpu, _n_in_blocks_cpu = _mega3_stage2_out
                 _n_out_i = max(0, int(_n_in_blocks_cpu[i].item()) - 1)
@@ -2219,7 +2220,7 @@ class MQALayer(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        # Phase 24: caller may stash a (fp8, scale) tuple for wq_a's input.
+        # Caller may stash a pre-quantized (fp8, scale) tuple for wq_a's input.
         prequant_x = getattr(self, "_prequant_x", None)
         wq_a_in = prequant_x if prequant_x is not None else x
         # [bs, q_lora_rank]
@@ -2257,7 +2258,7 @@ class MQALayer(nn.Module):
         positions: Optional[torch.Tensor] = None,
         freqs_cis: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Phase 24: caller may stash a (fp8, scale) tuple for wkv's input.
+        # Caller may stash a pre-quantized (fp8, scale) tuple for wkv's input.
         prequant_x = getattr(self, "_prequant_x", None)
         wkv_in = prequant_x if prequant_x is not None else x
         # [bs, head_dim]
@@ -2296,7 +2297,7 @@ class MQALayer(nn.Module):
         stream_compressor.wait_stream(current_stream)
         stream_indexer.wait_stream(current_stream)
 
-        # Phase 24: snapshot prequant tuple for use across alt-streams.
+        # Snapshot prequant tuple for use across alt-streams.
         # _compute_q_a / _compute_kv read self._prequant_x; snapshot ensures
         # both see the same value even though they run on different streams.
         # Cleared after both helpers consume it (below).
@@ -2327,7 +2328,7 @@ class MQALayer(nn.Module):
                     swa_k=kv,
                     forward_batch=forward_batch,
                 )
-        # Phase 24: clear prequant slot after both q-a and kv have been
+        # Clear the prequant slot after both q-a and kv have been
         # dispatched (they ran on different streams; both already grabbed
         # references to the underlying tensors via wq_a/wkv input).
         self._prequant_x = None
@@ -2354,8 +2355,8 @@ class MQALayer(nn.Module):
         freqs_cis: Optional[torch.Tensor] = None,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Phase 24 (A2-#1 dual-output): if the parent layer pre-fused
-        # input_layernorm into (fp8, scale), feed those directly into wq_a /
+        # If the parent layer pre-fused input_layernorm into a (fp8, scale)
+        # dual-output tuple, feed those directly into wq_a /
         # wkv. Bypasses the per-1x128 quant launches that would otherwise
         # fire inside each FP8 GEMM apply. `x` (bf16) is still used downstream
         # by indexer/compressor — it is the bf16 normed-out from the fused
@@ -2377,8 +2378,8 @@ class MQALayer(nn.Module):
             q, _ = self.wq_a(wq_a_in)
             # [bs, head_dim]
             kv, _ = self.wkv(wkv_in)
-        # A2-#1 path: env-gated. Fuses q_norm + per-1x128 fp8 quant into one
-        # Triton launch, then feeds wq_b's FP8 GEMM with pre-quantized input.
+        # Env-gated fused-rmsnorm-quant path: combines q_norm + per-1x128 fp8
+        # quant into one Triton launch, then feeds wq_b's FP8 GEMM with pre-quantized input.
         # This drops the qk_rmsnorm fusion (kv_norm goes through its own
         # launch), but eliminates the dynamic_per_group_scaled_quant launch
         # that otherwise fires inside wq_b. Net win on graph replay because
@@ -2592,7 +2593,7 @@ class MQALayer(nn.Module):
 
         if q_out is not None:
             if _rope_to_out_active:
-                # Phase A1: fuse rmsnorm+RoPE+strided-write into one kernel.
+                # Fuse rmsnorm+RoPE+strided-write into one Triton kernel.
                 # Replaces (in-place rope at line ~2410) + (q_out.copy_) two-launch chain.
                 fused_rmsnorm_rope_q_triton_to_out(
                     q, q_out, self.freqs_cis, positions, self.eps, self.qk_rope_head_dim,
@@ -2960,8 +2961,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             sinkhorn_iters=self.hc_sinkhorn_iters,
             eps=self.hc_eps,
         )
-        # A2-#2: fuse (pre * x_flat).sum(1).to(dtype) into one kernel.
-        # Default OFF (preserve Phase 13 behavior). Only valid when fused
+        # Fuse (pre * x_flat).sum(1).to(dtype) into one Triton kernel.
+        # Default OFF (preserve unfused-baseline behavior). Only valid when fused
         # hc_pre path emitted x_flat as fp32 [B, HC_MULT*HIDDEN] AND the
         # caller wants bf16 output (the only path on Flash-Base FP8).
         if (os.environ.get("SGLANG_FUSED_MHC_POST", "0") == "1"
@@ -3035,8 +3036,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states, post, comb = self.hc_pre(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )  # -> [n, d]
-        # Phase 24 (A2-#1 dual-output): when the env knob is on, fuse
-        # input_layernorm + per-1x128 fp8 quant into a single launch and
+        # When the dual-output env knob is on, fuse input_layernorm
+        # + per-1x128 fp8 quant into a single launch and
         # stash the (fp8, scale) tuple on self.self_attn for wq_a/wkv to
         # consume directly. The bf16 normed-out is reused as `hidden_states`
         # for indexer/compressor (non-fp8 consumers). One launch eliminates
