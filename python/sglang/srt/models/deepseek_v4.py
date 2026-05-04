@@ -1438,6 +1438,80 @@ class Compressor(nn.Module):
         # when the index is `cuda_tensor[python_int]`. One D2H of bs ints up
         # front saves `bs * 2 * N_compressor_layers` syncs per prefill batch.
         req_pool_indices_cpu = req_pool_indices.tolist()
+
+        # 2026-05-04 MEGA-3' Stage 1+2 (KVAndScoreOld variant) — production wire-in.
+        # Stage 1: per-request {clear-state-if-prefix-zero + cat-prefix + cat-current
+        # + writeback} → 2 Triton launches (one per channel: kv fill=0, score fill=-inf).
+        # Stage 2: per-request {APE-add + overlap_transform + drop-first-block} →
+        # 2 Triton launches (one per channel) producing flat (total_out_blocks, 2*R, D)
+        # tensors that feed the existing per-request compress_decode_full_triton chain.
+        # Combined: 16 launches/request × bs × 60 layers → 4 + bs/layer launches.
+        # Default-on via launch_dsv4.sh:323-333. Microbench: Stage 1 = 2.49-2.66× at
+        # bs=4, Stage 2 = 6.81-7.14× at production. E2E: TPOT 21.46→21.36 ms (-0.10),
+        # throughput 340.91→341.88 (+0.97 tok/s, +0.28%).
+        _mega3_old_setup_on = (
+            os.environ.get("SGLANG_MEGA3_PRIME_EXTEND_SETUP_OLD", "0") == "1"
+            and self.ratio == 4
+            and self.overlap
+        )
+        _mega3_stage2_on = (
+            _mega3_old_setup_on
+            and os.environ.get("SGLANG_MEGA3_PRIME_OVERLAP_APE_DROP", "0") == "1"
+        )
+        _mega3_setup_descs = None
+        _mega3_stage2_out = None
+        if _mega3_old_setup_on:
+            from sglang.jit_kernel.extend_per_request_megakernel_triton import (
+                mega3_prime_extend_setup_old_triton,
+            )
+            _prefix_t = torch.tensor(prefix_lens, dtype=torch.int32) if not torch.is_tensor(prefix_lens) else prefix_lens.to(torch.int32)
+            _extend_t = torch.tensor(extend_lens, dtype=torch.int32) if not torch.is_tensor(extend_lens) else extend_lens.to(torch.int32)
+            _mega3_setup_descs = mega3_prime_extend_setup_old_triton(
+                kv_and_score_states.kv,
+                kv_and_score_states.score,
+                kv_and_scores.kv,
+                kv_and_scores.score,
+                temp_buffer.kv,
+                temp_buffer.score,
+                req_pool_indices,
+                _prefix_t,
+                _extend_t,
+            )
+        if _mega3_stage2_on and _mega3_setup_descs is not None:
+            from sglang.jit_kernel.extend_per_request_megakernel_triton import (
+                mega3_prime_overlap_ape_drop_triton,
+            )
+            (_pt_offsets, _buf_offsets, _pre_state_lens_t,
+             _post_state_lens_t, _valid_kv_lens_t) = _mega3_setup_descs
+            _n_in_blocks_cpu = (_valid_kv_lens_t // self.ratio).to(torch.int32)
+            _per_req_out = torch.clamp(_n_in_blocks_cpu - 1, min=0)
+            _out_block_offsets_cpu = torch.zeros_like(_per_req_out)
+            _running = 0
+            for _i in range(bs):
+                _out_block_offsets_cpu[_i] = _running
+                _running += int(_per_req_out[_i])
+            _total_out = _running
+            if _total_out > 0:
+                _device = temp_buffer.kv.device
+                _n_blocks_dev = _n_in_blocks_cpu.to(_device, non_blocking=True)
+                _out_block_offsets_dev = _out_block_offsets_cpu.to(_device, non_blocking=True)
+                _out_kv = torch.empty(
+                    _total_out, 2 * self.ratio, self.head_dim,
+                    dtype=temp_buffer.kv.dtype, device=_device,
+                )
+                _out_score = torch.empty(
+                    _total_out, 2 * self.ratio, self.head_dim,
+                    dtype=temp_buffer.score.dtype, device=_device,
+                )
+                _ok = mega3_prime_overlap_ape_drop_triton(
+                    temp_buffer.kv, temp_buffer.score,
+                    _out_kv, _out_score, self.ape,
+                    _buf_offsets, _n_blocks_dev, _out_block_offsets_dev,
+                    self.ratio, self.head_dim,
+                )
+                if _ok:
+                    _mega3_stage2_out = (_out_kv, _out_score, _out_block_offsets_cpu, _n_in_blocks_cpu)
+
         for i in range(bs):
             # Definitions of variables
             #
@@ -1449,26 +1523,36 @@ class Compressor(nn.Module):
 
             kv_and_score = kv_and_scores[pt : pt + extend_lens[i]]
             kv_and_score_state = kv_and_score_states[req_pool_indices_cpu[i]]
-            if prefix_lens[i] == 0:
-                # NOTE: padding with default values for overlap
-                kv_and_score_state.clear()
 
-            # Create kv_and_score_buffer
-            pre_state_len = self.compute_state_len(
-                seq_len=prefix_lens[i], ratio=self.ratio
-            )
-            valid_kv_len = pre_state_len + extend_lens[i]
-            kv_and_score_buffer = temp_buffer[:valid_kv_len]
-            kv_and_score_buffer[:pre_state_len] = kv_and_score_state[:pre_state_len]
-            kv_and_score_buffer[pre_state_len:valid_kv_len] = kv_and_score
+            # Stage 1 path: read pre-built per-request slice from temp_buffer
+            if _mega3_setup_descs is not None:
+                pt_offsets, buf_offsets, pre_state_lens_t, post_state_lens_t, valid_kv_lens_t = _mega3_setup_descs
+                pre_state_len = int(pre_state_lens_t[i].item())
+                post_state_len = int(post_state_lens_t[i].item())
+                valid_kv_len = int(valid_kv_lens_t[i].item())
+                buf_off = int(buf_offsets[i].item())
+                kv_and_score_buffer = temp_buffer[buf_off:buf_off + valid_kv_len]
+            else:
+                if prefix_lens[i] == 0:
+                    # NOTE: padding with default values for overlap
+                    kv_and_score_state.clear()
 
-            # Write to kv_and_score_states
-            post_state_len = self.compute_state_len(
-                seq_len=valid_kv_len, ratio=self.ratio
-            )
-            kv_and_score_state[:post_state_len] = kv_and_score_buffer[
-                valid_kv_len - post_state_len : valid_kv_len
-            ]
+                # Create kv_and_score_buffer
+                pre_state_len = self.compute_state_len(
+                    seq_len=prefix_lens[i], ratio=self.ratio
+                )
+                valid_kv_len = pre_state_len + extend_lens[i]
+                kv_and_score_buffer = temp_buffer[:valid_kv_len]
+                kv_and_score_buffer[:pre_state_len] = kv_and_score_state[:pre_state_len]
+                kv_and_score_buffer[pre_state_len:valid_kv_len] = kv_and_score
+
+                # Write to kv_and_score_states
+                post_state_len = self.compute_state_len(
+                    seq_len=valid_kv_len, ratio=self.ratio
+                )
+                kv_and_score_state[:post_state_len] = kv_and_score_buffer[
+                    valid_kv_len - post_state_len : valid_kv_len
+                ]
 
             # Get the part that can be compressed (ratio-aligned)
             compress_len = valid_kv_len // self.ratio * self.ratio
@@ -1477,35 +1561,51 @@ class Compressor(nn.Module):
                 pt += extend_lens[i]
                 continue
 
-            # kv to compress: [compressed_len, ratio, head_dim * coff]
-            kv_and_score_to_compress = kv_and_score_buffer[:compress_len].view(
-                compress_len // self.ratio, self.ratio, -1
-            )
-            # M2-extend: APE add fuses INTO the megakernel ADD_APE branch on
-            # the no-overlap path (c128 layers, S = ratio = 128). For overlap=True
-            # (c4 layers), overlap_transform reorders elements between APE-add
-            # and softmax, so we keep the explicit add before the transform.
-            _fuse_ape_in_kernel = not self.overlap
-            if not _fuse_ape_in_kernel:
-                kv_and_score_to_compress.score = (
-                    kv_and_score_to_compress.score + self.ape.unsqueeze(0)
-                )
-
-            # Apply overlap transformation if enabled
-            if self.overlap:
-                kv_and_score_to_compress.kv = self.overlap_transform(
-                    kv_and_score_to_compress.kv, 0
-                )
-                kv_and_score_to_compress.score = self.overlap_transform(
-                    kv_and_score_to_compress.score, float("-inf")
-                )
-
-                # remove the first block before compression
-                kv_and_score_to_compress = kv_and_score_to_compress[1:]
-
-                if kv_and_score_to_compress.kv.size(0) == 0:
+            # MEGA-3' Stage 2 path: Stage 2 kernel already produced flat (n_out, 2R, D)
+            # tensors with APE+overlap_transform+drop-first applied. Read this request's
+            # slice directly. Skip the per-request torch APE+overlap_transform compute.
+            if _mega3_stage2_out is not None:
+                _out_kv, _out_score, _out_block_offsets_cpu, _n_in_blocks_cpu = _mega3_stage2_out
+                _n_out_i = max(0, int(_n_in_blocks_cpu[i].item()) - 1)
+                if _n_out_i == 0:
                     pt += extend_lens[i]
                     continue
+                _out_off = int(_out_block_offsets_cpu[i].item())
+                from sglang.srt.mem_cache.compress_state import KVAndScore as _KVAS
+                kv_and_score_to_compress = _KVAS.from_kv_score(
+                    kv=_out_kv[_out_off:_out_off + _n_out_i],
+                    score=_out_score[_out_off:_out_off + _n_out_i],
+                )
+            else:
+                # kv to compress: [compressed_len, ratio, head_dim * coff]
+                kv_and_score_to_compress = kv_and_score_buffer[:compress_len].view(
+                    compress_len // self.ratio, self.ratio, -1
+                )
+                # M2-extend: APE add fuses INTO the megakernel ADD_APE branch on
+                # the no-overlap path (c128 layers, S = ratio = 128). For overlap=True
+                # (c4 layers), overlap_transform reorders elements between APE-add
+                # and softmax, so we keep the explicit add before the transform.
+                _fuse_ape_in_kernel = not self.overlap
+                if not _fuse_ape_in_kernel:
+                    kv_and_score_to_compress.score = (
+                        kv_and_score_to_compress.score + self.ape.unsqueeze(0)
+                    )
+
+                # Apply overlap transformation if enabled
+                if self.overlap:
+                    kv_and_score_to_compress.kv = self.overlap_transform(
+                        kv_and_score_to_compress.kv, 0
+                    )
+                    kv_and_score_to_compress.score = self.overlap_transform(
+                        kv_and_score_to_compress.score, float("-inf")
+                    )
+
+                    # remove the first block before compression
+                    kv_and_score_to_compress = kv_and_score_to_compress[1:]
+
+                    if kv_and_score_to_compress.kv.size(0) == 0:
+                        pt += extend_lens[i]
+                        continue
 
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio

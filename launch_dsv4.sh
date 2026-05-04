@@ -321,6 +321,17 @@ case "$PRESET" in
     #   delta:          -0.38 ms TPOT, +1.5% throughput
     # Combined stack vs origin: TPOT 28.73 → 24.32 ms (-4.41 ms / -15.4%), +17.3% tput.
     export SGLANG_FUSED_COMPRESS_DECODE_KV_POOL_V2="${SGLANG_FUSED_COMPRESS_DECODE_KV_POOL_V2:-1}"
+    # 2026-05-04: MEGA-3' Stage 1+2 default-on. Replaces compress_extend_old's
+    # per-request {clear+cat+writeback} (Stage 1) + {APE+overlap_transform+drop-first}
+    # (Stage 2) with 2+2 = 4 Triton launches per layer (vs 16 launches/request × bs).
+    # Microbench: Stage 1 = 2.49-2.66× at bs=4, Stage 2 = 6.81-7.14× at production.
+    # E2E A/B on chi2811 (40 prompts × ISL=OSL=1024 × c=4): TPOT 21.46→21.37 ms,
+    # TTFT 252.74→252.29 ms, throughput 340.91→341.32 tok/s — first single env-knob
+    # this session producing direction-correct delta on all three metrics.
+    # Wire-in: compress_extend_old:1525-1593 (KVAndScoreOld variant). Falls back
+    # to torch loop on shape gate fail (ratio != 4 or overlap=False, i.e. c128 layers).
+    export SGLANG_MEGA3_PRIME_EXTEND_SETUP_OLD="${SGLANG_MEGA3_PRIME_EXTEND_SETUP_OLD:-1}"
+    export SGLANG_MEGA3_PRIME_OVERLAP_APE_DROP="${SGLANG_MEGA3_PRIME_OVERLAP_APE_DROP:-1}"
     # 2026-05-01: hc_pre decode-shape Triton kernel default-ON. Replaces
     # _hc_pre_torch_impl (5-7 launch RMSNorm+Linear chain) at decode shapes
     # (M=1-8) with 3-launch path: Triton per-row RMSNorm + torch.matmul + mul.
