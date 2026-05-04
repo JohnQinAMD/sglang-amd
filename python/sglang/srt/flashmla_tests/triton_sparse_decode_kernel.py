@@ -12,11 +12,20 @@ so the dot work stays proportional to the true D.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+# 2026-05-03 v3b sweep: BH=16 SK=16 wins 1.17-1.55× over BH=8 at Topk≥1024
+# (B=4 T=2048: 26.71→21.75 us; B=8 T=2048: 42.41→27.37 us). Bit-exact at
+# production shapes, within bf16-ULP rounding elsewhere. See
+# /sgl-pr/microbench/triton_sparse_decode_sweep_results.md.
+_SGLANG_SPARSE_DECODE_BH16_BIG_TOPK = (
+    os.environ.get("SGLANG_SPARSE_DECODE_BH16_BIG_TOPK", "1") != "0"
+)
 
 
 @triton.jit
@@ -182,23 +191,33 @@ def triton_sparse_attn_decode(
         and waves_per_eu is None
         and matrix_instr_nonkdim is None
     ):
-        # Per-shape autotuned config (2026-04-29 sweep on chi2774, MI355X).
-        # Sweep at /sgl-pr/microbench/triton_sparse_decode_sweep_results.md
-        # documents the search space + winners. Universal pattern:
-        # `waves_per_eu=2 matrix_instr_nonkdim=16` + BLOCK_T=32 + larger
-        # SPLIT_K + BLOCK_D matched to D_QK = avg 1.10× decode, 1.32× big-topk.
+        # Per-shape autotuned config. Universal `waves_per_eu=2
+        # matrix_instr_nonkdim=16 BLOCK_T=32` + per-D BLOCK_D + BH/SK from
+        # 2026-04-29 (small-topk) and 2026-05-03 v3b (big-topk Topk≥1024) sweeps.
         if D_QK == 512:
             block_d_sk = 256  # Flash mxfp4 / Flash-Base FP8: 1 clean D-tile
         elif D_QK == 576:
             block_d_sk = 128  # Pro: 5 tiles with masking; BD=192 was non-improving
         else:
             block_d_sk = 128  # safe default
+        # 2026-05-03 v3b sweep: BH=16 wins 1.17-1.55× over BH=8 at Topk≥1024
+        # across B∈{2,4,8,16} on Flash D=512. Per-call Δ at production
+        # B=4 T=2048: 26.71→21.75 us (1.23×); B=8 T=2048: 42.41→27.37 us (1.55×).
+        # 04-29 sweep didn't try BH=16 at T=2048 — discovery missed.
+        # Env knob `SGLANG_SPARSE_DECODE_BH16_BIG_TOPK=0` rolls back to BH=8
+        # if E2E regresses; default-on after correctness PASS on 20 shapes.
         if BS <= 2:
-            sk_block_h, sk_split_k = 4, 16  # B=1: lots of SPLIT_K to fill CUs
+            if Topk >= 1024 and _SGLANG_SPARSE_DECODE_BH16_BIG_TOPK:
+                sk_block_h, sk_split_k = 16, 32  # B≤2 big topk: wider H + deep SK
+            else:
+                sk_block_h, sk_split_k = 4, 16   # small topk: keep narrow H
         elif Topk >= 1024:
-            sk_block_h, sk_split_k = 8, 16  # big topk: wider H + max SPLIT_K
+            if _SGLANG_SPARSE_DECODE_BH16_BIG_TOPK:
+                sk_block_h, sk_split_k = 16, 16  # 2026-05-03 v3b winner (1.20-1.55×)
+            else:
+                sk_block_h, sk_split_k = 8, 16   # 2026-04-29 fallback
         else:
-            sk_block_h, sk_split_k = 8, 8   # B≥4 small topk: wider H, moderate SK
+            sk_block_h, sk_split_k = 8, 8        # B≥4 small topk: unchanged
         return triton_sparse_attn_decode_split_k(
             q, gathered_kv, invalid_mask, attn_sink, sm_scale, d_v,
             BLOCK_H=sk_block_h, BLOCK_T=32, BLOCK_D=block_d_sk,
