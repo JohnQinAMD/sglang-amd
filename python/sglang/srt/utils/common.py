@@ -4091,6 +4091,14 @@ def bind_to_closest_numa_node_cuda():
 def maybe_torch_compile(func):
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
+    # Allow disabling the in-capture torch.compile wrap entirely.
+    # CUDA-graph capture with @maybe_torch_compile fires Inductor compilation
+    # for each decorated region — first-time capture can take 20+ minutes on
+    # AMD ROCm. Setting SGLANG_DISABLE_CAPTURE_COMPILE=1 drops those
+    # per-region fusion passes (the captured graph still records all kernel
+    # launches; we lose Inductor-level fusion but gain capture speed).
+    if os.environ.get("SGLANG_DISABLE_CAPTURE_COMPILE", "0") == "1":
+        return func
     if get_is_capture_mode():
         return torch.compile(func)
     return func

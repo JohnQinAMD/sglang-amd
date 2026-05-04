@@ -132,6 +132,30 @@ def rms_normalize(x: torch.Tensor, eps: float) -> torch.Tensor:
     return x
 
 
+# HC pre/post are decorated at module level so torch.compile is invoked at most
+# once per process. Previously these were nested inside hc_pre/hc_post methods,
+# which created a new local function object each call. With maybe_torch_compile's
+# in-capture wrap (`if get_is_capture_mode(): return torch.compile(func)`),
+# every cuda graph capture call recompiled the same code from scratch — 43
+# layers × N captured batch sizes × 2 functions = hundreds of fresh Inductor
+# compiles, all serializing on the file_baton lock. That was the cuda-graph
+# capture wedge that shadowed every stacked-best run.
+@maybe_torch_compile
+def _hc_pre_torch_impl(x, hc_fn, rms_norm_eps: float):
+    x_flat = x.flatten(1).float()
+    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_norm_eps)
+    mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
+    return x_flat, mixes
+
+
+@maybe_torch_compile
+def _hc_post_torch_impl(x, residual, post, comb):
+    return (
+        post.unsqueeze(-1) * x.unsqueeze(1)
+        + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
+    ).type_as(x)
+
+
 @triton.jit
 def _rms_normalize_kernel(
     x_ptr,
@@ -237,6 +261,22 @@ class Compressor(nn.Module):
 
         self.ape_converted = False
 
+        # Replay-stable scratch for compress_decode / compress_extend /
+        # overlap_transform. Root cause: advanced indexing / fancy alloc
+        # inside `torch.cuda.graph` binds caching-allocator addresses; if a
+        # later eager (bs > captured_bs) call reallocates the same scratch,
+        # the captured graph's frozen pointer points to freed memory and
+        # HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION (0x29) fires on the
+        # next replay.
+        #
+        # Fix: keep TWO dicts, one for the captured graph and one for eager
+        # work. Capture-time allocations land in `_scratch_captured` and
+        # are NEVER reassigned (replay doesn't run Python). Eager calls
+        # land in `_scratch_eager`, which is free to reallocate per shape
+        # since eager has no replay-stability requirement.
+        self._scratch_captured: dict = {}
+        self._scratch_eager: dict = {}
+
     @cached_property
     def use_fused_compress(self) -> bool:
         if (
@@ -271,6 +311,61 @@ class Compressor(nn.Module):
             self.ape.data.copy_(ape.view(self.ratio, -1))
             # ============================================================================
 
+    def _ensure_scratch(
+        self, name, shape, dtype, device, grow_dim_0_only=True,
+    ) -> torch.Tensor:
+        """Return a contiguous tensor of `shape`, backed by per-mode scratch.
+
+        Capture phase (`is_current_stream_capturing()`) → `_scratch_captured`,
+        which is allocated lazily and never reassigned thereafter. Eager
+        calls → `_scratch_eager`, free to grow.
+
+        `grow_dim_0_only=True` (default): the backing tensor's dim 0 is the
+        only one allowed to grow; trailing dims must match exactly. The
+        returned slice `[:shape[0]]` is contiguous, so callers can `.view()`
+        on it. Use `grow_dim_0_only=False` for tensors whose later dims
+        also vary — those reallocate on any mismatch (no slicing).
+        """
+        scratch = (
+            self._scratch_captured
+            if torch.cuda.is_current_stream_capturing()
+            else self._scratch_eager
+        )
+        cur = scratch.get(name)
+        target = tuple(shape)
+        if grow_dim_0_only:
+            need_realloc = (
+                cur is None
+                or cur.dtype != dtype
+                or cur.device != device
+                or tuple(cur.shape[1:]) != target[1:]
+                or cur.shape[0] < target[0]
+            )
+            if need_realloc:
+                if (
+                    cur is not None
+                    and cur.dtype == dtype
+                    and cur.device == device
+                    and tuple(cur.shape[1:]) == target[1:]
+                ):
+                    new_rows = max(cur.shape[0], target[0])
+                else:
+                    new_rows = target[0]
+                scratch[name] = torch.empty(
+                    (new_rows,) + target[1:], dtype=dtype, device=device,
+                )
+            return scratch[name][: target[0]]
+        else:
+            need_realloc = (
+                cur is None
+                or cur.dtype != dtype
+                or cur.device != device
+                or tuple(cur.shape) != target
+            )
+            if need_realloc:
+                scratch[name] = torch.empty(target, dtype=dtype, device=device)
+            return scratch[name]
+
     def _get_states(self, forward_batch: ForwardBatch) -> KVAndScore:
         token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -297,7 +392,13 @@ class Compressor(nn.Module):
         assert tensor.shape[1:] == (self.ratio, 2 * self.head_dim)
 
         s, r, d = tensor.size(0), self.ratio, self.head_dim
-        new_tensor = tensor.new_full((s, 2 * r, d), fill_value)
+        # Per-mode persistent scratch (`_ensure_scratch`) — captured graph
+        # gets a frozen buffer, eager grows. Avoids HSA 0x29 from captured
+        # replay reading freed bs=1 storage after eager bs>1 grew it.
+        new_tensor = self._ensure_scratch(
+            "overlap_xform", (s, 2 * r, d), tensor.dtype, tensor.device,
+        )
+        new_tensor.fill_(fill_value)
         new_tensor[:, r:] = tensor[:, :, d:]
         new_tensor[1:, :r] = tensor[:-1, :, :d]
         return new_tensor
@@ -574,21 +675,38 @@ class Compressor(nn.Module):
         req_pool_indices = forward_batch.req_pool_indices
         assert extend_lens is not None and prefix_lens is not None
 
-        # compress info
-        # TODO: reuse the buffer across layers and reduce the sizes
+        # compress info — replay-stable scratch instead of fresh per-call allocs.
+        # `temp_buffer.new_empty(...)` and `torch.full(...)` here used to bind the
+        # caching allocator each call; under c≥8 multi-bs eager pressure those
+        # addresses get churned between captures and replays → stale-pointer
+        # HSA 0x29 on the next captured-graph decode. Persistent scratch with
+        # grow-only resize keeps addresses stable.
         max_buffer_size = 2 * kv_and_score_states.shape[1] + kv_and_scores.shape[0]
-        temp_buffer_shape = [max_buffer_size, head_dim_times_coff]
-        temp_buffer = kv_and_scores.new_empty(temp_buffer_shape)
 
-        # Deliberately fill w/ huge values, s.t. when misuse and access the unfilled values,
-        # we have higher probability to see something very weird
-        assert kv_and_scores.kv.shape[-1] == self.head_dim * self.coff
-        compressed_kv_output = torch.full(
-            (kv_and_scores.kv.size(0), self.head_dim),
-            fill_value=10000.0,
-            dtype=kv_and_scores.kv.dtype,
-            device=kv_and_scores.kv.device,
+        # Backing kv_score tensor is [N, 2 * head_dim_times_coff]: KVAndScore
+        # stores kv and score concatenated on last dim. The original
+        # `kv_and_scores.new_empty([..., head_dim_times_coff])` doubles last
+        # dim and wraps; we replicate that.
+        backing_last = 2 * head_dim_times_coff
+        backing_dtype = kv_and_scores.kv_score.dtype
+        backing_device = kv_and_scores.kv_score.device
+        tb = self._ensure_scratch(
+            "extend_temp", (max_buffer_size, backing_last), backing_dtype, backing_device,
         )
+        # Wrap the slice in KVAndScore (matches the type returned by the
+        # original `kv_and_scores.new_empty(...)`).
+        from sglang.srt.mem_cache.compress_state import KVAndScore as _KVAndScore
+        temp_buffer = _KVAndScore(tb)
+
+        assert kv_and_scores.kv.shape[-1] == self.head_dim * self.coff
+        out_rows = kv_and_scores.kv.size(0)
+        compressed_kv_output = self._ensure_scratch(
+            "extend_output", (out_rows, self.head_dim),
+            kv_and_scores.kv.dtype, kv_and_scores.kv.device,
+        )
+        # Fill is the original sentinel (10000.0) so misuse still produces an
+        # obvious "very weird" output.
+        compressed_kv_output.fill_(10000.0)
 
         bs = forward_batch.batch_size
         pt = 0
@@ -714,9 +832,19 @@ class Compressor(nn.Module):
         write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
         kv_and_score_states_pool[req_pool_indices, write_pos] = kv_and_scores
 
-        # NOTE: need to copy out before modifying overlap states
-        # kv_states: [bs, coff * ratio, coff * head_dim]
-        kv_and_score_to_compress = kv_and_score_states_pool[req_pool_indices]
+        # NOTE: need to copy out before modifying overlap states.
+        # Replay-stable read into pre-allocated scratch (see __init__ comment).
+        # Equivalent to `kv_and_score_states_pool[req_pool_indices]` but with a
+        # stable backing pointer across cuda-graph replays.
+        pool_kv_score = kv_and_score_states_pool.kv_score
+        decode_pool_scratch = self._ensure_scratch(
+            "decode_pool", (max(bs, 1), *pool_kv_score.shape[1:]),
+            pool_kv_score.dtype, pool_kv_score.device,
+        )
+        torch.index_select(
+            pool_kv_score, 0, req_pool_indices, out=decode_pool_scratch,
+        )
+        kv_and_score_to_compress = KVAndScore(decode_pool_scratch)
 
         # Shift just compressed kv states left by ratio
         if self.overlap:
@@ -759,7 +887,19 @@ class Compressor(nn.Module):
         self.print_tensor(kv_compressed, "kv_before_norm")
         kv_compressed = self.norm(kv_compressed)
         self.print_tensor(kv_compressed, "kv_after_norm")
-        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+        # Replay-stable freqs_cis read. The original
+        #   freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+        # advanced-indexes into self.freqs_cis at runtime, allocating a fresh
+        # output each call. Inside cuda-graph capture the next op
+        # (apply_rotary_emb_triton) records the output pointer; on replay the
+        # caching allocator can re-bind to a different address → APERTURE_VIOLATION.
+        freqs_idx = (seq_lens - 1) // self.ratio * self.ratio
+        freqs_cis = self._ensure_scratch(
+            "decode_freqs",
+            (max(freqs_idx.shape[0], 1), *self.freqs_cis.shape[1:]),
+            self.freqs_cis.dtype, self.freqs_cis.device,
+        )
+        torch.index_select(self.freqs_cis, 0, freqs_idx, out=freqs_cis)
         self.print_tensor(freqs_cis, "freqs_cis")
         apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
         self.print_tensor(kv_compressed, "kv_after_rope")
@@ -864,21 +1004,34 @@ class Compressor(nn.Module):
         extend_lens = forward_batch.extend_seq_lens_cpu
         req_pool_indices = forward_batch.req_pool_indices
 
-        # compress info
-        # TODO: reuse the buffer across layers and reduce the sizes
+        # compress info — replay-stable scratch (mirrors compress_extend at L693-L709).
+        # Original `KVAndScore.empty_like(...)` and `torch.full(...)` here used to
+        # bind fresh caching-allocator addresses each call. Under c=16 multi-bs
+        # capture pressure (bs={1,2,4,8,16}) the eager allocator churns these
+        # addresses against captured-graph slabs in the graph pool, creating an
+        # async write-read race that surfaces as HIP IMA in this same function
+        # later (see /mnt/vast/john/rocm-dynamo/A4_HIP_IMA_REPRO.md).
         max_buffer_size = 2 * kv_and_score_states.shape[1] + kv_and_scores.shape[0]
-        temp_buffer_shape = [max_buffer_size, head_dim_times_coff]
-        temp_buffer = KVAndScore.empty_like(temp_buffer_shape, old=kv_and_scores)
 
-        # Deliberately fill w/ huge values, s.t. when misuse and access the unfilled values,
-        # we have higher probability to see something very weird
-        assert kv_and_scores.kv.shape[-1] == self.head_dim * self.coff
-        compressed_kv_output = torch.full(
-            (kv_and_scores.kv.size(0), self.head_dim),
-            fill_value=10000.0,
-            dtype=kv_and_scores.kv.dtype,
-            device=kv_and_scores.kv.device,
+        # temp_buffer: KVAndScoreOld stores kv and score in SEPARATE tensors,
+        # so we need two scratches (vs the new path which has one combined).
+        temp_buffer_kv = self._ensure_scratch(
+            "extend_old_temp_kv", (max_buffer_size, head_dim_times_coff),
+            kv_and_scores.kv.dtype, kv_and_scores.kv.device,
         )
+        temp_buffer_score = self._ensure_scratch(
+            "extend_old_temp_score", (max_buffer_size, head_dim_times_coff),
+            kv_and_scores.score.dtype, kv_and_scores.score.device,
+        )
+        temp_buffer = KVAndScore(kv=temp_buffer_kv, score=temp_buffer_score)
+
+        assert kv_and_scores.kv.shape[-1] == self.head_dim * self.coff
+        compressed_kv_output = self._ensure_scratch(
+            "extend_old_output", (kv_and_scores.kv.size(0), self.head_dim),
+            kv_and_scores.kv.dtype, kv_and_scores.kv.device,
+        )
+        # Sentinel fill (matches original behavior: misuse should produce obvious junk).
+        compressed_kv_output.fill_(10000.0)
 
         bs = forward_batch.batch_size
         pt = 0
@@ -1241,8 +1394,12 @@ class MQALayer(nn.Module):
         assert (
             config.compress_rope_theta == expected_compress_rope_theta
         ), f"{config.compress_rope_theta=} {expected_compress_rope_theta=}"
+        # rope_theta may not be an attribute of the model_type-shimmed config
+        # class used in newer transformers; fall back to the HF default.
         rope_base = (
-            config.compress_rope_theta if self.compress_ratio else config.rope_theta
+            config.compress_rope_theta
+            if self.compress_ratio
+            else getattr(config, "rope_theta", 10000)
         )
 
         self.rotary_emb = get_rope_wrapper(
@@ -1771,15 +1928,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        @maybe_torch_compile
-        def hc_pre_torch_impl(x, hc_fn):
-            x_flat = x.flatten(1).float()
-            rsqrt = torch.rsqrt(
-                x_flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
-            )
-            mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
-            return x_flat, mixes
-
         # x: [n,hc,d] -> y: [n,d], where n=b*s
         shape, dtype = x.size(), x.dtype
 
@@ -1827,7 +1975,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
             # Naive Torch implementation
-            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+            x_flat, mixes = _hc_pre_torch_impl(x, hc_fn, self.rms_norm_eps)
 
         from sglang.srt.layers.mhc import hc_split_sinkhorn
 
@@ -1869,14 +2017,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         assert post.shape == (x.shape[0], self.hc_mult)
         assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
 
-        @maybe_torch_compile
-        def hc_post_torch_impl(x, residual, post, comb):
-            return (
-                post.unsqueeze(-1) * x.unsqueeze(1)
-                + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
-            ).type_as(x)
-
-        result = hc_post_torch_impl(x, residual, post, comb)
+        result = _hc_post_torch_impl(x, residual, post, comb)
         return result
 
     def forward(
@@ -1890,6 +2031,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
             assert deepseek_v4_moe_code_path_checker.observed == 0
 
+        # SGLANG_CAPTURE_TRACE=1 — per-phase stderr prints inside the captured
+        # forward; last line before scheduler-dead points at the crash site.
+        _trace = os.environ.get("SGLANG_CAPTURE_TRACE", "0") == "1"
+        if _trace:
+            import sys
+            sys.stderr.write(f"[trace] L{self.layer_id} enter\n"); sys.stderr.flush()
 
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(
@@ -1897,11 +2044,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         )  # -> [n, d]
         hidden_states = self.input_layernorm(hidden_states)
 
+        if _trace:
+            sys.stderr.write(f"[trace] L{self.layer_id} pre-attn\n"); sys.stderr.flush()
+
         hidden_states = self.self_attn(
             x=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
         )
+
+        if _trace:
+            sys.stderr.write(f"[trace] L{self.layer_id} post-attn\n"); sys.stderr.flush()
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states  # [n, hc, d]
@@ -1960,12 +2113,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states, local_hidden_states = get_global_dp_buffer(), hidden_states
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         # ----------------------------------- MoE ------------------------------------
+        if _trace:
+            sys.stderr.write(f"[trace] L{self.layer_id} pre-mlp\n"); sys.stderr.flush()
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        if _trace:
+            sys.stderr.write(f"[trace] L{self.layer_id} post-mlp\n"); sys.stderr.flush()
         # ----------------------------------- Scatter (DP only, not CP) ----------------
         if _use_tp_moe_gather:
             hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
@@ -2131,10 +2288,18 @@ class DeepseekV4Model(nn.Module):
             else None
         )
 
+        _trace = os.environ.get("SGLANG_CAPTURE_TRACE", "0") == "1"
+        if _trace:
+            import sys
+            sys.stderr.write("[trace] post-decoder pre-hc_head\n"); sys.stderr.flush()
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
+        if _trace:
+            sys.stderr.write("[trace] post-hc_head pre-norm\n"); sys.stderr.flush()
         hidden_states = self.norm(hidden_states)
+        if _trace:
+            sys.stderr.write("[trace] post-norm return\n"); sys.stderr.flush()
 
         if pre_hc_head is not None:
             return hidden_states, pre_hc_head
@@ -2251,10 +2416,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                     forward_batch.seq_lens_cpu.tolist(),
                 )
 
+        _trace = os.environ.get("SGLANG_CAPTURE_TRACE", "0") == "1"
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        if _trace:
+            import sys
+            sys.stderr.write("[trace] causallm post-model pre-logits\n"); sys.stderr.flush()
         aux_hidden_states = None
         pre_hc_head = None
         if self.capture_aux_hidden_states:
@@ -2264,7 +2433,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             and envs.SGLANG_DSV4_MODE.get() == "2604"
         ):
             hidden_states, pre_hc_head = hidden_states
-        return self.logits_processor(
+        if _trace:
+            sys.stderr.write("[trace] causallm pre-logits_processor\n"); sys.stderr.flush()
+        logits = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
@@ -2275,6 +2446,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             #       should rename and generalize later, e.g. "hidden_states_for_spec"
             hidden_states_before_norm=pre_hc_head,
         )
+        if _trace:
+            sys.stderr.write("[trace] causallm post-logits_processor return\n"); sys.stderr.flush()
+        return logits
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from deep_gemm import transform_sf_into_required_layout
@@ -2414,15 +2588,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         #     weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, is_nextn
         # )
 
-        if (
-            envs.SGLANG_DSV4_MODE.get() == "2604"
-            and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
-        ):
-            if envs.SGLANG_DSV4_FP4_EXPERTS.get():
-                weights = _dequant_fp8_wo_a(weights)
-            else:
-                # Converted FP8 checkpoint: wo_a is already bf16; drop stale wo_a.scale if present
-                weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+            # Probe one wo_a weight to decide: if stored FP8, dequant inline;
+            # if already bf16, just drop any stale scale tensor.
+            weights = _maybe_dequant_fp8_wo_a(weights)
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -2760,9 +2929,10 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     assert (
         weight.dtype == torch.float8_e4m3fn
     ), f"expected fp8_e4m3fn, got {weight.dtype}"
-    assert (
-        scale.dtype == torch.float8_e8m0fnu
-    ), f"expected fp8_e8m0fnu, got {scale.dtype}"
+    assert scale.dtype in (
+        torch.float8_e8m0fnu,
+        torch.float32,
+    ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
     assert weight.shape == (8192, 4096), f"unexpected weight shape {weight.shape}"
     assert scale.shape == (64, 32), f"unexpected scale shape {scale.shape}"
 
@@ -2775,6 +2945,31 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
     assert result.shape == (8192, 4096)
     return result.to(torch.bfloat16)
+
+
+def _maybe_dequant_fp8_wo_a(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Auto-detect checkpoint wo_a layout and dequant inline when needed.
+
+    - FP8 wo_a + separate scale (HF DeepSeek-V4-Flash{,-Base}): dequant to bf16.
+    - BF16 wo_a + stale scale (some converted checkpoints): drop stale scale.
+    - BF16 wo_a, no scale: passthrough.
+    """
+    weights_dict = dict(weights)
+    sample_wo_a = next(
+        (t for n, t in weights_dict.items() if n.endswith(".wo_a.weight")),
+        None,
+    )
+    is_fp8_wo_a = sample_wo_a is not None and sample_wo_a.dtype == torch.float8_e4m3fn
+
+    if is_fp8_wo_a:
+        yield from _dequant_fp8_wo_a(weights_dict.items())
+    else:
+        for n, t in weights_dict.items():
+            if n.endswith(".wo_a.scale"):
+                continue
+            yield n, t
 
 
 def _dequant_fp8_wo_a(

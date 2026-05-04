@@ -1,8 +1,89 @@
+import os
 from typing import Optional, Tuple
 
 import torch
 
 from .lib import KVScope, Testcase, TestcaseForDecode, TestParam
+
+# torch.compile wrap for the hot sparse-attn inner loop on AMD.
+# Disabled if SGLANG_DISABLE_REF_ATTN_COMPILE=1.
+_USE_COMPILE = os.environ.get("SGLANG_DISABLE_REF_ATTN_COMPILE", "0") != "1"
+# Opt-in Triton sparse-decode kernel (AMD MI355X / gfx950).
+# Takes precedence over torch.compile when set to "1".
+_USE_TRITON = os.environ.get("SGLANG_TRITON_SPARSE_DECODE", "0") == "1"
+
+
+def _sparse_attn_decode_inner(
+    q_f32: torch.Tensor,            # [B*Sq, Hq, D]
+    gathered_kv_f32: torch.Tensor,  # [B*Sq, Topk, D]
+    invalid_mask: torch.Tensor,     # [B*Sq, Topk] bool
+    attn_sink: Optional[torch.Tensor],  # [Hq] or None
+    sm_scale: float,
+    d_v: int,
+    h_q: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure-tensor sparse decode core: q @ K^T, masked softmax, @ V, optional sink scaling.
+    Returns (output[B*Sq, Hq, dv] bf16, lse[B*Sq, Hq] f32).
+    """
+    attn_weight = q_f32 @ gathered_kv_f32.transpose(-1, -2)  # [B*Sq, Hq, Topk]
+    attn_weight = attn_weight * sm_scale
+    attn_weight = attn_weight.masked_fill(
+        invalid_mask.unsqueeze(1).expand_as(attn_weight), float("-inf")
+    )
+    lse = attn_weight.logsumexp(dim=-1)  # [B*Sq, Hq]
+    attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
+    output = attn_weight @ gathered_kv_f32[..., :d_v]  # [B*Sq, Hq, dv]
+    if attn_sink is not None:
+        scale = 1.0 / (1.0 + torch.exp(attn_sink.view(1, h_q) - lse))
+        output = output * scale.unsqueeze(-1)
+    return output.to(torch.bfloat16), lse
+
+
+def _sparse_attn_decode_inner_triton(
+    q_f32: torch.Tensor,            # [B*Sq, Hq, D]
+    gathered_kv_f32: torch.Tensor,  # [B*Sq, Topk, D]
+    invalid_mask: torch.Tensor,     # [B*Sq, Topk] bool
+    attn_sink: Optional[torch.Tensor],  # [Hq] or None
+    sm_scale: float,
+    d_v: int,
+    h_q: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Triton-backed sparse decode core for AMD MI355X (gfx950).
+
+    Drop-in replacement for ``_sparse_attn_decode_inner``. Returns the same
+    ``(output[B*Sq, Hq, dv] bf16, lse[B*Sq, Hq] fp32)`` tuple.
+
+    The Triton kernel operates on bf16 Q/K; sglang callers pass fp32, so we
+    cast on the boundary. Invalid rows inside ``gathered_kv_f32`` may contain
+    NaN (sglang already runs ``nan_to_num`` upstream, but we defend here too
+    because the Triton kernel will poison the accumulator on NaN loads).
+    """
+    # Cast to bf16 (kernel contract).
+    q_bf = (
+        q_f32.to(torch.bfloat16).contiguous()
+        if q_f32.dtype != torch.bfloat16
+        else q_f32.contiguous()
+    )
+    kv_bf = (
+        gathered_kv_f32.to(torch.bfloat16).contiguous()
+        if gathered_kv_f32.dtype != torch.bfloat16
+        else gathered_kv_f32.contiguous()
+    )
+    kv_bf = torch.nan_to_num(kv_bf, nan=0.0)
+
+    from .triton_sparse_decode_kernel import triton_sparse_attn_decode
+
+    return triton_sparse_attn_decode(
+        q_bf, kv_bf, invalid_mask, attn_sink, float(sm_scale), int(d_v)
+    )
+
+
+if _USE_TRITON:
+    _sparse_attn_decode_inner = _sparse_attn_decode_inner_triton
+elif _USE_COMPILE:
+    _sparse_attn_decode_inner = torch.compile(
+        _sparse_attn_decode_inner, dynamic=True, fullgraph=False
+    )
 
 
 def _merge_two_lse(
@@ -106,32 +187,34 @@ def ref_sparse_attn_decode(
     # may use more advanced approach
 
     gathered_kv = gathered_kv.view(b * p.s_q, -1, p.d_qk).float()
-    gathered_kv[gathered_kv != gathered_kv] = 0.0
+    gathered_kv = torch.nan_to_num(gathered_kv, nan=0.0)
     q = t.q.float().view(b * p.s_q, p.h_q, p.d_qk)
-    attn_weight = q @ gathered_kv.transpose(
-        -1, -2
-    )  # [t.b*t.s_q, t.h_q, topk+extra_topk]
-    attn_weight *= t.sm_scale
-    attn_weight[
-        invalid_mask.view(b * p.s_q, 1, -1).broadcast_to(
-            b * p.s_q, p.h_q, invalid_mask.size(-1)
-        )
-    ] = float("-inf")
-    lse = attn_weight.logsumexp(dim=-1)  # [t.b*t.s_q, t.h_q]
-    attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
-    output = attn_weight @ gathered_kv[..., : p.d_v]  # [t.b*t.s_q, t.h_q, t.dv]
+    invalid_mask_2d = invalid_mask.view(b * p.s_q, -1)
+
+    output, lse = _sparse_attn_decode_inner(
+        q,
+        gathered_kv,
+        invalid_mask_2d,
+        t.attn_sink,
+        float(t.sm_scale),
+        int(p.d_v),
+        int(p.h_q),
+    )
+
     output = output.view(b, p.s_q, p.h_q, p.d_v)
     lse = lse.view(b, p.s_q, p.h_q)
 
-    # Attention sink
-    if t.attn_sink is not None:
-        output *= (
-            1.0 / (1.0 + torch.exp(t.attn_sink.view(1, 1, p.h_q) - lse))
-        ).unsqueeze(-1)
-
-    # Correct for q tokens which has no attendable k
+    # Correct for q tokens which has no attendable k.
+    # NOTE: previously this was guarded by `if lonely_q_mask.any():` which
+    # forces a GPU->CPU sync and breaks CUDA graph capture
+    # (HIP error: operation not permitted when stream is capturing). We now
+    # always apply the where; it's a no-op when the mask is all-False.
     lonely_q_mask = lse == float("-inf")
-    output[lonely_q_mask.unsqueeze(-1).broadcast_to(b, p.s_q, p.h_q, p.d_v)] = 0.0
-    lse[lonely_q_mask] = float("+inf")
+    output = torch.where(
+        lonely_q_mask.unsqueeze(-1).expand_as(output),
+        torch.zeros_like(output),
+        output,
+    )
+    lse = torch.where(lonely_q_mask, torch.full_like(lse, float("+inf")), lse)
 
-    return output.to(torch.bfloat16), lse.transpose(1, 2)
+    return output, lse.transpose(1, 2)

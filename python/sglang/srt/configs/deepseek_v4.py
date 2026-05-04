@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from transformers import PretrainedConfig
 
@@ -8,7 +8,11 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 @dataclass
 class DeepSeekV4Config(PretrainedConfig):
-    architectures: List[str]
+    # All fields default-valued so dataclass synthesis works under newer
+    # transformers versions whose PretrainedConfig introduces annotated
+    # fields with defaults (which would otherwise force every subclass field
+    # to also have a default).
+    architectures: List[str] = field(default_factory=lambda: ["DeepseekV4ForCausalLM"])
     attention_bias: bool = False
     attention_dropout: float = 0.0
     bos_token_id: int = 0
@@ -41,11 +45,11 @@ class DeepSeekV4Config(PretrainedConfig):
     qk_nope_head_dim: int = 448
     qk_rope_head_dim: int = 64
 
-    quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig)
+    quantization_config: Optional[QuantizationConfig] = None
 
     rms_norm_eps: float = 1e-6
 
-    rope_scaling: Dict[str, float] = field(default_factory=dict)
+    rope_scaling: Optional[Dict[str, float]] = None
     rope_theta: int = 10000
 
     routed_scaling_factor: float = 1.5
@@ -64,7 +68,7 @@ class DeepSeekV4Config(PretrainedConfig):
     window_size: int = 128
 
     compress_rope_theta: int = 40000
-    compress_ratios: List[int] = field(default_factory=list)
+    compress_ratios: Optional[List[int]] = None
 
     n_hash_layers: int = 3
     hc_mult: int = 4

@@ -509,6 +509,15 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # Use aiter's Triton fp8_paged_mqa_logits kernel (HIP path).
+    # When set, takes precedence over the torch fallback. Falls back to the
+    # selected path automatically if `aiter.ops.triton.pa_mqa_logits` is unavailable.
+    SGLANG_FP8_PAGED_MQA_LOGITS_AITER = EnvBool(False)
+    # Cap padded sequence length used by fp8_paged_mqa_logits_torch (HIP fallback).
+    # 0 = inherit from caller (page_table.shape[1] * page_size, typically 1048576 at --context-len=1M),
+    # which OOMs at multi-bs since transient allocs scale with B * padded * (heads | head_dim).
+    # Set to a tighter bound (e.g. 32768) to cap both capture and eager allocations.
+    SGLANG_INDEXER_MAX_SEQ_LEN = EnvInt(0)
 
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)

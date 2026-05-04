@@ -128,10 +128,14 @@ class PagedIndexerMetadata(IndexerMetadata):
     deep_gemm_metadata: Any = field(init=False, repr=False)
 
     def __post_init__(self):
-        # if is_hip():
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            # For HIP/ROCm, we don't need deep_gemm metadata
-            # Will use aiter's deepgemm_fp8_paged_mqa_logits instead
+        # On HIP/ROCm we route through either the torch fallback or aiter's
+        # deepgemm_fp8_paged_mqa_logits — neither needs deep_gemm metadata,
+        # so skip the import (deep_gemm is CUDA-only and not present in the
+        # ROCm container).
+        if (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_AITER.get()
+        ):
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
@@ -169,17 +173,18 @@ class PagedIndexerMetadata(IndexerMetadata):
 
     def copy_(self, other: "PagedIndexerMetadata"):
         if is_hip():
-            # HIP/ROCm: don't copy deep_gemm_metadata (it's None)
             copy_fields = ["page_table", "c4_seq_lens"]
+            assign_fields = ["deep_gemm_metadata"]
         else:
-            # CUDA: original behavior
             copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
+            assign_fields = []
 
         copy_metadata(
             src=other,
             dst=self,
             check_eq_fields=["page_size"],
             copy_fields=copy_fields,
+            assign_fields=assign_fields,
         )
 
 
