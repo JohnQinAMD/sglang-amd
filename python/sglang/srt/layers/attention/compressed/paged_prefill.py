@@ -10,7 +10,9 @@ from sglang.srt.layers.attention.nsa import index_buf_accessor_v4
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, is_hip
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.metadata import PagedCoreMetadata
@@ -59,6 +61,22 @@ def make_swa_ring_buffer_indices(
     SWA_WINDOW = swa_window_size
     extend_num_tokens = forward_batch.extend_num_tokens
     assert extend_num_tokens is not None
+    if _is_hip:
+        from sglang.srt.layers.swa_indices_hip import hip_make_swa_prefill_indices
+
+        seq_lens = forward_batch.seq_lens
+        extend_lens = forward_batch.extend_seq_lens
+        assert extend_lens is not None
+        if extend_lens.dtype != seq_lens.dtype:
+            extend_lens = extend_lens.to(seq_lens.dtype)
+        swa_indices = torch.empty(
+            (extend_num_tokens, SWA_WINDOW), device=device, dtype=torch.int32
+        )
+        return hip_make_swa_prefill_indices(
+            seq_lens_k=seq_lens,
+            seq_lens_q=extend_lens,
+            swa_indices=swa_indices,
+        )
     if envs.SGLANG_OPT_USE_TILELANG_SWA_PREPARE.get():
         seq_lens = forward_batch.seq_lens
         extend_lens = forward_batch.extend_seq_lens
