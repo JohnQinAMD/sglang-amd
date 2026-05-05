@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
+from sglang.jit_kernel.freqs_idx_gather_triton import freqs_idx_gather
 from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
 from sglang.srt.layers.deepseek_v4_rope import (
     apply_rotary_emb_triton,
@@ -563,14 +564,14 @@ class Compressor(nn.Module):
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            freqs_cis = freqs_idx_gather(seq_lens, self.freqs_cis, self.ratio)
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
             )
         else:
             kv_compressed = self.norm(kv_compressed)
             self.print_tensor(kv_compressed, "kv_after_norm")
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            freqs_cis = freqs_idx_gather(seq_lens, self.freqs_cis, self.ratio)
             self.print_tensor(freqs_cis, "freqs_cis")
             apply_rotary_emb_triton(
                 kv_compressed[..., -self.rope_head_dim :], freqs_cis
@@ -789,14 +790,14 @@ class Compressor(nn.Module):
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            freqs_cis = freqs_idx_gather(seq_lens, self.freqs_cis, self.ratio)
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
             )
         else:
             kv_compressed = self.norm(kv_compressed)
             self.print_tensor(kv_compressed, "kv_after_norm")
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            freqs_cis = freqs_idx_gather(seq_lens, self.freqs_cis, self.ratio)
             self.print_tensor(freqs_cis, "freqs_cis")
             apply_rotary_emb_triton(
                 kv_compressed[..., -self.rope_head_dim :], freqs_cis
@@ -1127,14 +1128,14 @@ class Compressor(nn.Module):
             ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            freqs_cis = freqs_idx_gather(seq_lens, self.freqs_cis, self.ratio)
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
             )
         else:
             kv_compressed = self.norm(kv_compressed)
             self.print_tensor(kv_compressed, "kv_after_norm")
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            freqs_cis = freqs_idx_gather(seq_lens, self.freqs_cis, self.ratio)
             self.print_tensor(freqs_cis, "freqs_cis")
             apply_rotary_emb_triton(
                 kv_compressed[..., -self.rope_head_dim :], freqs_cis
