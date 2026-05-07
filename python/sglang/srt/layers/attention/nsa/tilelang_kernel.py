@@ -2346,6 +2346,9 @@ def dpsk_v4_fp8_attention_fwd(
     replicate_h = max((num_heads + 63) // 64, 1)
     seq = batch * seq_len * replicate_h
 
+    if _is_gfx95_supported and seq > 4 * cu:
+        block_I = 32
+
     k1, _, bs_kv_1 = _build_fp8_combined_view(k_cache)
     topk1 = indices.shape[-1]
     ni_1 = topk1 // block_I
