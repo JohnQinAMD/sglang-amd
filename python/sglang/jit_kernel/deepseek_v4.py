@@ -420,8 +420,9 @@ def _tilelang_make_swa_indices_kernel(swa_window_size: int, threads: int = 128) 
                 return
             for i in T.serial(0, batch_size, step=32):
                 j = i + lane_id
-                if cu_seqlens_q[j] <= token_id < cu_seqlens_q[j + 1]:
-                    s_batch_id[warp_id] = j
+                if j < batch_size:
+                    if cu_seqlens_q[j] <= token_id < cu_seqlens_q[j + 1]:
+                        s_batch_id[warp_id] = j
             T.sync_warp()
 
             seq_idx = s_batch_id[warp_id]
