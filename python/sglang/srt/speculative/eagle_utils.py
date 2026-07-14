@@ -662,21 +662,15 @@ def _verify_uses_greedy(
     is_all_greedy: bool,
     is_cpu: bool,
     is_npu: bool,
-    is_hip: bool,
     is_xpu: bool,
-    use_rejection_sampling: bool,
 ) -> bool:
     """Whether EAGLE verify must commit argmax(greedy) instead of the sampling path.
 
-    HIP has no CUDA/MUSA sampling-verify kernels, so it historically forced greedy here;
-    route it through the pure-Triton chain sampler when rejection sampling supplies the
-    draft proposal and the batch isn't all-greedy. Reduces to the original predicate on
-    non-HIP platforms.
+    Greedy only where there is no sampling-verify kernel (CPU/NPU/XPU) or when the batch
+    is all-greedy. HIP has the pure-Triton chain (rejection) and tree (target-only)
+    samplers, so it samples like CUDA.
     """
-    hip_can_sample = is_hip and use_rejection_sampling and not is_all_greedy
-    return (
-        is_all_greedy or is_cpu or is_npu or is_xpu or (is_hip and not hip_can_sample)
-    )
+    return is_all_greedy or is_cpu or is_npu or is_xpu
 
 
 def eagle_sample(
@@ -765,9 +759,7 @@ def eagle_sample(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
         is_npu=_is_npu,
-        is_hip=_is_hip,
         is_xpu=_is_xpu,
-        use_rejection_sampling=_use_rej,
     ):
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
@@ -784,8 +776,8 @@ def eagle_sample(
         )
     else:
         # sgl_kernel renorm/tree-verify ops are CUDA/MUSA-only; import lazily so the HIP
-        # branch never ImportErrors. The gate forces rejection sampling on HIP, so the
-        # CUDA-only tree_speculative_sampling_target_only is never referenced there.
+        # branch never ImportErrors. On HIP the pure-Triton chain (rejection) and tree
+        # (target-only) samplers below stand in for the CUDA-only ops.
         if not _is_hip:
             from sgl_kernel import (
                 top_k_renorm_prob,
@@ -795,6 +787,7 @@ def eagle_sample(
 
         from sglang.srt.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
+            tree_speculative_sampling_target_only_triton,
         )
 
         use_rejection_sampling = _use_rej
@@ -847,11 +840,12 @@ def eagle_sample(
         # coins for final sampling
         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
+        if use_rejection_sampling:
+            sampling_fn = chain_speculative_sampling_triton
+        elif _is_hip:
+            sampling_fn = tree_speculative_sampling_target_only_triton
+        else:
+            sampling_fn = tree_speculative_sampling_target_only
         sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
