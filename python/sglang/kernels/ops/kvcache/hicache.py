@@ -3,20 +3,21 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_hip_runtime,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     import torch
     from tvm_ffi.module import Module
 
-# Caps num_blocks in the transfer kernels, to bound interference with model
-# compute. Interference is blocks x duration, so shrinking this past the point
-# where reads saturate backfires: on MI355X a 2-block read runs ~4x longer and
-# costs more concurrent GEMM throughput than an 8-block one, not less. 8 is where
-# idle read bandwidth tops out; higher only adds pressure. Affects reads only in
-# practice -- the write kernel's grid already fills the GPU.
-DEFAULT_BLOCK_QUOTA = 8
+# Grid cap on the transfer kernels, bounding interference with model compute. ROCm
+# needs it looser: at 2 a read runs ~4x longer and disturbs compute more, not less.
+DEFAULT_BLOCK_QUOTA = 8 if is_hip_runtime() else 2
 
 
 @cache_once
