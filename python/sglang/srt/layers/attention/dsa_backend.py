@@ -337,8 +337,8 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
-        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
-            model_runner.server_args.dsa_topk_backend
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(
+            model_runner.server_args.dsa_topk_backend, self.dsa_index_topk
         )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64

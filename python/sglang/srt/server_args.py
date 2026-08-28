@@ -1820,11 +1820,11 @@ class ServerArgs:
     dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer', 'aiter'. Defaults to aiter, which falls back to sgl-kernel off ROCm or on a top-k its kernel does not serve. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
             choices=DSA_TOPK_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),
-    ] = "sgl-kernel"
+    ] = "aiter"
     disable_flashinfer_autotune: A[
         bool, "Disable FlashInfer autotuning.", NS("exec.kernel")
     ] = False
