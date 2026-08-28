@@ -5476,8 +5476,7 @@ class ServerArgs:
                     # GLM-5.x) that shares the same decode top-k path.
                     envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 if not self._resolved().enable_dp_attention and self.nnodes == 1:
-                    # TODO (Hubert): Put this back later
-                    # self.enable_aiter_allreduce_fusion = True
+                    self.enable_aiter_allreduce_fusion = True
                     logger.info(
                         "Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM"
                     )
