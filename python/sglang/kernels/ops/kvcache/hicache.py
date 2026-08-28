@@ -3,14 +3,21 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_hip_runtime,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     import torch
     from tvm_ffi.module import Module
 
-DEFAULT_BLOCK_QUOTA = 2
+# Grid cap on the transfer kernels, bounding interference with model compute. ROCm
+# needs it looser: at 2 a read runs ~4x longer and disturbs compute more, not less.
+DEFAULT_BLOCK_QUOTA = 8 if is_hip_runtime() else 2
 
 
 @cache_once
