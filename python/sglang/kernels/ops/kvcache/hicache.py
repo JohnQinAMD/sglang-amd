@@ -10,7 +10,13 @@ if TYPE_CHECKING:
     import torch
     from tvm_ffi.module import Module
 
-DEFAULT_BLOCK_QUOTA = 2
+# Caps num_blocks in the transfer kernels. It was 2, meant to keep the copy from
+# competing with model compute -- but two blocks on a 256-CU GPU stretch a read
+# out ~4x, and the copy then interferes for that much longer. Measured on MI355X
+# the low cap loses on both counts: less read bandwidth AND less concurrent GEMM
+# throughput than 8. Writes are unaffected either way; their kernel already fills
+# the grid.
+DEFAULT_BLOCK_QUOTA = 8
 
 
 @cache_once
