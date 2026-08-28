@@ -10,12 +10,12 @@ if TYPE_CHECKING:
     import torch
     from tvm_ffi.module import Module
 
-# Caps num_blocks in the transfer kernels. It was 2, meant to keep the copy from
-# competing with model compute -- but two blocks on a 256-CU GPU stretch a read
-# out ~4x, and the copy then interferes for that much longer. Measured on MI355X
-# the low cap loses on both counts: less read bandwidth AND less concurrent GEMM
-# throughput than 8. Writes are unaffected either way; their kernel already fills
-# the grid.
+# Caps num_blocks in the transfer kernels, to bound interference with model
+# compute. Interference is blocks x duration, so shrinking this past the point
+# where reads saturate backfires: on MI355X a 2-block read runs ~4x longer and
+# costs more concurrent GEMM throughput than an 8-block one, not less. 8 is where
+# idle read bandwidth tops out; higher only adds pressure. Affects reads only in
+# practice -- the write kernel's grid already fills the GPU.
 DEFAULT_BLOCK_QUOTA = 8
 
 
