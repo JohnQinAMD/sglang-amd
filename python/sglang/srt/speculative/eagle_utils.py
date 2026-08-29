@@ -888,10 +888,7 @@ def eagle_sample(
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if _is_hip:
-            if (
-                sampling_info.need_top_k_sampling
-                or sampling_info.need_top_p_sampling
-            ):
+            if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
                 target_probs = _renorm_top_k_top_p_hip(
                     target_probs,
                     torch.repeat_interleave(
