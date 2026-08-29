@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from enum import Enum, IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hip
+
+logger = logging.getLogger(__name__)
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -20,11 +24,40 @@ class TopkTransformMethod(IntEnum):
     RAGGED = auto()
 
 
+_AITER_TOPK = 2048  # the top-k aiter's coop kernel is built for
+
+
+def _aiter_topk_unavailable(index_topk: int) -> Optional[str]:
+    """Why aiter cannot serve this top-k, or None if it can."""
+    if not is_hip():
+        return "ROCm only"
+    if index_topk != _AITER_TOPK:
+        return f"top-k is {index_topk}, aiter's kernel is built for {_AITER_TOPK}"
+    try:
+        import aiter
+    except ImportError:
+        return "aiter is not installed"
+    if not hasattr(aiter, "dsa_topk_transform"):
+        return "this aiter build has no dsa_topk_transform"
+    return None
+
+
 class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
     AITER = "aiter"
+
+    @classmethod
+    def resolve(cls, name: str, index_topk: int) -> "DSATopKBackend":
+        backend = cls(name)
+        if backend is not cls.AITER:
+            return backend
+        reason = _aiter_topk_unavailable(index_topk)
+        if reason is None:
+            return backend
+        logger.info("aiter DSA top-k unavailable (%s), using sgl-kernel", reason)
+        return cls.SGL_KERNEL
 
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL

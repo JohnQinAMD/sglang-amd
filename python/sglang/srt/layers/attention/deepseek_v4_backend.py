@@ -549,8 +549,8 @@ class DeepseekV4AttnBackend(
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
         )
-        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
-            model_runner.server_args.dsa_topk_backend
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(
+            model_runner.server_args.dsa_topk_backend, self.c4_topk
         )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
