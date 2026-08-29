@@ -45,6 +45,9 @@ from sglang.srt.lora.deepseek_mla_correction import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     _select_local_dcp_heads_for_autotune,
     is_dcp_mla_decode_phase,
@@ -123,6 +126,17 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
+def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
+    """Dequantize an absorbed MLA weight, skipping the pass when it is a no-op."""
+    if (
+        w.dtype == torch.bfloat16
+        and isinstance(w_scale, (int, float))
+        and w_scale == 1.0
+    ):
+        return w
+    return w.to(torch.bfloat16) * w_scale
+
+
 def rocm_absorb_q_bmm(
     attn: DeepseekV2AttentionMLA,
     q_nope: torch.Tensor,
@@ -168,7 +182,7 @@ def rocm_absorb_q_bmm(
         else:
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1),
-                attn.w_kc.to(torch.bfloat16) * attn.w_scale,
+                _absorb_weight_bf16(attn.w_kc, attn.w_scale),
             )
     return q_nope_out
 
@@ -222,10 +236,26 @@ def rocm_absorb_v_bmm(
                 transpose_bm_in=True,
                 dtype=torch.bfloat16,
             )
+        elif not is_in_tc_piecewise_cuda_graph():
+            # Same (batch, heads, dim) layout as the quantized paths above, so the
+            # post-GEMM flatten is a view. Skipped under piecewise: torch dynamo
+            # rejects out= with a non-contiguous output tensor.
+            _bmm_buf = torch.empty(
+                attn_output.shape[0],
+                attn.num_local_heads,
+                attn.w_vc.shape[2],
+                device=attn_output.device,
+                dtype=torch.bfloat16,
+            )
+            torch.bmm(
+                attn_output.to(torch.bfloat16).transpose(0, 1),
+                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+                out=_bmm_buf.transpose(0, 1),
+            )
         else:
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
-                attn.w_vc.to(torch.bfloat16) * attn.w_scale,
+                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
             )
 
     if _bmm_buf is not None:
