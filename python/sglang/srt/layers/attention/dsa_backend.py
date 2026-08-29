@@ -1452,7 +1452,7 @@ class DeepseekSparseAttnBackend(
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
 
-            if is_cuda() and not _is_hip:
+            if is_cuda() or _is_hip:
                 from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_decode_metadata,
                 )
@@ -1494,7 +1494,7 @@ class DeepseekSparseAttnBackend(
         elif forward_mode.is_target_verify():
             max_seqlen_k = self._graph_page_table_width(metadata)
 
-            if is_cuda() and not _is_hip:
+            if is_cuda() or _is_hip:
                 from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_target_verify_metadata,
                 )
@@ -1592,7 +1592,7 @@ class DeepseekSparseAttnBackend(
                 device=self.device,
             )
 
-            if is_cuda() and not _is_hip:
+            if is_cuda() or _is_hip:
                 from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_draft_extend_metadata,
                 )
