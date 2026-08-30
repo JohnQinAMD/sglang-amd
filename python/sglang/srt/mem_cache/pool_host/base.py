@@ -323,6 +323,12 @@ class HostKVCache(abc.ABC):
         return len(self.free_slots) + self.num_release_slots
 
     def _merge_release_slots(self):
+        # free_slots starts as arange and alloc() takes from the front, so a fresh
+        # pool hands out contiguous indices; this concatenates freed chunks in
+        # release order, so once the pool has evicted and reused anything they are
+        # scattered. Backends that copy page by page (io_backend=direct) therefore
+        # degrade as the pool reaches steady state, while the kernel backends
+        # gather inside the kernel and are unaffected.
         if self.num_release_slots == 0:
             return
 
