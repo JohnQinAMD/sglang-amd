@@ -8,8 +8,11 @@ from collections import defaultdict
 import torch
 
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 
 class HostTensorAllocator:
@@ -153,10 +156,26 @@ def alloc_with_host_register(
     """
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
+
+    On ROCm, prefer pin_memory: the HiCache transfer kernels dereference a table
+    of host pointers on the GPU, and hipHostRegister maps a region at a device
+    address that differs from its host virtual address, whereas hipHostMalloc
+    (which pin_memory goes through) returns one address valid on both sides.
+    Storage backend allocators own their memory, so they still have to register.
     """
+    if pin_memory and _is_hip and type(allocator) is HostTensorAllocator:
+        return torch.empty(dims, dtype=dtype, device=device, pin_memory=True)
+
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer)
+        if _is_hip:
+            logger.warning(
+                "%s owns its host memory, which ROCm cannot address from the GPU "
+                "at its host virtual address; use --hicache-io-backend direct "
+                "with this storage backend.",
+                type(allocator).__name__,
+            )
     return buffer
 
 
