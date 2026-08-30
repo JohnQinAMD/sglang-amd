@@ -743,7 +743,15 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        # HIP belongs here too: #28534 added _is_hip to MHATokenToKVPoolHost's
+        # gates but left this index-K pool on _is_cuda, with no comment claiming
+        # the exclusion was deliberate.
+        #
+        # Requires the pin_memory allocation in pool_host/common.py: under
+        # page_first, backup_from_device_all_layer hands the host-side
+        # k_data_ptrs table to the JIT kernel to dereference on the GPU, which
+        # only holds when the host buffer came from hipHostMalloc.
+        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
             element_size=self.token_stride_size
         )
         self.k_device_ptrs = torch.tensor(
