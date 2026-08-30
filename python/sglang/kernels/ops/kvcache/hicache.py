@@ -17,6 +17,9 @@ if TYPE_CHECKING:
 
 # Grid cap on the transfer kernels, bounding interference with model compute. ROCm
 # needs 16: 2, 8 and 16 blocks leave the same GEMM throughput, 16 just ends sooner.
+# Do not lower it without measuring the per-layer path: its calls move a factor of
+# layer_num less data than the all-layer path's, so the narrow rounds below lose
+# bandwidth at a smaller cap while the all-layer path barely moves.
 DEFAULT_BLOCK_QUOTA = 16 if is_hip_runtime() else 2
 
 # Mirrors device::kWarpThreads in sgl_kernel/utils.cuh: the lane group a worker

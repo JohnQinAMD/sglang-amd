@@ -2689,7 +2689,10 @@ class ServerArgs:
     hicache_io_backend: A[
         str,
         Arg(
-            help="The IO backend for KV cache transfer between CPU and GPU",
+            help="The IO backend for KV cache transfer between CPU and GPU. "
+            "'direct' copies page by page, so it degrades once the host pool "
+            "reaches steady state and its free list hands out scattered "
+            "indices; 'kernel' gathers inside the transfer kernel instead.",
             choices=["direct", "kernel", "kernel_ascend"],
         ),
         NS("memory"),

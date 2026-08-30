@@ -185,6 +185,10 @@ class HostKVCache(abc.ABC):
         during SIGKILL reclaim, which can stall teardown in uninterruptible
         sleep for tens of seconds. Idempotent. (Only the host_register path
         needs this; npu/musa pin_memory buffers are freed by torch.)
+
+        Buffers that were never registered -- ROCm's default allocator returns
+        hipHostMalloc memory instead -- are skipped by _cuda_host_unregister,
+        which tracks what it registered. Do not re-derive that here.
         """
         if getattr(self, "_destroyed", False):
             return
@@ -319,6 +323,12 @@ class HostKVCache(abc.ABC):
         return len(self.free_slots) + self.num_release_slots
 
     def _merge_release_slots(self):
+        # free_slots starts as arange and alloc() takes from the front, so a fresh
+        # pool hands out contiguous indices; this concatenates freed chunks in
+        # release order, so once the pool has evicted and reused anything they are
+        # scattered. Backends that copy page by page (io_backend=direct) therefore
+        # degrade as the pool reaches steady state, while the kernel backends
+        # gather inside the kernel and are unaffected.
         if self.num_release_slots == 0:
             return
 

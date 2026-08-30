@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from collections import defaultdict
 
 import torch
 
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 
 class HostTensorAllocator:
@@ -117,6 +121,15 @@ def get_allocator_type(server_args) -> str:
     return backend or "default"
 
 
+# Pointers actually handed to cudaHostRegister; only these may be unregistered.
+# A buffer that came from hipHostMalloc was never registered, and unregistering
+# one reports success while corrupting the runtime's memory-object map. Record
+# that here, at the registration site, rather than re-deriving it at teardown,
+# where a second copy of the platform and allocator condition would drift.
+_registered_host_ptrs: set[int] = set()
+_registered_host_ptrs_lock = threading.Lock()
+
+
 def _cuda_host_register(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
     n_bytes = buffer.numel() * buffer.element_size()
@@ -128,18 +141,28 @@ def _cuda_host_register(buffer: torch.Tensor) -> None:
             f"size={n_bytes}; host buffer is not pinned and device transfers "
             f"may silently return stale data."
         )
+    with _registered_host_ptrs_lock:
+        _registered_host_ptrs.add(buffer.data_ptr())
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
+    ptr = buffer.data_ptr()
+    with _registered_host_ptrs_lock:
+        was_registered = ptr in _registered_host_ptrs
+        _registered_host_ptrs.discard(ptr)
+    if not was_registered:
+        return
     cudart = torch.cuda.cudart()
-    rc = cudart.cudaHostUnregister(buffer.data_ptr())
+    rc = cudart.cudaHostUnregister(ptr)
     if int(rc) != 0:
-        # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
-        logger.warning(
+        # Unexpected, since we only reach here for pointers we registered
+        # ourselves. Still best-effort: teardown must not raise, and the mapping
+        # is reclaimed at process exit.
+        logger.error(
             "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x",
             int(rc),
             cudart.cudaGetErrorString(rc),
-            buffer.data_ptr(),
+            ptr,
         )
 
 
@@ -153,10 +176,26 @@ def alloc_with_host_register(
     """
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
+
+    On ROCm, prefer pin_memory: the HiCache transfer kernels dereference a table
+    of host pointers on the GPU, and hipHostRegister maps a region at a device
+    address that differs from its host virtual address, whereas hipHostMalloc
+    (which pin_memory goes through) returns one address valid on both sides.
+    Storage backend allocators own their memory, so they still have to register.
     """
+    if pin_memory and _is_hip and type(allocator) is HostTensorAllocator:
+        return torch.empty(dims, dtype=dtype, device=device, pin_memory=True)
+
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer)
+        if _is_hip:
+            logger.warning(
+                "%s owns its host memory, which ROCm cannot address from the GPU "
+                "at its host virtual address; use --hicache-io-backend direct "
+                "with this storage backend.",
+                type(allocator).__name__,
+            )
     return buffer
 
 
