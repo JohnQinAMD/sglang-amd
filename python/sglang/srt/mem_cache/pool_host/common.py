@@ -155,8 +155,10 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
     rc = cudart.cudaHostUnregister(ptr)
     if int(rc) != 0:
-        # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
-        logger.warning(
+        # Unexpected, since we only reach here for pointers we registered
+        # ourselves. Still best-effort: teardown must not raise, and the mapping
+        # is reclaimed at process exit.
+        logger.error(
             "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x",
             int(rc),
             cudart.cudaGetErrorString(rc),
