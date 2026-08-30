@@ -103,6 +103,11 @@ def get_allocator_from_storage(allocator_type):
         return HostTensorAllocator()
 
 
+# Allocator types get_allocator_from_storage() maps to something other than
+# HostTensorAllocator; every other value falls through to HostTensorAllocator.
+_OWNED_MEMORY_ALLOCATOR_TYPES = ("shm", "mooncake", "mori")
+
+
 def get_allocator_type(server_args) -> str:
     backend = getattr(server_args, "hicache_storage_backend", None)
     if backend == "shm":
@@ -119,6 +124,22 @@ def get_allocator_type(server_args) -> str:
             except Exception:
                 pass
     return backend or "default"
+
+
+def host_allocator_owns_memory(server_args) -> bool:
+    """Whether these server args select an allocator that owns its host memory.
+
+    The server-args-side form of the `type(allocator) is HostTensorAllocator`
+    test in alloc_with_host_register(), for callers that have to decide before
+    any pool exists. Keyed on get_allocator_type() rather than on
+    hicache_storage_backend so that the two agree on the cases where they
+    differ, notably a "dynamic" backend whose extra config asks for shm.
+
+    Over-reports if mooncake or mori is selected but its allocator is
+    unavailable, since get_allocator_from_storage() then falls back to
+    HostTensorAllocator. That direction is the safe one.
+    """
+    return get_allocator_type(server_args) in _OWNED_MEMORY_ALLOCATOR_TYPES
 
 
 # Pointers actually handed to cudaHostRegister; only these may be unregistered.
@@ -190,10 +211,13 @@ def alloc_with_host_register(
     if pin_memory:
         _cuda_host_register(buffer)
         if _is_hip:
+            # Reached with io_backend=kernel only by callers that construct host
+            # pools without going through ServerArgs, which downgrades that
+            # combination; see ServerArgs._resolve_hicache_rocm_io_compatibility.
             logger.warning(
                 "%s owns its host memory, which ROCm cannot address from the GPU "
-                "at its host virtual address; use --hicache-io-backend direct "
-                "with this storage backend.",
+                "at its host virtual address, so the kernel io backend cannot "
+                "read or write these buffers.",
                 type(allocator).__name__,
             )
     return buffer

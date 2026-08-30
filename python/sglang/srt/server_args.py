@@ -7368,6 +7368,7 @@ class ServerArgs:
         """Normalize hicache-related knobs into a valid runtime configuration.
 
         Resolution order:
+        0) ROCm <-> I/O compatibility (may rewrite io backend).
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
         """
@@ -7381,6 +7382,12 @@ class ServerArgs:
             )
         ):
             return
+
+        # Step 0: ROCm cannot run the kernel io backend against a storage
+        # backend's own host memory. Must run before step 1 so the downgrade
+        # lands on the same configuration as an explicit --hicache-io-backend
+        # direct, whose layout step 1 then normalizes.
+        self._resolve_hicache_rocm_io_compatibility()
 
         # Step 1: Initial layout-io compatibility normalization.
         self._resolve_layout_io_compatibility()
@@ -7429,6 +7436,29 @@ class ServerArgs:
             "logical slot accounting with per-rank physical translation at "
             "the transfer boundary (dcp_size=%d).",
             self.dcp_size,
+        )
+
+    def _resolve_hicache_rocm_io_compatibility(self):
+        if not is_hip() or self.hicache_io_backend != "kernel":
+            # kernel_ascend and any other future backend keep current behavior.
+            return
+
+        # Imported here rather than at module scope so that the allocator-type
+        # mapping has exactly one definition, the one alloc_with_host_register()
+        # also relies on.
+        from sglang.srt.mem_cache.pool_host.common import (
+            get_allocator_type,
+            host_allocator_owns_memory,
+        )
+
+        if not host_allocator_owns_memory(self):
+            return
+
+        self.hicache_io_backend = "direct"
+        logger.warning(
+            "Kernel io backend cannot address the host memory owned by the %s "
+            "allocator on ROCm, switching to direct io backend",
+            get_allocator_type(self),
         )
 
     def _resolve_layout_io_compatibility(self):
