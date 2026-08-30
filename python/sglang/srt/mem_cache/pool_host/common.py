@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from collections import defaultdict
 
 import torch
@@ -120,6 +121,15 @@ def get_allocator_type(server_args) -> str:
     return backend or "default"
 
 
+# Pointers actually handed to cudaHostRegister; only these may be unregistered.
+# A buffer that came from hipHostMalloc was never registered, and unregistering
+# one reports success while corrupting the runtime's memory-object map. Record
+# that here, at the registration site, rather than re-deriving it at teardown,
+# where a second copy of the platform and allocator condition would drift.
+_registered_host_ptrs: set[int] = set()
+_registered_host_ptrs_lock = threading.Lock()
+
+
 def _cuda_host_register(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
     n_bytes = buffer.numel() * buffer.element_size()
@@ -131,18 +141,26 @@ def _cuda_host_register(buffer: torch.Tensor) -> None:
             f"size={n_bytes}; host buffer is not pinned and device transfers "
             f"may silently return stale data."
         )
+    with _registered_host_ptrs_lock:
+        _registered_host_ptrs.add(buffer.data_ptr())
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
+    ptr = buffer.data_ptr()
+    with _registered_host_ptrs_lock:
+        was_registered = ptr in _registered_host_ptrs
+        _registered_host_ptrs.discard(ptr)
+    if not was_registered:
+        return
     cudart = torch.cuda.cudart()
-    rc = cudart.cudaHostUnregister(buffer.data_ptr())
+    rc = cudart.cudaHostUnregister(ptr)
     if int(rc) != 0:
         # Best-effort on shutdown: warn, don't raise -- a leak is reclaimed at exit.
         logger.warning(
             "cudaHostUnregister failed (rc=%d, %s) for ptr=%#x",
             int(rc),
             cudart.cudaGetErrorString(rc),
-            buffer.data_ptr(),
+            ptr,
         )
 
 

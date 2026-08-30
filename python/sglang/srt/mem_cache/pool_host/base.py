@@ -185,6 +185,10 @@ class HostKVCache(abc.ABC):
         during SIGKILL reclaim, which can stall teardown in uninterruptible
         sleep for tens of seconds. Idempotent. (Only the host_register path
         needs this; npu/musa pin_memory buffers are freed by torch.)
+
+        Buffers that were never registered -- ROCm's default allocator returns
+        hipHostMalloc memory instead -- are skipped by _cuda_host_unregister,
+        which tracks what it registered. Do not re-derive that here.
         """
         if getattr(self, "_destroyed", False):
             return
