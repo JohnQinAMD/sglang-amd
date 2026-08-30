@@ -697,7 +697,10 @@ def _top_p_renorm_kernel(
 
 
 def _renorm_top_k_top_p_hip(
-    probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    need_top_k: bool = True,
 ) -> torch.Tensor:
     """ROCm replacement for sgl_kernel top_k/top_p_renorm_prob (CUDA/MUSA-only).
 
@@ -707,7 +710,9 @@ def _renorm_top_k_top_p_hip(
     """
     vocab = probs.shape[-1]
     probs = probs.contiguous()
-    if bool((top_ks < vocab).any()):
+    # Same predicate as `(top_ks < vocab).any()`, but the host already computed it
+    # from the request params; reading it off the device costs a full sync here.
+    if need_top_k:
         sorted_probs, sorted_indices = probs.sort(dim=-1, descending=True)
         order = torch.arange(vocab, device=probs.device).view(1, -1)
         sorted_probs = sorted_probs.masked_fill(order >= top_ks.reshape(-1, 1), 0.0)
@@ -897,6 +902,7 @@ def eagle_sample(
                     torch.repeat_interleave(
                         sampling_info.top_ps, verify_input.draft_token_num, dim=0
                     ),
+                    need_top_k=sampling_info.need_top_k_sampling,
                 )
                 maybe_detect_nan(
                     target_probs, "v2 verify: target_probs after top_k/top_p renorm"
