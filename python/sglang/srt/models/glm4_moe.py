@@ -1449,6 +1449,10 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    # The loader rewrites the draft arch to this name, so the inherited
+    # DeepseekV3 value would never match and silently disable fusion.
+    fused_shared_experts_architecture = "GlmMoeDsaForCausalLMNextN"
+
     # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited
     # substr mapping would wrongly rewrite GLM's real layer-61 weights.
     # exclude_layers remapping for the MTP layer is handled explicitly in
