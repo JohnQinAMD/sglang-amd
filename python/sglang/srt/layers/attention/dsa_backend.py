@@ -148,6 +148,63 @@ def _can_use_flydsl_sparse_mla_prefill(
     )
 
 
+# FlyDSL sparse MLA decode scratch, one flat buffer per device.
+#
+# aiter allocates partial_output/partial_lse itself when they are not supplied,
+# so leaving them out costs one pair of allocations per layer per step -- 79
+# layers on GLM-5.2 -- and its docstring asks for persistent buffers precisely
+# when the call is captured in a HIP graph, which this one is. The buffers are
+# scratch: the layers run back to back on the current stream and the kernel
+# consumes the partials before the next layer overwrites them, so one buffer
+# serves every layer and every backend instance on a device.
+#
+# aiter requires them contiguous with the exact shapes [seq,ng,H,DV] and
+# [seq,ng,H], which a 2-D slice of a max-sized tensor is not. Keep one flat
+# 1-D buffer and view a prefix of it instead.
+_FLYDSL_DECODE_H = 16
+_FLYDSL_DECODE_DV = 512
+_FLYDSL_DECODE_MAX_SEQ = 96  # the dispatch gate's upper bound
+_FLYDSL_DECODE_MAX_NG = 33  # width <= 2112 over a 64-token page
+_FLYDSL_DECODE_SCRATCH: Dict[torch.device, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _flydsl_decode_scratch(
+    seq: int, ng: int, device: torch.device
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Persistent partials for one decode call, or (None, None) to let aiter allocate.
+
+    Returns (None, None) rather than allocating under graph capture: a buffer
+    created inside a capture lives in that graph's private pool, and reusing it
+    from another graph is the stale-mapping hazard this backend has already been
+    bitten by once.
+    """
+    n_out = seq * ng * _FLYDSL_DECODE_H * _FLYDSL_DECODE_DV
+    n_lse = seq * ng * _FLYDSL_DECODE_H
+    buf = _FLYDSL_DECODE_SCRATCH.get(device)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None, None
+        cap = (
+            _FLYDSL_DECODE_MAX_SEQ
+            * _FLYDSL_DECODE_MAX_NG
+            * _FLYDSL_DECODE_H
+            * _FLYDSL_DECODE_DV
+        )
+        buf = (
+            torch.empty(cap, dtype=torch.bfloat16, device=device),
+            torch.empty(
+                cap // _FLYDSL_DECODE_DV, dtype=torch.float32, device=device
+            ),
+        )
+        _FLYDSL_DECODE_SCRATCH[device] = buf
+    if n_out > buf[0].numel() or n_lse > buf[1].numel():
+        return None, None
+    return (
+        buf[0][:n_out].view(seq, ng, _FLYDSL_DECODE_H, _FLYDSL_DECODE_DV),
+        buf[1][:n_lse].view(seq, ng, _FLYDSL_DECODE_H),
+    )
+
+
 def _can_use_flydsl_sparse_mla_decode(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -2432,12 +2489,17 @@ class DeepseekSparseAttnBackend(
                     dtype=torch.bfloat16,
                     device=q_all.device,
                 )
+                partial_output, partial_lse = _flydsl_decode_scratch(
+                    q_all.shape[0], page_table_1.shape[1] // 64, q_all.device
+                )
                 return flydsl_sparse_mla_decode(
                     q=q_all,
                     kv=kv_cache,
                     indices=page_table_1,
                     out=out,
                     sm_scale=layer.scaling,
+                    partial_output=partial_output,
+                    partial_lse=partial_lse,
                 )
             return self._forward_tilelang(
                 q_all=q_all,
