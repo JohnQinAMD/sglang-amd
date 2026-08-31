@@ -1365,6 +1365,17 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # gfx950 (MI355X) only: run the DSA indexer decode step as four fused raw-HIP
+    # kernels (dual GEMV | rope+Hadamard+quant+cache | paged-MQA logits+histogram
+    # | top-k+page transform) instead of the 12-launch aiter/torch chain.
+    # Opt-in; setting it to 0 is the kill switch. The gate additionally requires
+    # gfx950 + aiter preshuffle + fp8 e4m3fn + page_size 64 + index_topk 2048 +
+    # head_dim 128 + 32 index heads, and admits decode and target-verify at up to
+    # MAX_ROWS (24 = cuda-graph-max-bs 4 x num_draft_tokens 6) query rows. Every
+    # other shape falls back to the standard path. It does NOT enable
+    # use_dsa_indexer_fusion (which is CUDA only and, on this path, would delete
+    # the Hadamard - see Indexer._maybe_rotate).
+    SGLANG_DSA_HIP_FUSED_INDEXER_GFX950 = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)

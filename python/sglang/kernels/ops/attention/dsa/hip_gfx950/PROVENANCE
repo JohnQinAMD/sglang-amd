@@ -1,0 +1,20 @@
+Each file under csrc/ is a DISTILLATION of a KernelForge campaign source: the
+accepted kernel plus its one accepted configuration, with the search space that
+produced it removed.  It is NOT a verbatim copy and cannot be re-synced by
+copying -- a kernel update is a re-distillation, gated on the campaign's
+integration suite reproducing its three results unchanged: the 8-check gate and
+shape suite, bit-exact equivalence against the standard path at every verify
+batch shape, and ~41.2 us for the fused four-kernel chain in graph replay.
+
+  csrc/dual_gemv_bf16.cu   cfg 61 of 67          <- bench/csrc/dual_gemv_bf16.cu
+  csrc/indexer_qk_had.cu   impl 3, 1 of 3 kernels <- bench/csrc/indexer_qk_had.cu
+  csrc/logits_kernel.hip   variant 20 of 80      <- experiments/phaseC/logits_kernel.hip
+  csrc/topk_phaseD.cu      1 of 5 kernels        <- experiments/phaseD/topk_phaseD.cu
+
+sha256 of those upstream sources when the distillation was taken.  A mismatch
+means the campaign source moved and the distillation should be revisited:
+
+  8c1f55243267cf4bd710caba6e95557d0c3f21c4550f7abe853f9fe854565445  dual_gemv_bf16.cu
+  0785bbda5e04ca04bcb43882124b6dea250571389286d3cbfa8eab44d00593ea  indexer_qk_had.cu
+  ee10484c6e4c9519c0cad25f95206f8852c3df1b1c92367f4cde79b0a3b75190  logits_kernel.hip
+  25f8e76201cbb16ef7f2a07f12ba50813521ba57c1c1be77eb9084ff262968c2  topk_phaseD.cu

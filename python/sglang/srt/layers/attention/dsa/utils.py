@@ -61,6 +61,91 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
+def gfx950_fused_indexer_runtime_ok() -> bool:
+    """Whether this *runtime* can serve the gfx950 4-kernel fused DSA indexer.
+
+    Process-level half of the gate: architecture, build and kill switch only.
+    The per-model shape half lives in ``Indexer.__init__``
+    (``use_gfx950_fused_indexer``) and the per-call half in ``forward_cuda``;
+    all three must be true. Mirrors the structure of
+    ``aiter_can_use_preshuffle_paged_mqa`` above, and like it the result is
+    cached so the probe cost is paid once per process.
+
+    Requirements, each traceable to a kernel-source constraint:
+      * gfx950 (MI355X). The kernels are compiled ``--offload-arch=gfx950`` only
+        and use ``v_mfma_scale_f32_16x16x128_f8f6f4`` / ``v_permlane*``.
+      * aiter + its preshuffle paged-MQA path, because section B reads the FP8
+        index-K cache in aiter's ``preshuffle=True`` page layout
+        (64 tokens x 132 B, MFMA-16x16 order) and section A writes it.
+      * OCP ``float8_e4m3fn``; the kernels never emit fnuz.
+
+    ``SGLANG_DSA_HIP_FUSED_INDEXER_GFX950=0`` is the kill switch and is checked
+    first, so a bad build can always be turned off without a code change.
+    """
+    from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+    from sglang.srt.utils import is_gfx95_supported
+
+    if not envs.SGLANG_DSA_HIP_FUSED_INDEXER_GFX950.get():
+        return False
+    if not (is_hip() and is_gfx95_supported()):
+        return False
+    if not get_bool_env_var("SGLANG_USE_AITER"):
+        return False
+    if not aiter_can_use_preshuffle_paged_mqa():
+        return False
+    if is_fp8_fnuz():
+        return False
+    from sglang.kernels.ops.attention.dsa.hip_gfx950 import loader
+
+    return loader.modules_or_none() is not None
+
+
+def gfx950_model_shape_supported(**kwargs) -> bool:
+    """Static per-model half of the gfx950 fused-indexer gate.
+
+    Thin indirection so ``dsa_indexer`` never imports the HIP extension package
+    on a platform that cannot use it.
+    """
+    from sglang.kernels.ops.attention.dsa.hip_gfx950 import model_shape_supported
+
+    return model_shape_supported(**kwargs)
+
+
+def assert_hadamard_preserved(indexer) -> None:
+    """Prove the fused Hadamard is still applied before enabling the fused path.
+
+    This is the trap Phase I exists to prevent, and it is deliberately an
+    executable check rather than a comment. The merged 6144->160 projection that
+    section A depends on is, upstream, gated behind ``use_dsa_indexer_fusion`` --
+    and ``Indexer._maybe_rotate`` reads the SAME boolean, returning ``x``
+    unrotated when it is set. Flipping that flag on for gfx950 would therefore
+    silently delete ``rotate_activation`` and change the stored index-K cache
+    format. The gfx950 path uses its own flag and keeps the Hadamard inside
+    ``indexer_qk_had``; this asserts both halves of that claim:
+
+      1. ``use_dsa_indexer_fusion`` is still off, so every non-gated call on this
+         module still rotates, and
+      2. ``_maybe_rotate`` is genuinely not the identity: a 128-point Hadamard
+         maps ``e_0`` to a vector whose entries are all ``128 ** -0.5``, while
+         the identity leaves 127 zeros.
+    """
+    assert not indexer.use_dsa_indexer_fusion, (
+        "gfx950 fused DSA indexer requires use_dsa_indexer_fusion == False: the "
+        "fused flag makes Indexer._maybe_rotate a no-op, which deletes the "
+        "Hadamard and changes the index-K cache format"
+    )
+    device = indexer.k_norm.weight.device
+    probe = torch.zeros(1, indexer.head_dim, dtype=torch.bfloat16, device=device)
+    probe[0, 0] = 1.0
+    rotated = indexer._maybe_rotate(probe)
+    assert bool((rotated != 0).all()), (
+        "Indexer._maybe_rotate did not apply the Hadamard rotation "
+        "(e_0 must map to a dense vector); refusing to enable the gfx950 fused "
+        "indexer, which assumes the rotation is present"
+    )
+
+
 # Tile size for the indexer FP8 K-cache preshuffle layout. Store and gather
 # kernels reorganize each page into (tile x tile) blocks so the aiter preshuffle
 # paged-MQA gather can consume the cache directly.
