@@ -79,10 +79,7 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 
-# Opt-in (default off): route the validated gfx950 FP8 sparse-MLA prefill shape
-# through AITER's FlyDSL kernel. Decode and all unsupported shapes stay on
-# TileLang. Keep this off by default until full serving no-regression coverage
-# is available.
+# Default-off FlyDSL routes for the validated gfx950 sparse-MLA shapes.
 _DSA_FLYDSL_PREFILL = get_bool_env_var("SGLANG_DSA_FLYDSL_PREFILL")
 _DSA_FLYDSL_DECODE = get_bool_env_var("SGLANG_DSA_FLYDSL_DECODE")
 
@@ -94,6 +91,22 @@ _IS_GFX950 = _IS_GFX95 and (
 )
 
 
+def _are_flydsl_fp8_inputs(*tensors: torch.Tensor) -> bool:
+    device = tensors[0].device
+    return device.type == "cuda" and all(
+        tensor.dtype == torch.float8_e4m3fn
+        and tensor.is_contiguous()
+        and tensor.device == device
+        for tensor in tensors
+    )
+
+
+def _is_flydsl_kv_shape(kv_cache: torch.Tensor) -> bool:
+    return (kv_cache.ndim == 2 and kv_cache.shape[1] == 576) or (
+        kv_cache.ndim == 3 and kv_cache.shape[1:] == (1, 576)
+    )
+
+
 def _can_use_flydsl_sparse_mla_prefill(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -103,26 +116,16 @@ def _can_use_flydsl_sparse_mla_prefill(
     return (
         _DSA_FLYDSL_PREFILL
         and _IS_GFX950
-        and q_nope.dtype == torch.float8_e4m3fn
-        and q_rope.dtype == torch.float8_e4m3fn
-        and kv_cache.dtype == torch.float8_e4m3fn
-        and page_table.dtype == torch.int32
         and q_nope.ndim == 3
         and q_rope.ndim == 3
         and q_nope.shape[0] >= 512
         and q_nope.shape[1:] == (16, 512)
         and q_rope.shape == (q_nope.shape[0], 16, 64)
-        and (
-            (kv_cache.ndim == 2 and kv_cache.shape[1] == 576)
-            or (kv_cache.ndim == 3 and kv_cache.shape[1:] == (1, 576))
-        )
+        and _are_flydsl_fp8_inputs(q_nope, q_rope, kv_cache)
+        and _is_flydsl_kv_shape(kv_cache)
+        and page_table.dtype == torch.int32
         and page_table.shape == (q_nope.shape[0], 2048)
-        and q_nope.is_contiguous()
-        and q_rope.is_contiguous()
-        and kv_cache.is_contiguous()
         and page_table.is_contiguous()
-        and q_rope.device == q_nope.device
-        and kv_cache.device == q_nope.device
         and page_table.device == q_nope.device
     )
 
@@ -131,32 +134,30 @@ def _can_use_flydsl_sparse_mla_decode(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
+    *,
+    head_dim: int,
+    v_head_dim: int,
 ) -> bool:
     seq = q_all.shape[0] if q_all.ndim == 3 else 0
     width = page_table.shape[1] if page_table.ndim == 2 else 0
     return (
         _DSA_FLYDSL_DECODE
         and _IS_GFX950
-        and q_all.dtype == torch.float8_e4m3fn
-        and kv_cache.dtype == torch.float8_e4m3fn
-        and page_table.dtype == torch.int32
         and q_all.ndim == 3
         and page_table.ndim == 2
+        and (head_dim, v_head_dim) == (576, 512)
         and seq in (1, 6)
         and q_all.shape[1:] == (16, 576)
-        and (
-            (kv_cache.ndim == 2 and kv_cache.shape[1] == 576)
-            or (kv_cache.ndim == 3 and kv_cache.shape[1:] == (1, 576))
-        )
+        and _are_flydsl_fp8_inputs(q_all, kv_cache)
+        and _is_flydsl_kv_shape(kv_cache)
+        and page_table.dtype == torch.int32
         and page_table.shape[0] == seq
         and 64 <= width <= 2112
         and width % 64 == 0
-        and q_all.is_contiguous()
-        and kv_cache.is_contiguous()
         and page_table.is_contiguous()
-        and kv_cache.device == q_all.device
         and page_table.device == q_all.device
     )
+
 
 if is_cuda():
     import deep_gemm
@@ -2128,9 +2129,7 @@ class DeepseekSparseAttnBackend(
                         sm_scale=layer.scaling,
                         d_v=layer.v_head_dim,
                     )
-                # Cat-skip, as in forward_decode: q_rope=None means the caller
-                # already handed us the concatenated form and q_all is a
-                # zero-copy view of it. `not _is_hip` keeps CUDA byte-identical.
+                # HIP callers may provide q in its already-concatenated layout.
                 if q_all is None or not _is_hip:
                     q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
@@ -2334,13 +2333,8 @@ class DeepseekSparseAttnBackend(
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            # Caller passed split q_nope / q_rope; we'll need to concat below if
-            # the chosen impl wants q_all.
             q_all = None
         else:
-            # Caller passed already-concatenated q (q_all = q). Reuse it directly
-            # via a zero-copy view; the impl-specific blocks below will skip the
-            # otherwise redundant concat_mla_absorb_q_general call.
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
@@ -2401,17 +2395,20 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif self.dsa_decode_impl == "tilelang":
-            # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
-            # has already been set to a zero-copy view of q in the else branch
-            # above and we can reuse it directly. The `not _is_hip` clause keeps
-            # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
+            # HIP callers may provide q in its already-concatenated layout.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            if _can_use_flydsl_sparse_mla_decode(q_all, kv_cache, page_table_1):
+            if _can_use_flydsl_sparse_mla_decode(
+                q_all,
+                kv_cache,
+                page_table_1,
+                head_dim=layer.head_dim,
+                v_head_dim=layer.v_head_dim,
+            ):
                 from aiter.ops.flydsl import flydsl_sparse_mla_decode
 
                 out = torch.empty(
-                    (q_all.shape[0], 16, 512),
+                    (q_all.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                     dtype=torch.bfloat16,
                     device=q_all.device,
                 )

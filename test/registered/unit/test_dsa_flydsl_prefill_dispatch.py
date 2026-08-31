@@ -1,9 +1,10 @@
 """CPU coverage for the opt-in FlyDSL sparse-MLA prefill dispatch gate."""
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
+
 from sglang.srt.layers.attention import dsa_backend
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -12,11 +13,21 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDsaFlydslPrefillDispatch(CustomTestCase):
+    @staticmethod
+    def _tensor(shape, dtype, *, device="cuda:0", contiguous=True):
+        tensor = MagicMock(spec=torch.Tensor)
+        tensor.shape = torch.Size(shape)
+        tensor.ndim = len(shape)
+        tensor.dtype = dtype
+        tensor.device = torch.device(device)
+        tensor.is_contiguous.return_value = contiguous
+        return tensor
+
     def setUp(self):
-        self.q_nope = torch.empty((512, 16, 512), dtype=torch.float8_e4m3fn)
-        self.q_rope = torch.empty((512, 16, 64), dtype=torch.float8_e4m3fn)
-        self.kv = torch.empty((4096, 1, 576), dtype=torch.float8_e4m3fn)
-        self.indices = torch.empty((512, 2048), dtype=torch.int32)
+        self.q_nope = self._tensor((512, 16, 512), torch.float8_e4m3fn)
+        self.q_rope = self._tensor((512, 16, 64), torch.float8_e4m3fn)
+        self.kv = self._tensor((4096, 1, 576), torch.float8_e4m3fn)
+        self.indices = self._tensor((512, 2048), torch.int32)
 
     def _can_use(self, **replacements):
         values = {
@@ -37,11 +48,34 @@ class TestDsaFlydslPrefillDispatch(CustomTestCase):
     @patch.object(dsa_backend, "_DSA_FLYDSL_PREFILL", True)
     def test_unvalidated_inputs_fall_back(self):
         cases = {
-            "short sequence": {"q_nope": self.q_nope[:511]},
-            "bf16 q": {"q_nope": self.q_nope.bfloat16()},
-            "fnuz kv": {"kv_cache": self.kv.to(torch.float8_e4m3fnuz)},
-            "wrong topk": {"page_table": self.indices[:, :-1]},
-            "noncontiguous indices": {"page_table": self.indices.t()},
+            "short sequence": {
+                "q_nope": self._tensor((511, 16, 512), torch.float8_e4m3fn),
+                "q_rope": self._tensor((511, 16, 64), torch.float8_e4m3fn),
+                "page_table": self._tensor((511, 2048), torch.int32),
+            },
+            "bf16 q": {"q_nope": self._tensor((512, 16, 512), torch.bfloat16)},
+            "noncontiguous q": {
+                "q_nope": self._tensor(
+                    (512, 16, 512), torch.float8_e4m3fn, contiguous=False
+                )
+            },
+            "fnuz kv": {
+                "kv_cache": self._tensor((4096, 1, 576), torch.float8_e4m3fnuz)
+            },
+            "CPU q": {
+                "q_nope": self._tensor(
+                    (512, 16, 512), torch.float8_e4m3fn, device="cpu"
+                )
+            },
+            "different device": {
+                "q_rope": self._tensor(
+                    (512, 16, 64), torch.float8_e4m3fn, device="cuda:1"
+                )
+            },
+            "wrong topk": {"page_table": self._tensor((512, 2047), torch.int32)},
+            "noncontiguous indices": {
+                "page_table": self._tensor((512, 2048), torch.int32, contiguous=False)
+            },
         }
         for name, replacements in cases.items():
             with self.subTest(name=name):
@@ -50,6 +84,11 @@ class TestDsaFlydslPrefillDispatch(CustomTestCase):
     @patch.object(dsa_backend, "_IS_GFX950", True)
     @patch.object(dsa_backend, "_DSA_FLYDSL_PREFILL", False)
     def test_default_off_falls_back(self):
+        self.assertFalse(self._can_use())
+
+    @patch.object(dsa_backend, "_IS_GFX950", False)
+    @patch.object(dsa_backend, "_DSA_FLYDSL_PREFILL", True)
+    def test_non_gfx950_falls_back(self):
         self.assertFalse(self._can_use())
 
 
