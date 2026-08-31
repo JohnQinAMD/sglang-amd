@@ -51,10 +51,11 @@ CACHE_TOK_STRIDE = 132  # paged_mqa_logits.cu: TOK_STRIDE (128 K bytes + 4 scale
 Q_LORA_RANK = 2048  # dual_gemv cfg 61, Q half
 HIDDEN_SIZE = 6144  # dual_gemv cfg 61, K half
 QUANT_BLOCK = 128  # qk_rope_hadamard_quant.cu: quant_block_size == head_dim
-# The only row cap among the four kernels (dual_gemv_bf16.cu). Section A is
-# chunked to it rather than capping the whole path, so rr >= 2 verify stays fused.
+# The only per-launch row cap among the four kernels (dual_gemv_bf16.cu).
+# Section A is chunked to it rather than capping the whole path, so larger
+# verify batches stay fused.
 DUAL_GEMV_MAX_M = 8
-MAX_ROWS = 24  # bs 4 (cuda-graph-max-bs) x num_draft_tokens 6
+MAX_ROWS = 48  # bs 8 x num_draft_tokens 6
 
 
 def model_shape_supported(
