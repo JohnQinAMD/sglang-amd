@@ -48,8 +48,8 @@ N_HEADS = 32  # validated shape (grid.y of the qk kernel, MFMA n of the logits k
 INDEX_TOPK = 2048  # topk_transform.cu: constexpr TOPK = 2048u
 PAGE_SIZE = 64  # paged_mqa_logits.cu: PAGE_TOK
 CACHE_TOK_STRIDE = 132  # paged_mqa_logits.cu: TOK_STRIDE (128 K bytes + 4 scale)
-Q_LORA_RANK = 2048  # dual_gemv cfg 26, Q half
-HIDDEN_SIZE = 6144  # dual_gemv cfg 26, K half
+Q_LORA_RANK = 2048  # dual_gemv cfg 61, Q half
+HIDDEN_SIZE = 6144  # dual_gemv cfg 61, K half
 QUANT_BLOCK = 128  # qk_rope_hadamard_quant.cu: quant_block_size == head_dim
 # The only row cap among the four kernels (dual_gemv_bf16.cu). Section A is
 # chunked to it rather than capping the whole path, so rr >= 2 verify stays fused.

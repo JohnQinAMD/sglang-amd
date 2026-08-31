@@ -1144,9 +1144,11 @@ static bool prank_resident_ok(const void *fn, int blocks_per_row, int rows) {
 // host entry
 // ---------------------------------------------------------------------------
 
-// The accepted Phase D configuration, baked in rather than selected:
-//   PTMODE 2   per-block window of the page table staged in LDS
-//   FUSEREF    the refinement runs in k_scatter's last-arriving block
+// The accepted Phase D configuration uses PTMODE 2 (a per-block page-table
+// window staged in LDS).  Very wide production page-table strides can exceed
+// that fixed window even when the live row is short, so those layouts use the
+// numerically identical PTMODE 0 global-gather specialization instead.
+// FUSEREF keeps the refinement in k_scatter's last-arriving block in both cases.
 void topk_transform(torch::Tensor logits, torch::Tensor row_ends,
                     torch::Tensor page_table, torch::Tensor out,
                     torch::Tensor ghist, torch::Tensor cursor,
@@ -1178,12 +1180,12 @@ void topk_transform(torch::Tensor logits, torch::Tensor row_ends,
   TORCH_CHECK(logits.scalar_type() == at::kFloat &&
                   out.scalar_type() == at::kInt,
               "dtype");
-  // PTMODE 2 is baked into the instantiation, so the window it stages has to
-  // fit -- checked here rather than dispatched around.  page_size 64, G 64 and
-  // a 62016-token context need 18 of the 256 entries.
-  TORCH_CHECK(
-      (PTS + (int64_t)G - 1) / (int64_t)G + 2 <= (int64_t)dsa_topk::PT_WIN,
-      "page-table window needs <= ", dsa_topk::PT_WIN, " entries per block");
+  // PTMODE 2 is faster when its per-block page-table slice fits in LDS.  PTS is
+  // a static graph property while row_ends is replay-time data, so use PTS as
+  // the conservative upper bound.  PTMODE 0 has no page-table-width limit.
+  const bool use_pt_window =
+      (PTS + (int64_t)G - 1) / (int64_t)G + 2 <=
+      (int64_t)dsa_topk::PT_WIN;
 
   auto stream = at::cuda::getCurrentCUDAStream();
   dim3 grid((unsigned)G, (unsigned)R, 1);
@@ -1203,13 +1205,22 @@ void topk_transform(torch::Tensor logits, torch::Tensor row_ends,
   // The persistent-rank tail finishes the exact rank behind a row barrier, so
   // its blocks must be co-resident.  When they would not be, the ordinary
   // kernel-boundary form is launched instead and the selector cannot hang.
-  if (prank_resident_ok(
+  if (use_pt_window &&
+      prank_resident_ok(
           (const void *)dsa_topk::k_scatter<2, true, true, true, true>, (int)G,
           (int)R)) {
     hipLaunchKernelGGL((dsa_topk::k_scatter<2, true, true, true, true, 16>),
                        SCATTER_ARGS);
-  } else {
+  } else if (use_pt_window) {
     hipLaunchKernelGGL((dsa_topk::k_scatter<2, true, true, true>),
+                       SCATTER_ARGS);
+  } else if (prank_resident_ok(
+                 (const void *)dsa_topk::k_scatter<0, true, true, true, true>,
+                 (int)G, (int)R)) {
+    hipLaunchKernelGGL((dsa_topk::k_scatter<0, true, true, true, true, 16>),
+                       SCATTER_ARGS);
+  } else {
+    hipLaunchKernelGGL((dsa_topk::k_scatter<0, true, true, true>),
                        SCATTER_ARGS);
   }
 #undef SCATTER_ARGS
