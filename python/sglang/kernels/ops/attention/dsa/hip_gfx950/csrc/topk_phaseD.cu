@@ -751,51 +751,17 @@ refine_core(uint32_t n, uint32_t above, uint32_t remain,
     for(uint32_t i = filled + tx; i < TOPK; i += BS) { o[i] = -1; }
 }
 
-// Shared by the standalone K3 and by the fused tail inside k_scatter.
-// FRANK (Phase L2): the exact-rank selection, with the n inner keys broadcast
-// from a REGISTER instead of re-read from LDS.
+// The exact rank of the boundary candidates, shared by the standalone
+// refinement kernel and by the fused tail inside k_scatter.
 //
-// The rank loop is O(n^2) LDS *broadcasts* -- j is uniform across the wave -- and
-// at n = 88..120 that is only ~120 reads per thread, which should be well under
-// 0.1 us.  Measured, it is 3.09 us (Phase L2 bisection: k_scatter 10.11 with the
-// refinement, 7.02 with dbg bit 1 clear), because the whole phase runs in SIX
-// blocks on a 256-CU part and every ds_read pays its full latency against an
-// otherwise empty machine.  Staging a 64-key chunk into one register per lane
-// and broadcasting it with __shfl at a UNIFORM lane index lowers to
-// v_readlane_b32 -- SALU, no LDS at all -- so the inner loop stops touching the
-// LDS pipe entirely: 2 ds_read per thread instead of n.
+// PRANK is the parallel form.  It is exact and deterministic: bit-identical to
+// the serial rank element by element, not merely as a set.
 //
-// RNOCMP (Phase O): DIAGNOSTIC, WRONG ANSWER, TIMING ONLY.  The rank branch is
-// run with the O(n^2) comparison loop DELETED and `rank := i`.  Since i ranges
-// over [0, n) exactly as a true rank does, EXACTLY `remain` threads still pass
-// `rank < remain` and exactly `remain` stores still land in
-// o[above .. above+remain) -- the same count, the same address range, a
-// different permutation.  So it holds the store tail, the barriers, the
-// staging, the cursor round trip and the 6-block geometry FIXED and removes
-// only the comparisons.
-//
-//     (full - RNOCMP)  = the comparison work        -> 64 blocks remove ~63/64
-//     (RNOCMP - dbg&2 off) = the fixed tail         -> 64 blocks remove none
-//
-// It is a TEMPLATE parameter, not a dbg bit, for the reason the RESV probe
-// established the hard way: a runtime predicate lets the optimiser keep the
-// very instructions the probe exists to delete.  Defaulted false, so every
-// shipping instantiation is textually unchanged.
-//
-// PRANK (Phase O): THE PARALLEL RANK.  Exact, deterministic, bit-identical to
-// the serial rank -- see the argument below, which is the whole point of this
-// block comment.
-//
-// WHY THE OBVIOUS PARTITION IS WRONG.  "Give each of the row's 64 blocks 1/64
-// of the candidates" does NOT work and the arithmetic says so before any code
-// is written: there are only n = 55..120 candidates
-// (experiments/phaseO_C/refine_shape.json), so slicing i over 64 blocks leaves
-// each block TWO active threads, each still walking all n j's.  The serial
-// DEPTH is unchanged and the measurement would have been a null.  The measured
-// split (experiments/phaseO_C/split_cmp_tail.json) says the 3.64 us selection
-// is 3.22 comparisons + 0.42 fixed tail, and the comparisons are being run by
-// 12 waves (6 blocks x 2 populated waves) on a 1024-SIMD machine.  So the
-// parallelism has to come from the j axis, not the i axis.
+// WHY THE OBVIOUS PARTITION IS WRONG.  "Give each of the row's blocks 1/64 of
+// the candidates" does not work, and the arithmetic says so before any code is
+// written: there are only n = 55..120 candidates, so slicing i over 64 blocks
+// leaves each block two active threads, each still walking all n j's.  The
+// serial DEPTH is unchanged.  The parallelism has to come from the j axis.
 //
 // THE PARTITION THAT WORKS.  One thread per j, one block per i-set:
 //   * thread tx evaluates the order predicate for j = tx  (needs n <= BS)
@@ -805,7 +771,7 @@ refine_core(uint32_t n, uint32_t above, uint32_t remain,
 //     one or two i, and the DEPTH per block is 2 x (one compare + one ballot +
 //     two barriers) instead of 120 dependent LDS-fed compares.
 //
-// EXACTNESS, which is what PRECISION_BLOCKER.md gates on:
+// EXACTNESS:
 //   1. (key_j, j) is a STRICT TOTAL ORDER on [0, n): keys are order_key32 of
 //      the candidate values and ties are broken by the array index, which is
 //      unique.  Hence rank : [0,n) -> [0,n) is a BIJECTION.
@@ -822,17 +788,15 @@ refine_core(uint32_t n, uint32_t above, uint32_t remain,
 //      o[above .. above+remain) is covered exactly once, and o[0..above) is
 //      untouched.  Independent of how above (1990..2045) and n (55..120) vary
 //      per row, because both are block-uniform reads of the same two dwords.
-//   5. DETERMINISM IS PRESERVED, not merely correctness: the value written to
-//      o[above + r] is the slot of the candidate whose rank is r, and r does
-//      not depend on block scheduling.  The output is bit-identical to the
-//      serial rank ELEMENT BY ELEMENT, not just as a set -- which is what the
-//      documented "deterministic rather than arrival-ordered" property of
+//   5. The value written to o[above + r] is the slot of the candidate whose
+//      rank is r, and r does not depend on block scheduling -- which is what
+//      the documented "deterministic rather than arrival-ordered" property of
 //      o[above..TOPK) requires.
 //
 // The barrier pair inside the i loop is safe because the loop's trip count
 // (pb, n, PB) is block-uniform, so every thread of the block executes exactly
 // the same number of barriers.
-template <bool AGL = false, bool FRANK = false, bool RNOCMP = false,
+template <bool AGL = false,
           bool PRANK = false>
 __device__ __forceinline__ void
 refine_row(uint32_t row, uint32_t above, uint32_t n_raw, uint32_t cap,
@@ -930,33 +894,6 @@ refine_row(uint32_t row, uint32_t above, uint32_t n_raw, uint32_t cap,
             // to the serial rank, in ONE block only -- never silently skipped.
             if(pb != 0u) { return; }
         }
-        if(FRANK && n <= BS)
-        {
-            const uint32_t lane = tx & (WAVE - 1u);
-            const uint32_t ki   = (tx < n) ? s_key[tx] : 0u;
-            uint32_t rank       = 0;
-            for(uint32_t c = 0; c < n; c += WAVE)
-            {
-                const uint32_t kc  = (c + lane < n) ? s_key[c + lane] : 0u;
-                const uint32_t lim = (n - c) < WAVE ? (n - c) : WAVE;
-                for(uint32_t jj = 0; jj < lim; ++jj)
-                {
-                    const uint32_t kj = __shfl(kc, (int)jj, WAVE);
-                    const uint32_t j  = c + jj;
-                    rank += (kj > ki) || (kj == ki && j < tx);
-                }
-            }
-            if(tx < n && rank < remain) { o[above + rank] = s_slot[tx]; }
-        }
-        else if constexpr(RNOCMP)
-        {
-            // Phase O probe: same store tail, no comparisons.  See the header.
-            for(uint32_t i = tx; i < n; i += BS)
-            {
-                if(i < remain) { o[above + i] = s_slot[i]; }
-            }
-        }
-        else
         for(uint32_t i = tx; i < n; i += BS)
         {
             const uint32_t ki = s_key[i];
@@ -1017,40 +954,14 @@ refine_row(uint32_t row, uint32_t above, uint32_t n_raw, uint32_t cap,
 // PTMODE 0: page table read from global (the original path).
 //        1: the whole row's table staged in LDS at block entry.
 //        2: only the block's own slice window staged in LDS.
-// HIER (Phase K / C1): derive the threshold from the two-level histogram, so
-// the 16 KB flat-histogram load, the 4096-element block scan and -- crucially
-// for the fused form -- the 16 KB s_hist LDS block all disappear.  Requires a
-// section-B variant that maintains the coarse summary (hip_hist*c).
-// NACQ (Phase K / R10): narrow the fused handshake's ACQUIRE side.  See the
-// comment at the __threadfence() below.
-// CANDIN (Phase L): take the compact candidate stream section B now emits
-// instead of re-scanning the flat logits array.  See the contract comment in
-// experiments/phaseC/logits_kernel.hip.  The flat `scan_slice` path stays
-// compiled in and is taken whenever the interlock does not hold.
-// NOHS (Phase L2): delete the arrival handshake from the DEPENDENCY CHAIN.
-//
-// The fused tail exists because refine_row needs three things it believes only
-// the other blocks can give it: `above` (how many strict winners were emitted),
-// the boundary elements, and the guarantee that they have all landed.  Under
-// CANDIN none of that is true any more:
-//   * `above` is an exact suffix sum of ghist, which find_thr_hier now returns.
-//     Every block computes the identical value at t=0 with zero communication.
-//   * the boundary elements (fine_bin == thr) all live in bucket thr>>BKSH, and
-//     section B's count table says exactly where that bucket sits inside each
-//     segment's compact prefix: [sfx[b][thr_b+1], sfx[b][thr_b]).  They come
-//     from B's output, not from C's other blocks.
-//   * the two output regions are disjoint BY CONSTRUCTION -- strict winners are
-//     exactly o[0..above) and boundary winners exactly o[above..TOPK) -- so the
-//     refiner never has to know when the emitters finished.
-// So block 0 resolves the boundary CONCURRENTLY with all 95 other blocks
-// emitting strict winners, instead of after them.  The arrival counter survives
-// but now guards only the ghist/cursor reset, which is fire-and-forget stores
-// with no dependent read: no release s_waitcnt, no acquire, no dependent
-// rc[RC_WIN]/rc[RC_CAND] round trip, no candidate arrays at all.
+// HIER: derive the threshold from the two-level histogram, so the 16 KB flat
+//   histogram load, the 4096-element block scan and -- crucially for the fused
+//   form -- the 16 KB s_hist LDS block all disappear.  Requires the producer of
+//   ghist to have written the coarse summary, which the logits kernel does.
+// NACQ: narrow the fused handshake's ACQUIRE side.  See the comment at the
+//   __threadfence() below.
 template <int PTMODE, bool FUSEREF, bool HIER = false, bool NACQ = false,
-          bool CANDIN = false, bool NOHS = false, bool FRANK = false,
-          int RESV = 0, bool PRANK = false, int PBLK = 0, bool PADRC = false,
-          bool DBGPRE = false>
+          bool PRANK = false, int PBLK = 0, bool PADRC = false>
 __global__ __launch_bounds__(BS) void k_scatter(const float* __restrict__ logits,
                                                 const int32_t* __restrict__ row_ends,
                                                 const int32_t* __restrict__ page_table,
@@ -1112,10 +1023,8 @@ __global__ __launch_bounds__(BS) void k_scatter(const float* __restrict__ logits
     __shared__ uint32_t s_last;
     // Phase L: per-section-B-block candidate counts, so the compact read loop
     // does not re-issue a uniform global load per element.
-    __shared__ uint32_t s_need[CANDIN ? CAND_GBMAX : 1];
     // Phase L2: the upper edge of the threshold bucket inside each segment's
     // compact prefix, so the refiner can address the boundary run directly.
-    __shared__ uint32_t s_needhi[(CANDIN && NOHS) ? CAND_GBMAX : 1];
     __shared__ uint32_t s_bn;
 
     const uint32_t row = blockIdx.y;
@@ -1201,7 +1110,7 @@ __global__ __launch_bounds__(BS) void k_scatter(const float* __restrict__ logits
         // the page-table window staging above.  Needs neither LDS nor a barrier.
         if(emit_on < 5u)
         {
-            thr_h     = find_thr_hier_impl<CANDIN>(gh, TOPK, pre_crs, row_len,
+            thr_h     = find_thr_hier_impl<false>(gh, TOPK, pre_crs, row_len,
                                                    &sbk, &hier_above);
             need_flat = (thr_h == HIER_BAD);   // block-uniform
         }
@@ -1242,107 +1151,6 @@ __global__ __launch_bounds__(BS) void k_scatter(const float* __restrict__ logits
     uint32_t run_sh = 0u;          // log2 of the padded per-segment boundary run
     uint32_t lo_b = 0u, hi_b = 0u;
     if(tx == 0) { s_bn = 0u; }
-    if constexpr(CANDIN)
-    {
-        static_assert(PTMODE != 2,
-                      "the compact stream is not slice-contiguous, so the "
-                      "page-table WINDOW form cannot serve it");
-        if(HIER && !need_flat && emit_on == 1u)
-        {
-            const uint32_t ln    = tx & (WAVE - 1u);
-            const uint32_t meta  = cmeta[row];
-            const uint32_t gb    = meta & 0xFFFFu;
-            gb_all               = gb;
-            const uint32_t thr_b = thr_h >> BKSH;
-            cap_b                = meta >> 16;
-            uint32_t sum_t = 0u, sum_n = 0u, max_n = 0u, sum_in = 0u, max_r = 0u;
-            if(gb != 0u && gb <= CAND_GBMAX && cap_b != 0u)
-            {
-                for(uint32_t base = 0; base < gb; base += WAVE)
-                {
-                    const uint32_t b = base + ln;
-                    uint32_t t0 = 0u, tk = 0u;
-                    if(b < gb)
-                    {
-                        // BUCKET-MAJOR: the gb entries of one bucket are
-                        // consecutive, so each of these is one 128 B coalesced
-                        // load per wave.  The block-major layout this replaced
-                        // put them 512 B apart -- 64 separate lines per load,
-                        // 12.6 MB of L2 line fetches over the grid, on the
-                        // dependent path right behind the threshold.
-                        const unsigned short* __restrict__ r =
-                            sfxt + (size_t)row * CAND_NBUCKET * CAND_GBMAX;
-                        t0 = (uint32_t)r[b];
-                        tk = (uint32_t)r[(size_t)thr_b * CAND_GBMAX + b];
-                        s_need[b] = tk;   // every wave writes the same value
-                        if constexpr(NOHS)
-                        {
-                            // Same 128 B coalesced shape, adjacent bucket row,
-                            // so it rides in the same round trip as s_need.
-                            const uint32_t th = (thr_b + 1u < CAND_NBUCKET)
-                                ? (uint32_t)r[(size_t)(thr_b + 1u) * CAND_GBMAX + b]
-                                : 0u;
-                            s_needhi[b] = th;
-                            sum_in += tk - th;
-                            max_r = (tk - th) > max_r ? (tk - th) : max_r;
-                        }
-                    }
-                    sum_t += t0;
-                    sum_n += tk;
-                    max_n = tk > max_n ? tk : max_n;
-                }
-#pragma unroll
-                for(uint32_t sh = 1; sh < WAVE; sh <<= 1)
-                {
-                    sum_t += __shfl_xor(sum_t, sh, WAVE);
-                    sum_n += __shfl_xor(sum_n, sh, WAVE);
-                    sum_in += __shfl_xor(sum_in, sh, WAVE);
-                    const uint32_t m = __shfl_xor(max_n, sh, WAVE);
-                    max_n = m > max_n ? m : max_n;
-                    const uint32_t mr = __shfl_xor(max_r, sh, WAVE);
-                    max_r = mr > max_r ? mr : max_r;
-                }
-                run_sh = (max_r <= 1u) ? 0u : (32u - (uint32_t)__clz(max_r - 1u));
-                use_cand = (sum_t == row_len) && (sum_n == sbk) && (max_n <= cap_b);
-                // Phase L2 adds a fourth precondition, from the same table: the
-                // whole row's threshold-BUCKET run has to fit the refiner's LDS,
-                // because block 0 now resolves the boundary alone and has no
-                // second chance to spill.  Measured 1018-1787 against
-                // REF_CAP = 2048; over that, fall back to the flat path exactly
-                // as for any other interlock failure.
-                if constexpr(NOHS) { use_cand = use_cand && (sum_in <= REF_CAP); }
-                // Observability, not control flow.  cand_cnt is otherwise
-                // unused by this kernel, so recording the decision here costs
-                // one store per block and lets a bench run PROVE the fast path
-                // engaged instead of inferring it -- a fallback returns the
-                // same answer, so no correctness gate can tell the two apart.
-                if(tx == 0) { cand_cnt[row] = use_cand ? 1 : 0; }
-                // Every wave ran the identical reduction over the identical
-                // dwords, so this is block-uniform without a barrier.
-                if(NOHS && G > 1u)
-                {
-                    // DEDICATED REFINER.  Block 0 emits no strict winners at
-                    // all; blocks 1..G-1 partition the segments between them.
-                    //
-                    // This is what makes removing the handshake pay.  With
-                    // block 0 doing both duties the kernel's span is
-                    // emit + collect + rank in ONE block, which is strictly
-                    // worse than the handshake it replaced (measured: 15.58 us
-                    // against 10.25).  With block 0 doing only collect + rank,
-                    // its span runs entirely underneath the other blocks' emit
-                    // and the rank stops being on the critical path at all.
-                    const uint32_t ge = g - 1u, Ge = G - 1u;
-                    lo_b = (g == 0u) ? 0u : (ge * gb) / Ge;
-                    hi_b = (g == 0u) ? 0u : ((ge + 1u) * gb) / Ge;
-                }
-                else
-                {
-                    lo_b = (g * gb) / G;
-                    hi_b = ((g + 1u) * gb) / G;
-                }
-            }
-        }
-    }
     if(need_flat && emit_on != 5u)
     {
         for(uint32_t i = tx; i < HIST_BINS; i += BS) { s_hist[i] = gh[i]; }
@@ -1461,13 +1269,6 @@ __global__ __launch_bounds__(BS) void k_scatter(const float* __restrict__ logits
                 if(q < TOPK) { o[q] = (int32_t)gi; }
             }
         }
-        else if(NOHS && CANDIN)
-        {
-            // Phase L2: boundary elements are NOT published here.  Block 0
-            // reads them straight out of section B's stream, so there is no
-            // candidate array, no agent-scope write-through store, and nothing
-            // for another block to wait on.
-        }
         else if(kb == thr)
         {
             const uint32_t p = atomicAdd(&s_ccnt, 1u);
@@ -1500,164 +1301,62 @@ __global__ __launch_bounds__(BS) void k_scatter(const float* __restrict__ logits
         }
     };
 
-    if(CANDIN && use_cand)
+scan_slice(in, sl, [&](float v, uint32_t gi) {
+    const uint32_t kb = order_key16(v) >> LOW_BITS;
+    if(kb > thr)
     {
-        const uint32_t ln = tx & (WAVE - 1u);
-        const uint32_t wv = tx / WAVE;
-        const uint32_t nb = hi_b - lo_b;
-        // Two traversal shapes for the same work: one section-B block per WAVE
-        // when a C block owns at least NWAVE of them, otherwise the whole C
-        // block on one section-B block at a time.  Either way a wave's lanes
-        // read 64 consecutive 8 B pairs, i.e. one 512 B coalesced burst.
-        if(nb >= NWAVE)
+        // Winner outright: monotonicity of order_key16 guarantees it beats
+        // every element of the threshold bin.
+        //
+        // Only the POSITION is staged here.  Doing `s_wbuf[p] = pt[gi]`
+        // inline puts a dependent scattered global load inside the scan, and
+        // since roughly every unrolled iteration has some lane hitting it,
+        // the whole wave stalls on a full memory round trip each time: worth
+        // ~3 us.  The gather is done in the flush below, where all of the
+        // block's lookups are independent and issue together.
+        const uint32_t p = atomicAdd(&s_wcnt, 1u);
+        if(p < STAGE) { s_wbuf[p] = (int32_t)gi; }
+        else
         {
-            for(uint32_t b = lo_b + wv; b < hi_b; b += NWAVE)
-            {
-                const uint32_t n_ = s_need[b];
-                const uint2* __restrict__ src =
-                    cand2 + ((size_t)row * CAND_GBMAX + b) * cap_b;
-                for(uint32_t i_ = ln; i_ < n_; i_ += WAVE)
-                {
-                    const uint2 pr = src[i_];
-                    classify(__uint_as_float(pr.x), pr.y);
-                }
-            }
+            const unsigned long long old =
+                atomicAdd((unsigned long long*)rc, 1ull);
+            const uint32_t q = (uint32_t)old;
+            // The threshold guarantees q < TopK; the bound is belt-and-braces
+            // so that no reachable state can scribble past the output row.
+            if(q < TOPK) { o[q] = SLOT(gi); }
+        }
+    }
+    else if(kb == thr)
+    {
+        const uint32_t p = atomicAdd(&s_ccnt, 1u);
+        if(p < STAGE)
+        {
+            s_cidx[p] = (int32_t)gi;
+            s_cval[p] = v;
         }
         else
         {
-            for(uint32_t b = lo_b; b < hi_b; ++b)
+            const unsigned long long old =
+                atomicAdd((unsigned long long*)rc, 1ull << 32);
+            const uint32_t q = (uint32_t)(old >> 32);
+            if(q < cap)
             {
-                const uint32_t n_ = s_need[b];
-                const uint2* __restrict__ src =
-                    cand2 + ((size_t)row * CAND_GBMAX + b) * cap_b;
-                for(uint32_t i_ = tx; i_ < n_; i_ += BS)
+                if constexpr(FUSEREF)
                 {
-                    const uint2 pr = src[i_];
-                    classify(__uint_as_float(pr.x), pr.y);
+                    __hip_atomic_store(&ci[q], SLOT(gi), __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+                    __hip_atomic_store(&cv[q], v, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+                }
+                else
+                {
+                    ci[q] = SLOT(gi);
+                    cv[q] = v;
                 }
             }
         }
     }
-    else
-    {
-    scan_slice(in, sl, [&](float v, uint32_t gi) {
-        const uint32_t kb = order_key16(v) >> LOW_BITS;
-        if(kb > thr)
-        {
-            // Winner outright: monotonicity of order_key16 guarantees it beats
-            // every element of the threshold bin.
-            //
-            // Only the POSITION is staged here.  Doing `s_wbuf[p] = pt[gi]`
-            // inline puts a dependent scattered global load inside the scan, and
-            // since roughly every unrolled iteration has some lane hitting it,
-            // the whole wave stalls on a full memory round trip each time: worth
-            // ~3 us.  The gather is done in the flush below, where all of the
-            // block's lookups are independent and issue together.
-            const uint32_t p = atomicAdd(&s_wcnt, 1u);
-            if(p < STAGE) { s_wbuf[p] = (int32_t)gi; }
-            else
-            {
-                const unsigned long long old =
-                    atomicAdd((unsigned long long*)rc, 1ull);
-                const uint32_t q = (uint32_t)old;
-                // The threshold guarantees q < TopK; the bound is belt-and-braces
-                // so that no reachable state can scribble past the output row.
-                if(q < TOPK) { o[q] = SLOT(gi); }
-            }
-        }
-        else if(kb == thr)
-        {
-            const uint32_t p = atomicAdd(&s_ccnt, 1u);
-            if(p < STAGE)
-            {
-                s_cidx[p] = (int32_t)gi;
-                s_cval[p] = v;
-            }
-            else
-            {
-                const unsigned long long old =
-                    atomicAdd((unsigned long long*)rc, 1ull << 32);
-                const uint32_t q = (uint32_t)(old >> 32);
-                if(q < cap)
-                {
-                    if constexpr(FUSEREF)
-                    {
-                        __hip_atomic_store(&ci[q], SLOT(gi), __ATOMIC_RELAXED,
-                                           __HIP_MEMORY_SCOPE_AGENT);
-                        __hip_atomic_store(&cv[q], v, __ATOMIC_RELAXED,
-                                           __HIP_MEMORY_SCOPE_AGENT);
-                    }
-                    else
-                    {
-                        ci[q] = SLOT(gi);
-                        cv[q] = v;
-                    }
-                }
-            }
-        }
-    });
-    }   // end of the flat scan_slice path (Phase L: else-branch of use_cand)
-
-    // -----------------------------------------------------------------------
-    // Phase L2: the boundary resolution, in block 0, CONCURRENTLY with every
-    // other block's strict-winner emit.  Issued BEFORE this block's own flush
-    // so its two loads are in flight across the flush's atomic round trip.
-    //
-    // The run [s_needhi[b], s_need[b]) of segment b's compact prefix is exactly
-    // its elements whose BUCKET equals thr>>BKSH -- 1018-1787 per row measured,
-    // of which 57-120 have fine_bin == thr exactly.  Nothing here depends on
-    // any other block having done anything.
-    // -----------------------------------------------------------------------
-    const bool nohs = NOHS && CANDIN && use_cand;
-    if(nohs && g == 0u && (dbg & 1u))
-    {
-        // FLAT, RECTANGULAR ITERATION SPACE.  The obvious `for(b) for(i)` nest
-        // over the 64 segments measured 36.78 us: 64 SERIAL round trips of ~28
-        // elements each, the same serialisation trap as the first Phase L emit.
-        // Padding each segment's run up to a power of two turns the whole thing
-        // into one flat index with a shift/mask mapping, so 8 independent loads
-        // are in flight per thread and the entire 1018-1787-element boundary
-        // run is ~1 memory round trip.  The padding costs no global traffic:
-        // out-of-run items are skipped on an LDS compare, before any load.
-        const uint32_t nit  = gb_all << run_sh;
-        const uint32_t rmsk = (1u << run_sh) - 1u;
-        for(uint32_t it0 = tx; it0 < nit; it0 += 8u * BS)
-        {
-            uint2 pr[8];
-            bool ok[8];
-#pragma unroll
-            for(uint32_t u = 0; u < 8u; ++u)
-            {
-                const uint32_t it = it0 + u * BS;
-                ok[u] = false;
-                if(it < nit)
-                {
-                    const uint32_t b = it >> run_sh;
-                    const uint32_t k = it & rmsk;
-                    const uint32_t e0 = s_needhi[b];
-                    if(e0 + k < s_need[b])
-                    {
-                        pr[u] = cand2[((size_t)row * CAND_GBMAX + b) * cap_b
-                                      + e0 + k];
-                        ok[u] = true;
-                    }
-                }
-            }
-#pragma unroll
-            for(uint32_t u = 0; u < 8u; ++u)
-            {
-                if(!ok[u]) { continue; }
-                const float v = __uint_as_float(pr[u].x);
-                if((order_key16(v) >> LOW_BITS) != thr) { continue; }
-                const uint32_t p = atomicAdd(&s_bn, 1u);
-                if(p < REF_CAP)
-                {
-                    s_key[p]  = order_key32(v);
-                    s_slot[p] = (int32_t)pr[u].y;
-                }
-            }
-        }
-    }
+});
 
     // ---- FROM HERE ON THE TWO PATHS SHARE EVERYTHING ----------------------
     // Both fill the same s_wbuf/s_cidx/s_cval staging with the same
@@ -1684,7 +1383,7 @@ __global__ __launch_bounds__(BS) void k_scatter(const float* __restrict__ logits
     // slot -- section B computed it from the page-table entry it had loaded for
     // its own KV read -- so the gather is the identity and the page table is
     // never touched.  Block-uniform, so this is one s_cmp.
-    const bool pre_slotted = CANDIN && use_cand;
+    const bool pre_slotted = false;
 #pragma unroll
     for(uint32_t u = 0; u < PERT; ++u)
     {
@@ -1703,58 +1402,15 @@ __global__ __launch_bounds__(BS) void k_scatter(const float* __restrict__ logits
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Phase O probe, RESV == 1.  WRONG ANSWER BY CONSTRUCTION, TIMING ONLY.
-    //
-    // The emit ladder (experiments/phaseO_C/ladder_emit_on.json) prices the
-    // whole flush at 4.40 us of WALL, of which the page-table LDS gather is
-    // 0.24 (e1 - e4).  The remaining 4.16 us is {reserving atomic, emit store,
-    // drain} and BUDGET.md's k=3 model attributes ~2.2 of it to the atomic's
-    // round trip sitting on the store's critical path:
-    //     last classify -> atomicAdd(rc) -> s_wbase -> store address -> drain.
-    //
-    // RESV == 1 isolates EXACTLY that dependency and nothing else.  The atomic
-    // is STILL ISSUED, same address, same 8-byte packing, same 384-way
-    // contention -- only its RETURN VALUE is dropped, so it lowers to a
-    // non-returning global_atomic_add_x2, the `s_waitcnt vmcnt(0)` in front of
-    // the emit disappears, and the base comes from blockIdx instead.
-    //
-    // WHY A TEMPLATE PARAMETER AND NOT AN `emit_on` VALUE.  It was first
-    // written as a runtime `if(emit_on == 3u)` branch.  The compiler CSE'd the
-    // two atomicAdd call sites into ONE returning atomic and selected the base
-    // with a v_cndmask -- verified in the disassembly:
-    //     global_atomic_add_x2 v[6:7], v13, v[6:7], s[28:29] sc0
-    //     s_waitcnt vmcnt(0)          <-- STILL THERE
-    //     s_cmp_eq_u32 s38, 3 ; v_cndmask_b32 v6, v6, v7, vcc
-    // i.e. the probe kept the very dependency it was built to remove and would
-    // have reported a null for a reason that had nothing to do with the
-    // hardware.  `if constexpr` makes the returning atomic non-existent in this
-    // instantiation, which is the only form the optimiser cannot undo.
-    //
-    // Read it as the CEILING of every reservation-overlap rewrite (per-wave,
-    // chunked, speculative): none can beat "the round trip is not on the
-    // critical path at all".  Flat here => the whole family is dead unbuilt.
-    //
-    // The bases collide across blocks, so the output is garbage.  The cursors
-    // still advance (the atomic is issued), so k_refine takes exactly the same
     // path it takes for the full kernel and still restores both zero
     // invariants.
     if(tx == 0)
     {
         const unsigned long long pack =
             ((unsigned long long)cn << 32) | (unsigned long long)wn;
-        if constexpr(RESV == 1)
-        {
-            atomicAdd((unsigned long long*)rc, pack);   // return value dropped
-            s_wbase = (int32_t)((g * 32u) & (TOPK - 1u));
-            s_cbase = (int32_t)(g * 64u);
-        }
-        else
-        {
-            const unsigned long long old = atomicAdd((unsigned long long*)rc, pack);
-            s_wbase = (int32_t)(uint32_t)old;
-            s_cbase = (int32_t)(uint32_t)(old >> 32);
-        }
+        const unsigned long long old = atomicAdd((unsigned long long*)rc, pack);
+        s_wbase = (int32_t)(uint32_t)old;
+        s_cbase = (int32_t)(uint32_t)(old >> 32);
     }
     __syncthreads();
 
@@ -1794,202 +1450,6 @@ __global__ __launch_bounds__(BS) void k_scatter(const float* __restrict__ logits
                 }
             }
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Phase H2: the refinement, in the LAST-ARRIVING block of the row.
-    //
-    // Refinement is one block's work, so a __threadfence() plus an arrival
-    // counter is enough -- no grid sync, and emphatically no
-    // hipLaunchCooperativeKernel (measured 21.1 us in-graph and it silently
-    // loses the cooperative attribute under capture).
-    //
-    // THE HISTOGRAM RESET.  k_refine used to spread it over all (G, rows)
-    // blocks because at six blocks a 24 KB store loop cost 2 us of pure
-    // latency, and the review's objection to moving it into k_scatter was that
-    // every block reads the WHOLE row histogram at the top to derive its
-    // threshold, so no stripe is provably dead mid-kernel.  That objection is
-    // about clearing it *early*.  By the time the LAST block arrives, every
-    // block has already finished that read -- the read happens before find_thr,
-    // which happens before the scan, which happens before the flush, which
-    // happens before the arrival increment.  So the row's histogram is provably
-    // dead here, and this block can clear it without any ping-pong buffer.
-    // -----------------------------------------------------------------------
-    if(nohs)
-    {
-        // -------------------------------------------------------------------
-        // Phase L2 tail.  Two things happen here and NEITHER is a dependency
-        // chain any more.
-        //
-        // (a) Block 0 finishes the boundary it started before the flush: rank
-        //     the fine_bin == thr elements and write them into o[above, TOPK).
-        //     `above` came from ghist at t=0, so this block never waited for a
-        //     single other block, and the region it writes is disjoint from
-        //     o[0..above) by construction.
-        // (b) The arrival counter survives, but it now guards ONLY the ghist
-        //     and cursor reset.  That reset is pure fire-and-forget stores with
-        //     no dependent read, so it needs no release s_waitcnt (nothing is
-        //     published), no __threadfence acquire (nothing is consumed), and
-        //     no rc[RC_WIN]/rc[RC_CAND] round trip.  All it needs is that every
-        //     block has finished READING the two live histogram regions, and a
-        //     block cannot reach its arrival increment before its own threshold
-        //     loads have returned -- the value is a data dependency of thr.
-        // -------------------------------------------------------------------
-        if(g == 0u)
-        {
-            __syncthreads();
-            const uint32_t n      = s_bn < REF_CAP ? s_bn : REF_CAP;
-            const uint32_t above  = hier_above;
-            // Observability: RC_STRIDE is 32 dwords and only 0/1/4 are live, so
-            // dwords 8-11 are free scratch for "what did the refiner actually
-            // see".  Guessing at these numbers is how the first two Phase L
-            // designs were built on a wrong model.
-            if(tx == 0)
-            {
-                rc[8]  = (int32_t)n;
-                rc[9]  = (int32_t)above;
-                rc[10] = (int32_t)run_sh;
-                rc[11] = (int32_t)(gb_all << run_sh);
-            }
-            const uint32_t remain = above < TOPK ? TOPK - above : 0u;
-            if(!(dbg & 2u)) { /* timing probe: skip the rank */ }
-            else if(remain != 0u && n > remain)
-            {
-                // Same exact-selection-by-rank the fused refinement used, on
-                // the same (key32, index) strict total order.
-                for(uint32_t i = tx; i < n; i += BS)
-                {
-                    const uint32_t ki = s_key[i];
-                    uint32_t rank = 0, j = 0;
-                    for(; j + 8u <= n; j += 8u)
-                    {
-                        const uint32_t k0 = s_key[j + 0], k1 = s_key[j + 1];
-                        const uint32_t k2 = s_key[j + 2], k3 = s_key[j + 3];
-                        const uint32_t k4 = s_key[j + 4], k5 = s_key[j + 5];
-                        const uint32_t k6 = s_key[j + 6], k7 = s_key[j + 7];
-                        rank += (k0 > ki) || (k0 == ki && (j + 0u) < i);
-                        rank += (k1 > ki) || (k1 == ki && (j + 1u) < i);
-                        rank += (k2 > ki) || (k2 == ki && (j + 2u) < i);
-                        rank += (k3 > ki) || (k3 == ki && (j + 3u) < i);
-                        rank += (k4 > ki) || (k4 == ki && (j + 4u) < i);
-                        rank += (k5 > ki) || (k5 == ki && (j + 5u) < i);
-                        rank += (k6 > ki) || (k6 == ki && (j + 6u) < i);
-                        rank += (k7 > ki) || (k7 == ki && (j + 7u) < i);
-                    }
-                    for(; j < n; ++j)
-                    {
-                        const uint32_t kj = s_key[j];
-                        rank += (kj > ki) || (kj == ki && j < i);
-                    }
-                    if(rank < remain) { o[above + rank] = s_slot[i]; }
-                }
-            }
-            else
-            {
-                // Degenerate (cannot happen when the threshold is honoured):
-                // emit what there is and leave a contiguous -1 tail.
-                for(uint32_t i = tx; i < n; i += BS)
-                {
-                    const uint32_t p = above + i;
-                    if(p < TOPK) { o[p] = s_slot[i]; }
-                }
-                __syncthreads();
-                for(uint32_t i = above + n + tx; i < TOPK; i += BS) { o[i] = -1; }
-            }
-        }
-        __syncthreads();
-        if(tx == 0)
-        {
-            const uint32_t old = __hip_atomic_fetch_add(
-                (uint32_t*)&rc[RcMap<PADRC>::ARR], 1u, __ATOMIC_RELAXED,
-                __HIP_MEMORY_SCOPE_AGENT);
-            // PRANK needs this block's ARRIVAL RANK, the non-PRANK form needs
-            // only the is-last flag, and no form needs both.  They share
-            // s_last rather than adding a slot: a separate __shared__ dword
-            // costs 4 B of LDS in EVERY instantiation including the shipped
-            // one, whose footprint must stay at exactly 39988 B.
-            s_last = PRANK ? old : ((old + 1u == G) ? 1u : 0u);
-        }
-        __syncthreads();
-        // PBLK: how many of the row's blocks take part in the parallel rank.
-        // PBLK == 0 means all G.  The participants are the LAST PBLK TO ARRIVE,
-        // which is the whole point: a block learns its arrival rank from the
-        // counter it just incremented, so the G - PBLK early blocks return
-        // exactly where they return today and never enter the spin.  Measured:
-        // with all 64 spinning, prank4 was 0.540 us SLOWER than the control
-        // even though the rank itself got 1.9 us faster -- 384 blocks polling
-        // one coherent dword contend with the emit stores of the very blocks
-        // they are waiting for.  Fewer, later spinners is the direct fix and
-        // the only variable changed.
-        const uint32_t PB_N   = (PBLK == 0 || (uint32_t)PBLK > G)
-                                    ? G : (uint32_t)PBLK;
-        const uint32_t pfirst = G - PB_N;
-        const uint32_t pidx   = s_last - pfirst;  // valid only if s_last>=pfirst
-        // -------------------------------------------------------------------
-        // Phase O / PRANK, the FUSED harness.  The arrival counter stops being
-        // an ELECTION (one block continues, G-1 return) and becomes the arrival
-        // half of a two-phase ROW barrier that all G blocks pass, so the
-        // parallel rank can use them.  This buys the node the k_refine harness
-        // spends, and costs a spin.
-        //
-        // THE SPIN NEEDS THE ROW'S BLOCKS TO BE CO-RESIDENT, which is not a
-        // property of this file -- it is a property of (G, rows, LDS, CU count)
-        // and is checked ON THE HOST before this instantiation is ever
-        // launched.  If the check fails the non-PRANK kernel is launched
-        // instead.  A spin whose liveness rests on an unchecked occupancy
-        // assumption is a hang waiting for someone to raise G.
-        //
-        // The acquire side is unchanged and still sound: producers store the
-        // handful of shared values write-through (sc0 sc1) and s_waitcnt them
-        // before their arrival increment, the counter is an agent-scope atomic,
-        // and every consumer reads the data with agent-scope loads that never
-        // consult the non-coherent L1.  That argument never depended on there
-        // being exactly one consumer.
-        if constexpr(PRANK)
-        {
-            if(s_last < pfirst) { return; }
-            // ATTRIBUTION ARM (Phase O).  Adding an agent-scope atomic RMW here
-            // -- immediately before the spin -- cost 0.64 us at PB=16 and
-            // 1.66 us at PB=32, and I attributed that to FALSE SHARING because
-            // the counter sat in the line being spun on.  Line-isolating the
-            // spin dword then measured -0.10 us, which does not support that
-            // attribution.  The competing explanation is that the cost is the
-            // extra RMW on the critical path, wherever it lands.  DBGPRE puts
-            // the bump back in this position so it can be run WITH and WITHOUT
-            // line isolation and the two explanations separated.
-            if(DBGPRE && tx == 0)
-            {
-                __hip_atomic_fetch_add((uint32_t*)&rc[RcMap<PADRC>::DBG2], 1u,
-                                       __ATOMIC_RELAXED,
-                                       __HIP_MEMORY_SCOPE_AGENT);
-            }
-            if(tx == 0)
-            {
-                uint32_t v = __hip_atomic_load((uint32_t*)&rc[RcMap<PADRC>::ARR],
-                                               __ATOMIC_RELAXED,
-                                               __HIP_MEMORY_SCOPE_AGENT);
-                while(v < G)
-                {
-                    __builtin_amdgcn_s_sleep(2);
-                    v = __hip_atomic_load((uint32_t*)&rc[RcMap<PADRC>::ARR],
-                                          __ATOMIC_RELAXED,
-                                          __HIP_MEMORY_SCOPE_AGENT);
-                }
-            }
-            __syncthreads();
-        }
-        else if(!s_last) { return; }
-        static_assert(GH_STRIDE % 4u == 0u, "vectorised reset needs 4 | stride");
-        uint4* __restrict__ ghw4 = (uint4*)(ghist + (size_t)row * GH_STRIDE);
-        const uint4 z4           = make_uint4(0u, 0u, 0u, 0u);
-        for(uint32_t i = tx; i < GH_STRIDE / 4u; i += BS) { ghw4[i] = z4; }
-        if(tx == 0)
-        {
-            rc[RC_WIN]  = 0;
-            rc[RC_CAND] = 0;
-            rc[RcMap<PADRC>::ARR]  = 0;
-        }
-        return;
     }
 
     if constexpr(FUSEREF)
@@ -2050,21 +1510,6 @@ __global__ __launch_bounds__(BS) void k_scatter(const float* __restrict__ logits
         if constexpr(PRANK)
         {
             if(s_last < pfirst) { return; }
-            // ATTRIBUTION ARM (Phase O).  Adding an agent-scope atomic RMW here
-            // -- immediately before the spin -- cost 0.64 us at PB=16 and
-            // 1.66 us at PB=32, and I attributed that to FALSE SHARING because
-            // the counter sat in the line being spun on.  Line-isolating the
-            // spin dword then measured -0.10 us, which does not support that
-            // attribution.  The competing explanation is that the cost is the
-            // extra RMW on the critical path, wherever it lands.  DBGPRE puts
-            // the bump back in this position so it can be run WITH and WITHOUT
-            // line isolation and the two explanations separated.
-            if(DBGPRE && tx == 0)
-            {
-                __hip_atomic_fetch_add((uint32_t*)&rc[RcMap<PADRC>::DBG2], 1u,
-                                       __ATOMIC_RELAXED,
-                                       __HIP_MEMORY_SCOPE_AGENT);
-            }
             if(tx == 0)
             {
                 uint32_t v = __hip_atomic_load((uint32_t*)&rc[RcMap<PADRC>::ARR],
@@ -2163,7 +1608,7 @@ __global__ __launch_bounds__(BS) void k_scatter(const float* __restrict__ logits
             rc[RcMap<PADRC>::ARR]  = 0;
         }
         uint32_t nranked = 0u;
-        refine_row<NACQ, FRANK, false, PRANK>(row, above, nraw, cap, cand_idx,
+        refine_row<NACQ, PRANK>(row, above, nraw, cap, cand_idx,
                          cand_val, o,
                          s_hist, s_grp, s_key, s_slot, &s_thr, &s_above, &s_emit,
                          dbg, true, pre_slot, pre_val, pidx, PB_N, &nranked);
@@ -2313,12 +1758,11 @@ void topk_transform(torch::Tensor logits,
     // its blocks must be co-resident.  When they would not be, the ordinary
     // kernel-boundary form is launched instead and the selector cannot hang.
     if(prank_resident_ok(
-           (const void*)phased::k_scatter<2, true, true, true, false,
-                                          false, false, 0, true>,
+           (const void*)phased::k_scatter<2, true, true, true, true>,
            (int)G, (int)R))
     {
         hipLaunchKernelGGL(
-            (phased::k_scatter<2, true, true, true, false, false, false, 0, true, 16>),
+            (phased::k_scatter<2, true, true, true, true, 16>),
             SCATTER_ARGS);
     }
     else
