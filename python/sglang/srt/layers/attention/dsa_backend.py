@@ -84,6 +84,7 @@ from sglang.srt.utils import (
 # TileLang. Keep this off by default until full serving no-regression coverage
 # is available.
 _DSA_FLYDSL_PREFILL = get_bool_env_var("SGLANG_DSA_FLYDSL_PREFILL")
+_DSA_FLYDSL_DECODE = get_bool_env_var("SGLANG_DSA_FLYDSL_DECODE")
 
 # Separate opt-in for the Triton per-query flash kernel.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
@@ -123,6 +124,38 @@ def _can_use_flydsl_sparse_mla_prefill(
         and q_rope.device == q_nope.device
         and kv_cache.device == q_nope.device
         and page_table.device == q_nope.device
+    )
+
+
+def _can_use_flydsl_sparse_mla_decode(
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+) -> bool:
+    seq = q_all.shape[0] if q_all.ndim == 3 else 0
+    width = page_table.shape[1] if page_table.ndim == 2 else 0
+    return (
+        _DSA_FLYDSL_DECODE
+        and _IS_GFX950
+        and q_all.dtype == torch.float8_e4m3fn
+        and kv_cache.dtype == torch.float8_e4m3fn
+        and page_table.dtype == torch.int32
+        and q_all.ndim == 3
+        and page_table.ndim == 2
+        and seq in (1, 6)
+        and q_all.shape[1:] == (16, 576)
+        and (
+            (kv_cache.ndim == 2 and kv_cache.shape[1] == 576)
+            or (kv_cache.ndim == 3 and kv_cache.shape[1:] == (1, 576))
+        )
+        and page_table.shape[0] == seq
+        and 64 <= width <= 2112
+        and width % 64 == 0
+        and q_all.is_contiguous()
+        and kv_cache.is_contiguous()
+        and page_table.is_contiguous()
+        and kv_cache.device == q_all.device
+        and page_table.device == q_all.device
     )
 
 if is_cuda():
@@ -2374,6 +2407,21 @@ class DeepseekSparseAttnBackend(
             # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if _can_use_flydsl_sparse_mla_decode(q_all, kv_cache, page_table_1):
+                from aiter.ops.flydsl import flydsl_sparse_mla_decode
+
+                out = torch.empty(
+                    (q_all.shape[0], 16, 512),
+                    dtype=torch.bfloat16,
+                    device=q_all.device,
+                )
+                return flydsl_sparse_mla_decode(
+                    q=q_all,
+                    kv=kv_cache,
+                    indices=page_table_1,
+                    out=out,
+                    sm_scale=layer.scaling,
+                )
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
