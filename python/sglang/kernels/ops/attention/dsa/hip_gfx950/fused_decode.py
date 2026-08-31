@@ -8,8 +8,8 @@ Replaces, for one indexer layer of one decode forward:
 
 with
 
-  dual_gemv_kernel<...,cfg 61> | indexer_qk_had_wave_kernel<true,0,true,true> |
-  logits_hist_m<8,12,...> | phased::k_scatter<2,...,16>
+  dual_gemv_kernel<...,cfg 61> | qk_rope_hadamard_quant_kernel<true,0,true,true> |
+  logits_hist_m<8,12,...> | dsa_topk::k_scatter<2,...,16>
 
 Each kernel source ships exactly one instantiation (see the package
 docstring); this module only marshals production tensors into their ABIs and
@@ -42,15 +42,15 @@ _WARNED_CAPTURE = False
 
 # Kernel-source constraints. Every one of these is enforced by a TORCH_CHECK or a
 # compile-time constant in csrc/, not by taste:
-HEAD_DIM = 128  # indexer_qk_had.cu / logits_kernel.hip
-ROPE_DIM = 64  # indexer_qk_had.cu
-N_HEADS = 32  # validated shape (grid.y of the qk kernel, MFMA n of section B)
-INDEX_TOPK = 2048  # topk_phaseD.cu: constexpr TOPK = 2048u
-PAGE_SIZE = 64  # logits_kernel.hip: PAGE_TOK
-CACHE_TOK_STRIDE = 132  # logits_kernel.hip: TOK_STRIDE (128 K bytes + 4 scale)
+HEAD_DIM = 128  # qk_rope_hadamard_quant.cu / paged_mqa_logits.cu
+ROPE_DIM = 64  # qk_rope_hadamard_quant.cu
+N_HEADS = 32  # validated shape (grid.y of the qk kernel, MFMA n of the logits kernel)
+INDEX_TOPK = 2048  # topk_transform.cu: constexpr TOPK = 2048u
+PAGE_SIZE = 64  # paged_mqa_logits.cu: PAGE_TOK
+CACHE_TOK_STRIDE = 132  # paged_mqa_logits.cu: TOK_STRIDE (128 K bytes + 4 scale)
 Q_LORA_RANK = 2048  # dual_gemv cfg 26, Q half
 HIDDEN_SIZE = 6144  # dual_gemv cfg 26, K half
-QUANT_BLOCK = 128  # indexer_qk_had.cu: quant_block_size == head_dim
+QUANT_BLOCK = 128  # qk_rope_hadamard_quant.cu: quant_block_size == head_dim
 # The only row cap among the four kernels (dual_gemv_bf16.cu). Section A is
 # chunked to it rather than capping the whole path, so rr >= 2 verify stays fused.
 DUAL_GEMV_MAX_M = 8
@@ -118,7 +118,9 @@ class _Workspace:
         self.q_fp8 = torch.empty(
             (rows, N_HEADS, HEAD_DIM), dtype=fp8_dtype, device=device
         )
-        self.head_gate = torch.empty((rows, N_HEADS), dtype=torch.float32, device=device)
+        self.head_gate = torch.empty(
+            (rows, N_HEADS), dtype=torch.float32, device=device
+        )
         self.q_proj = torch.empty(
             (rows, N_HEADS * HEAD_DIM), dtype=torch.bfloat16, device=device
         )
@@ -228,8 +230,12 @@ class Gfx950FusedIndexer:
         for i in range(0, rows, DUAL_GEMV_MAX_M):
             j = min(i + DUAL_GEMV_MAX_M, rows)
             gemv.dual_gemv_bf16(
-                q_lora[i:j], w_q_b, q_proj[i:j],
-                x[i:j], w_kw, kw[i:j],
+                q_lora[i:j],
+                w_q_b,
+                q_proj[i:j],
+                x[i:j],
+                w_kw,
+                kw[i:j],
                 loader.DUAL_GEMV_CFG,
             )
 
@@ -307,7 +313,6 @@ def _rope_2d(rotary_emb, rope_dim: int):
     cos = cos.reshape(cos.shape[0], half).contiguous()
     sin = sin.reshape(sin.shape[0], half).contiguous()
     assert cos.dtype == torch.bfloat16 and sin.dtype == torch.bfloat16, (
-        "gfx950 fused indexer needs a bf16 rope cache, got "
-        f"{cos.dtype}/{sin.dtype}"
+        "gfx950 fused indexer needs a bf16 rope cache, got " f"{cos.dtype}/{sin.dtype}"
     )
     return cos, sin

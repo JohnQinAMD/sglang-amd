@@ -12,7 +12,7 @@ timed region and never inside a HIP graph capture.
 Build flags are the ones the sources were measured with:
   * ``--offload-arch=gfx950`` only (the default torch arch list also emits
     gfx942, doubling compile time for a target this path refuses to run on).
-  * section B additionally needs ``-mllvm -amdgpu-mfma-vgpr-form`` and
+  * the logits kernel additionally needs ``-mllvm -amdgpu-mfma-vgpr-form`` and
     ``-fno-honor-nans``; that combination is ``liblogits_fast.so``, which is the
     library every accepted section-B measurement was taken with.  Dropping
     either flag changes the measured kernel, so they are not optional.
@@ -38,22 +38,20 @@ LOGITS_WARPS = 8
 # Section A's LSU4 Q reduction with two-MFMA shifted-load lookahead, plus the
 # accepted KW decomposition and K3 epilogue.
 DUAL_GEMV_CFG = 61
-# Section C blocks per row.  Its configuration is baked into topk_phaseD.cu.
+# Section C blocks per row.  Its configuration is baked into topk_transform.cu.
 TOPK_G = 64
 
 
 def _build_dir() -> str:
     d = os.environ.get("SGLANG_DSA_GFX950_BUILD_DIR")
     if not d:
-        d = os.path.join(
-            os.path.expanduser("~"), ".cache", "sglang", "dsa_gfx950"
-        )
+        d = os.path.join(os.path.expanduser("~"), ".cache", "sglang", "dsa_gfx950")
     os.makedirs(d, exist_ok=True)
     return d
 
 
 def _aiter_include_paths() -> List[str]:
-    """``indexer_qk_had.cu`` includes aiter's ``hip_reduce.h`` / ``opus/opus.hpp``.
+    """``qk_rope_hadamard_quant.cu`` includes aiter's ``hip_reduce.h`` / ``opus/opus.hpp``.
 
     It includes them rather than vendoring them on purpose: the numeric helpers
     must be the same code aiter's own fused indexer op uses.
@@ -113,17 +111,17 @@ def _load(
 def modules():
     """(gemv, qk, logits, topk) extension modules, or raise."""
     gemv = _load(_NAMES[0], ["dual_gemv_bf16.cu"])
-    # indexer_qk_had.cu needs C++20 (aiter's opus.hpp) and aiter's headers.
+    # qk_rope_hadamard_quant.cu needs C++20 (aiter's opus.hpp) and aiter's headers.
     qk = _load(
         _NAMES[1],
-        ["indexer_qk_had.cu"],
+        ["qk_rope_hadamard_quant.cu"],
         extra_flags=["-Wno-unused-result"],
         std="c++20",
         include_aiter=True,
     )
     logits = _load(
         _NAMES[2],
-        ["logits_kernel.cu", "logits_bindings.cu"],
+        ["paged_mqa_logits.cu", "paged_mqa_logits_bindings.cu"],
         extra_flags=[
             "-fno-honor-nans",
             "-mllvm",
@@ -137,8 +135,8 @@ def modules():
     )
     topk = _load(
         _NAMES[3],
-        ["topk_phaseD.cu"],
-        extra_flags=[f"-DPHASED_HIST_BITS={LOGITS_HIST_BITS}"],
+        ["topk_transform.cu"],
+        extra_flags=[f"-DDSA_TOPK_HIST_BITS={LOGITS_HIST_BITS}"],
     )
     return gemv, qk, logits, topk
 
