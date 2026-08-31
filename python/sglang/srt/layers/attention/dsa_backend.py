@@ -91,13 +91,26 @@ _IS_GFX950 = _IS_GFX95 and (
 )
 
 
-def _are_flydsl_fp8_inputs(*tensors: torch.Tensor) -> bool:
+def _are_flydsl_fp8_inputs(
+    *tensors: torch.Tensor, require_contiguous: bool = True
+) -> bool:
     device = tensors[0].device
     return device.type == "cuda" and all(
         tensor.dtype == torch.float8_e4m3fn
-        and tensor.is_contiguous()
+        and (not require_contiguous or tensor.is_contiguous())
         and tensor.device == device
         for tensor in tensors
+    )
+
+
+def _is_flydsl_prefill_q_layout(tensor: torch.Tensor) -> bool:
+    # AITER reads vector4 FP8 values using explicit token/head strides. This
+    # admits production's 512/64 views of contiguous [T,16,576] storage without
+    # an HBM copy, while retaining the alignment required by the vector loads.
+    return (
+        tensor.stride(2) == 1
+        and tensor.stride(0) % 4 == 0
+        and tensor.stride(1) % 4 == 0
     )
 
 
@@ -123,7 +136,10 @@ def _can_use_flydsl_sparse_mla_prefill(
         and q_nope.shape[0] >= 256
         and q_nope.shape[1:] == (16, 512)
         and q_rope.shape == (q_nope.shape[0], 16, 64)
-        and _are_flydsl_fp8_inputs(q_nope, q_rope, kv_cache)
+        and _are_flydsl_fp8_inputs(q_nope, q_rope, require_contiguous=False)
+        and _is_flydsl_prefill_q_layout(q_nope)
+        and _is_flydsl_prefill_q_layout(q_rope)
+        and _are_flydsl_fp8_inputs(kv_cache)
         and _is_flydsl_kv_shape(kv_cache)
         and page_table.dtype == torch.int32
         and page_table.shape == (q_nope.shape[0], 2048)
