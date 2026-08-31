@@ -53,6 +53,13 @@ class TestDsaFlydslDecodeDispatch(CustomTestCase):
                 page_table=self._tensor((1, 2048), torch.int32),
             )
         )
+        for seq in (48, 96):
+            self.assertTrue(
+                self._can_use(
+                    q_all=self._tensor((seq, 16, 576), torch.float8_e4m3fn),
+                    page_table=self._tensor((seq, 2048), torch.int32),
+                )
+            )
         self.assertTrue(self._can_use(page_table=self._tensor((6, 64), torch.int32)))
         self.assertTrue(self._can_use(page_table=self._tensor((6, 2112), torch.int32)))
 

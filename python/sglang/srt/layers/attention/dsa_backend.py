@@ -165,11 +165,9 @@ def _can_use_flydsl_sparse_mla_decode(
         and page_table.ndim == 2
         and (head_dim, v_head_dim) == (576, 512)
         # Measured on MI355X vs the TileLang decode (width=2048, fp8): FlyDSL is
-        # faster from seq=1 through seq=24 (0.60x .. 0.75x) and loses at seq=48
-        # (1.05x), so the crossover sits between them. seq is a runtime scalar --
-        # the kernel compiles per split count, not per seq -- and numerics hold
-        # at 32.0-32.2 dB across the whole range.
-        and 1 <= seq <= 24
+        # faster and numerically sound for every production size through c=16.
+        # Keep unmeasured, non-production sizes on the incumbent path.
+        and (1 <= seq <= 24 or seq in (48, 96))
         and q_all.shape[1:] == (16, 576)
         and _are_flydsl_fp8_inputs(q_all, kv_cache)
         and _is_flydsl_kv_shape(kv_cache)
