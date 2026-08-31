@@ -76,6 +76,33 @@ _NAMES = (
 )
 
 
+def _stage(build_dir: str, sources: List[str]) -> List[str]:
+    """Compile from a copy in the build directory, not from the package.
+
+    torch's ROCm build hipifies each source IN PLACE: it writes the rewritten
+    file next to the original and compiles that one. Pointing it at the
+    installed package would litter it with generated files, and would fail
+    outright wherever the install is read-only. Copying only on a content
+    change keeps ninja from rebuilding on every import.
+    """
+    out = []
+    for s in sources:
+        src = os.path.join(_CSRC, s)
+        dst = os.path.join(build_dir, s)
+        with open(src, "rb") as f:
+            want = f.read()
+        try:
+            with open(dst, "rb") as f:
+                stale = f.read() != want
+        except FileNotFoundError:
+            stale = True
+        if stale:
+            with open(dst, "wb") as f:
+                f.write(want)
+        out.append(dst)
+    return out
+
+
 def _load(
     name: str,
     sources: List[str],
@@ -87,12 +114,13 @@ def _load(
 
     build_dir = os.path.join(_build_dir(), name)
     os.makedirs(build_dir, exist_ok=True)
+    staged = _stage(build_dir, sources)
     prev = os.environ.get("PYTORCH_ROCM_ARCH")
     os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"
     try:
         return load(
             name=name,
-            sources=[os.path.join(_CSRC, s) for s in sources],
+            sources=staged,
             build_directory=build_dir,
             extra_cflags=["-O3"],
             extra_cuda_cflags=["-O3", "--offload-arch=gfx950", f"-std={std}"]

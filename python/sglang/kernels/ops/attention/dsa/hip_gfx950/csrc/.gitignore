@@ -1,5 +1,0 @@
-# torch's hipify rewrites each .cu in place at build time -- CUDA headers and
-# at::cuda:: calls become their HIP equivalents -- and writes the result as a
-# .hip next to the source, which is the file it actually compiles. Generated,
-# never edited.
-*.hip
