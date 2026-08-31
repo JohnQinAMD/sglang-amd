@@ -1,7 +1,7 @@
 """JIT build + load of the four gfx950 DSA-indexer kernels.
 
 Each kernel source under ``csrc/`` ships exactly one accepted instantiation
-(see ``PROVENANCE``); this module only builds them and hands back
+(see the package docstring); this module only builds them and hands back
 the extension objects. Four extensions rather than one, because three of the
 sources carry their own ``PYBIND11_MODULE`` and would collide in a single
 extension.
@@ -123,7 +123,7 @@ def modules():
     )
     logits = _load(
         _NAMES[2],
-        ["logits_kernel.hip", "logits_bindings.hip"],
+        ["logits_kernel.cu", "logits_bindings.cu"],
         extra_flags=[
             "-fno-honor-nans",
             "-mllvm",

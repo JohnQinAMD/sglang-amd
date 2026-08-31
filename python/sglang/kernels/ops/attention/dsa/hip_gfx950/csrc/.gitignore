@@ -1,6 +1,5 @@
-# torch's hipify writes X.hip next to X.cu at build time and compiles THAT.
-# Generated, never edited: keep it out of the tree. sync_kernels.sh deletes any
-# stale copy, because a shadow left behind hides a freshly synced source.
+# torch's hipify rewrites each .cu in place at build time -- CUDA headers and
+# at::cuda:: calls become their HIP equivalents -- and writes the result as a
+# .hip next to the source, which is the file it actually compiles. Generated,
+# never edited.
 *.hip
-!logits_kernel.hip
-!logits_bindings.hip

@@ -11,9 +11,9 @@ with
   dual_gemv_kernel<...,cfg 61> | indexer_qk_had_wave_kernel<true,0,true,true> |
   logits_hist_m<8,12,...> | phased::k_scatter<2,...,16>
 
-Each kernel source ships exactly one instantiation (see ``PROVENANCE``); this
-module only marshals production tensors into their ABIs and owns the persistent
-workspace. It makes no numerical decision of its own.
+Each kernel source ships exactly one instantiation (see the package
+docstring); this module only marshals production tensors into their ABIs and
+owns the persistent workspace. It makes no numerical decision of its own.
 
 CONTRACT PRESERVED, deliberately and non-negotiably:
   * output is ``(rows, index_topk)`` int32 **physical page_size=1 KV slots**,
