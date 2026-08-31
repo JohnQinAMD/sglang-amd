@@ -8,8 +8,8 @@ Replaces, for one indexer layer of one decode forward:
 
 with
 
-  dual_gemv_kernel<...,cfg 61> | qk_rope_hadamard_quant_kernel<true,0,true,true> |
-  logits_hist_m<8,12,...> | dsa_topk::k_scatter<2,...,16>
+  dual_gemv_kernel<...,cfg 61> | qk_rope_hadamard_quant_kernel<true,true,true> |
+  logits_hist_m<8,12> | dsa_topk::k_scatter<2,...,16>
 
 Each kernel source ships exactly one instantiation (see the package
 docstring); this module only marshals production tensors into their ABIs and
