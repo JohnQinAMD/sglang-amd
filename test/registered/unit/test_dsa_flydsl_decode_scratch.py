@@ -60,6 +60,25 @@ class TestFlydslDecodeScratch(unittest.TestCase):
         cap_out = B._FLYDSL_DECODE_SCRATCH[self.dev][0].numel()
         self.assertGreaterEqual(cap_out, 96 * 33 * H * DV)
 
+    def test_prealloc_creates_the_buffer_before_capture(self):
+        self.assertEqual(len(B._FLYDSL_DECODE_SCRATCH), 0)
+        B._flydsl_decode_scratch_prealloc(self.dev)
+        self.assertEqual(len(B._FLYDSL_DECODE_SCRATCH), 1)
+        # 预分配之后，捕获期也能拿到 buffer 而不是回落
+        with mock.patch.object(
+            torch.cuda, "is_current_stream_capturing", lambda: True
+        ):
+            po, pl = B._flydsl_decode_scratch(4, 32, self.dev)
+        self.assertIsNotNone(po)
+        self.assertIsNotNone(pl)
+
+    def test_prealloc_is_a_noop_under_capture(self):
+        with mock.patch.object(
+            torch.cuda, "is_current_stream_capturing", lambda: True
+        ):
+            B._flydsl_decode_scratch_prealloc(self.dev)
+        self.assertEqual(len(B._FLYDSL_DECODE_SCRATCH), 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

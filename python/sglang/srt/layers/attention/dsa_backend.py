@@ -168,6 +168,20 @@ _FLYDSL_DECODE_MAX_NG = 33  # width <= 2112 over a 64-token page
 _FLYDSL_DECODE_SCRATCH: Dict[torch.device, Tuple[torch.Tensor, torch.Tensor]] = {}
 
 
+def _flydsl_decode_scratch_prealloc(device: torch.device) -> None:
+    """Create the scratch before any graph capture starts.
+
+    _flydsl_decode_scratch refuses to allocate under capture, so if the very
+    first FlyDSL decode of the process happens inside a capture the buffer is
+    never created and every call falls back to aiter allocating per call --
+    exactly what the buffer exists to avoid. init_cuda_graph_state runs before
+    capture, so allocate from there.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return
+    _flydsl_decode_scratch(1, 1, device)
+
+
 def _flydsl_decode_scratch(
     seq: int, ng: int, device: torch.device
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -1319,6 +1333,10 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        if _DSA_FLYDSL_DECODE and _IS_GFX950:
+            _flydsl_decode_scratch_prealloc(
+                torch.device("cuda", torch.cuda.current_device())
+            )
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
