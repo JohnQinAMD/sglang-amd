@@ -1,5 +1,6 @@
 // -----------------------------------------------------------------------------
-// GLM-5.2 DSA indexer, the logits kernel: paged MQA FP8 logits.  Raw HIP for gfx950.
+// GLM-5.2 DSA indexer, the logits kernel: paged MQA FP8 logits.  Raw HIP for
+// gfx950.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -12,8 +13,8 @@ typedef __attribute__((__vector_size__(4 * sizeof(float)))) float f32x4;
 #define PAGE_TOK 64
 #define HD 128
 #define TOK_STRIDE 132
-#define PAGE_BYTES (PAGE_TOK * TOK_STRIDE)  // 8448
-#define K_BYTES (PAGE_TOK * HD)             // 8192
+#define PAGE_BYTES (PAGE_TOK * TOK_STRIDE) // 8448
+#define K_BYTES (PAGE_TOK * HD)            // 8192
 
 union V8 {
   i32x8 v;
@@ -21,7 +22,8 @@ union V8 {
 };
 
 __device__ __forceinline__ f32x4 mfma128(i32x8 a, i32x8 b, f32x4 c) {
-  return __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(a, b, c, 0, 0, 0, 127, 0, 127);
+  return __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(a, b, c, 0, 0, 0, 127,
+                                                          0, 127);
 }
 
 // relu in exactly one v_max_f32.  fmaxf() lowers to TWO v_max_f32 (LLVM
@@ -48,16 +50,13 @@ __device__ __forceinline__ float xor16(float x, int lane) {
   return __builtin_bit_cast(float, (lane & 16) ? r[0] : r[1]);
 }
 
-template <int NT>
-__device__ __forceinline__ i32x4 ldv(const void* p) {
-  return NT ? __builtin_nontemporal_load((const i32x4*)p) : *(const i32x4*)p;
+template <int NT> __device__ __forceinline__ i32x4 ldv(const void *p) {
+  return NT ? __builtin_nontemporal_load((const i32x4 *)p) : *(const i32x4 *)p;
 }
-template <int NT>
-__device__ __forceinline__ float lds1(const float* p) {
+template <int NT> __device__ __forceinline__ float lds1(const float *p) {
   return NT ? __builtin_nontemporal_load(p) : *p;
 }
-template <int NT>
-__device__ __forceinline__ void stf(float v, float* p) {
+template <int NT> __device__ __forceinline__ void stf(float v, float *p) {
   if (NT)
     __builtin_nontemporal_store(v, p);
   else
@@ -83,13 +82,15 @@ __device__ __forceinline__ void stf(float v, float* p) {
 __device__ __forceinline__ uint32_t order_key16(float x) {
   __half h = __float2half_rn(x);
   unsigned short bits = __half_as_ushort(h);
-  unsigned short key = (bits & 0x8000) ? (unsigned short)(~bits) : (unsigned short)(bits | 0x8000);
+  unsigned short key = (bits & 0x8000) ? (unsigned short)(~bits)
+                                       : (unsigned short)(bits | 0x8000);
   return (uint32_t)key;
 }
 
 // -----------------------------------------------------------------------------
-// Phase K / C1: CO==1 additionally maintains a 64-bin COARSE summary of the same
-// histogram, so that the top-k stage's 192 k_scatter blocks can derive the threshold
+// Phase K / C1: CO==1 additionally maintains a 64-bin COARSE summary of the
+// same histogram, so that the top-k stage's 192 k_scatter blocks can derive the
+// threshold
 #define LG_CBITS 6
 #define LG_CBINS (1 << LG_CBITS)
 
@@ -114,27 +115,22 @@ __device__ __forceinline__ uint32_t order_bin_fast(float x) {
 // -----------------------------------------------------------------------------
 template <int WARPS, int HB>
 __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
-    const uint8_t* __restrict__ q,
-    const uint8_t* __restrict__ kv,
-    const float* __restrict__ wgt,
-    const int* __restrict__ seqlens,
-    const int* __restrict__ ptable,
-    float* __restrict__ out,
-    unsigned int* __restrict__ ghist,
-    int heads,
-    int max_pages,
-    int out_stride,
+    const uint8_t *__restrict__ q, const uint8_t *__restrict__ kv,
+    const float *__restrict__ wgt, const int *__restrict__ seqlens,
+    const int *__restrict__ ptable, float *__restrict__ out,
+    unsigned int *__restrict__ ghist, int heads, int max_pages, int out_stride,
     int topk) {
   constexpr int NBIN = 1 << HB;
   constexpr int LOWB = 16 - HB;
   constexpr int GHS = NBIN + LG_CBINS;
   constexpr int NTH = WARPS * 64;
-  constexpr int PERT = NBIN / NTH;  // GLOBAL bins per thread (coarse map)
+  constexpr int PERT = NBIN / NTH; // GLOBAL bins per thread (coarse map)
   constexpr int CSH = HB - LG_CBITS;
   constexpr int GRP = NTH / LG_CBINS;
   static_assert(NBIN >= 2 && (NBIN % 2) == 0, "paired flush needs even bins");
   static_assert(NBIN % NTH == 0 && NTH >= LG_CBINS, "");
-  static_assert(PERT <= LG_CBINS && (LG_CBINS % PERT) == 0, "a thread's contiguous run must sit inside one coarse bin");
+  static_assert(PERT <= LG_CBINS && (LG_CBINS % PERT) == 0,
+                "a thread's contiguous run must sit inside one coarse bin");
   __shared__ unsigned int s_hist[NBIN];
 
   const int row = blockIdx.y;
@@ -152,37 +148,39 @@ __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
       s_hist[i] = 0u;
   }
 
-  const uint8_t* qp = q + (size_t)row * (size_t)(heads * HD) + (size_t)c * HD + g * 32;
+  const uint8_t *qp =
+      q + (size_t)row * (size_t)(heads * HD) + (size_t)c * HD + g * 32;
   V8 qa0, qa1;
-  qa0.h[0] = *(const i32x4*)(qp);
-  qa0.h[1] = *(const i32x4*)(qp + 16);
-  qa1.h[0] = *(const i32x4*)(qp + 16 * HD);
-  qa1.h[1] = *(const i32x4*)(qp + 16 * HD + 16);
-  const float* wp = wgt + (size_t)row * heads + g * 4;
-  f32x4 w0 = *(const f32x4*)(wp);
-  f32x4 w1 = *(const f32x4*)(wp + 16);
+  qa0.h[0] = *(const i32x4 *)(qp);
+  qa0.h[1] = *(const i32x4 *)(qp + 16);
+  qa1.h[0] = *(const i32x4 *)(qp + 16 * HD);
+  qa1.h[1] = *(const i32x4 *)(qp + 16 * HD + 16);
+  const float *wp = wgt + (size_t)row * heads + g * 4;
+  f32x4 w0 = *(const f32x4 *)(wp);
+  f32x4 w1 = *(const f32x4 *)(wp + 16);
 
   const int nwaves = gridDim.x * WARPS;
   const int wid = blockIdx.x * WARPS + warp;
   const int koff = g * 512 + c * 16;
 
-  if (do_hist) __syncthreads();
+  if (do_hist)
+    __syncthreads();
 
-  unsigned int* __restrict__ gh = ghist + (size_t)row * GHS;
+  unsigned int *__restrict__ gh = ghist + (size_t)row * GHS;
 
-  const int* __restrict__ pt = ptable + (size_t)row * max_pages;
+  const int *__restrict__ pt = ptable + (size_t)row * max_pages;
 
   for (int p = wid; p < npages; p += nwaves) {
     const int phys = pt[p];
-    const uint8_t* base = kv + (size_t)phys * PAGE_BYTES;
-    const uint8_t* kb = base + koff;
+    const uint8_t *base = kv + (size_t)phys * PAGE_BYTES;
+    const uint8_t *kb = base + koff;
     V8 b[4];
 #pragma unroll
     for (int tt = 0; tt < 4; ++tt) {
-      b[tt].h[0] = *(const i32x4*)(kb + tt * 2048);
-      b[tt].h[1] = *(const i32x4*)(kb + tt * 2048 + 256);
+      b[tt].h[0] = *(const i32x4 *)(kb + tt * 2048);
+      b[tt].h[1] = *(const i32x4 *)(kb + tt * 2048 + 256);
     }
-    const float ks = ((const float*)(base + K_BYTES))[lane];
+    const float ks = ((const float *)(base + K_BYTES))[lane];
     float s[4];
 #pragma unroll
     for (int tt = 0; tt < 4; ++tt) {
@@ -227,11 +225,15 @@ __global__ __launch_bounds__(WARPS * 64) void logits_hist_m(
 #pragma unroll
     for (int o = GRP >> 1; o >= 1; o >>= 1)
       acc += __shfl_down(acc, o, 64);
-    if ((threadIdx.x & (GRP - 1)) == 0 && acc) atomicAdd(&gh[NBIN + (g0 >> CSH)], acc);
+    if ((threadIdx.x & (GRP - 1)) == 0 && acc)
+      atomicAdd(&gh[NBIN + (g0 >> CSH)], acc);
 
     for (int i = threadIdx.x; i < NBIN / 2; i += NTH) {
-      const unsigned long long vv = (unsigned long long)s_hist[2 * i] | ((unsigned long long)s_hist[2 * i + 1] << 32);
-      if (vv) atomicAdd((unsigned long long*)(gh + 2 * i), vv);
+      const unsigned long long vv =
+          (unsigned long long)s_hist[2 * i] |
+          ((unsigned long long)s_hist[2 * i + 1] << 32);
+      if (vv)
+        atomicAdd((unsigned long long *)(gh + 2 * i), vv);
     }
   }
 }
@@ -242,42 +244,20 @@ extern "C" {
 // One kernel ships: logits_hist_m<8, 12, ...>, the accepted hip_histM_w8b48.
 // The Phase M search space -- 7 kernel families, 80 variants, the histogram-
 // narrowing, flush-mode and warp-count crosses -- is in the campaign log.
-int launch_logits(
-    const void* q,
-    const void* kv,
-    const void* wgt,
-    const void* seqlens,
-    const void* ptable,
-    void* out,
-    int batch,
-    int heads,
-    int max_pages,
-    int out_stride,
-    int blocks_per_row,
-    int warps,
-    void* stream,
-    void* ghist,
-    int hist_bits,
-    int topk) {
-  if (hist_bits != 12) return -3;
-  if (warps != 8) return -6;
-  hipLaunchKernelGGL(
-      (logits_hist_m<8, 12>),
-      dim3(blocks_per_row, batch),
-      dim3(8 * 64),
-      0,
-      (hipStream_t)stream,
-      (const uint8_t*)q,
-      (const uint8_t*)kv,
-      (const float*)wgt,
-      (const int*)seqlens,
-      (const int*)ptable,
-      (float*)out,
-      (unsigned int*)ghist,
-      heads,
-      max_pages,
-      out_stride,
-      topk);
+int launch_logits(const void *q, const void *kv, const void *wgt,
+                  const void *seqlens, const void *ptable, void *out, int batch,
+                  int heads, int max_pages, int out_stride, int blocks_per_row,
+                  int warps, void *stream, void *ghist, int hist_bits,
+                  int topk) {
+  if (hist_bits != 12)
+    return -3;
+  if (warps != 8)
+    return -6;
+  hipLaunchKernelGGL((logits_hist_m<8, 12>), dim3(blocks_per_row, batch),
+                     dim3(8 * 64), 0, (hipStream_t)stream, (const uint8_t *)q,
+                     (const uint8_t *)kv, (const float *)wgt,
+                     (const int *)seqlens, (const int *)ptable, (float *)out,
+                     (unsigned int *)ghist, heads, max_pages, out_stride, topk);
   return (int)hipGetLastError();
 }
 }
