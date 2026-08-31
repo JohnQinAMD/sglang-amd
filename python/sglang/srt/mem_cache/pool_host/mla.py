@@ -413,6 +413,70 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return self.packed_device_data_ptrs, self.packed_device_kv_buffers
         return device_pool.data_ptrs, device_pool.kv_buffer
 
+
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        """Load KV from host (CPU DRAM) to device (GPU HBM) for ALL layers at once.
+
+        Replaces 80 per-layer kernel launches with a single all-layer kernel call,
+        matching the efficiency of backup_from_device_all_layer. On AMD ROCm this
+        eliminates 79 redundant kernel-launch overheads per load_back operation,
+        which at CONC=16+ where HiCache is heavily used can save 10s of ms per step.
+        """
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_all_layer_mla(
+                        ptr_dst=device_pool.data_ptrs,
+                        indices_dst=device_indices,
+                        ptr_src=self.data_ptrs,
+                        indices_src=host_indices,
+                        cache_dst_stride_bytes=self.token_stride_size,
+                        cache_src_stride_bytes=self.token_stride_size,
+                        element_size=self.kv_cache_dim * self.dtype.itemsize,
+                    )
+                else:
+                    transfer_kv_all_layer_mla(
+                        src_layers=self.data_ptrs,
+                        dst_layers=device_pool.data_ptrs,
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        item_size=self.token_stride_size,
+                        num_layers=self.layer_num,
+                    )
+            else:
+                for layer_id in range(self.layer_num):
+                    self.load_to_device_per_layer(
+                        device_pool, host_indices, device_indices, layer_id, io_backend
+                    )
+        elif io_backend == "direct":
+            if self.layout == "page_first_direct":
+                try:
+                    from sgl_kernel import transfer_kv_all_layer_direct_pf_lf
+                    transfer_kv_all_layer_direct_pf_lf(
+                        src_ptrs=[self.kv_buffer],
+                        dst_ptrs=device_pool.kv_buffer,
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        page_size=self.page_size,
+                    )
+                except (AttributeError, Exception):
+                    for layer_id in range(self.layer_num):
+                        self.load_to_device_per_layer(
+                            device_pool, host_indices, device_indices, layer_id, io_backend
+                        )
+            else:
+                for layer_id in range(self.layer_num):
+                    self.load_to_device_per_layer(
+                        device_pool, host_indices, device_indices, layer_id, io_backend
+                    )
+        else:
+            for layer_id in range(self.layer_num):
+                self.load_to_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):

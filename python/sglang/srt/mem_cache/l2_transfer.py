@@ -85,29 +85,52 @@ class L2TransferEngine:
         with device_module.stream(self.host_to_device_stream):
             start_event.wait(self.host_to_device_stream)
             ack_start.record()
-            for layer_id in range(layer_num):
+            # Use all-layer load if available (single kernel vs 80 per-layer launches).
+            # Falls back to per-layer when layer_mapper is set (non-uniform mapping)
+            # or when the host pool does not expose load_to_device_all_layer.
+            all_layer_capable = (
+                on_layer_done is None
+                and all(
+                    hasattr(t.host_pool, "load_to_device_all_layer")
+                    and t.layer_mapper is None
+                    for t in transfers
+                )
+            )
+            if all_layer_capable:
                 for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
-                    )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
-                        continue
-                    transfer.host_pool.load_to_device_per_layer(
+                    transfer.host_pool.load_to_device_all_layer(
                         transfer.device_pool,
                         transfer.host_indices,
                         transfer.device_indices,
-                        local_layer_id,
                         self.io_backend,
-                        is_draft=transfer.is_draft,
                     )
-                if on_layer_done is not None:
-                    on_layer_done(layer_id)
+                for layer_id in range(layer_num):
+                    if on_layer_done is not None:
+                        on_layer_done(layer_id)
+            else:
+                for layer_id in range(layer_num):
+                    for transfer in transfers:
+                        local_layer_id = (
+                            transfer.layer_mapper(layer_id)
+                            if transfer.layer_mapper is not None
+                            else layer_id
+                        )
+                        if local_layer_id is None or (
+                            transfer is not primary
+                            and transfer.layer_mapper is None
+                            and layer_id >= transfer.host_pool.layer_num
+                        ):
+                            continue
+                        transfer.host_pool.load_to_device_per_layer(
+                            transfer.device_pool,
+                            transfer.host_indices,
+                            transfer.device_indices,
+                            local_layer_id,
+                            self.io_backend,
+                            is_draft=transfer.is_draft,
+                        )
+                    if on_layer_done is not None:
+                        on_layer_done(layer_id)
             ack_finish.record()
             self._record_stream(transfers, self.host_to_device_stream)
         return TransferCompletion(ack_start, ack_finish, timing_enabled)
