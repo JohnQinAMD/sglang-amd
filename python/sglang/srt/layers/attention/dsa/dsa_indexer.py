@@ -523,6 +523,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             fp8_dtype=fp8_dtype,
         ):
             return None
+        from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
+            consume_fresh_allocation,
+        )
+
+        if consume_fresh_allocation():
+            # The workspace is device memory taken AFTER the MQA-logits budget
+            # cached torch.cuda.mem_get_info -- the budget is cached on the first
+            # non-capture prefill, the workspace on the first non-capture sparse
+            # decode, which is strictly later. Leaving the cache in place lets a
+            # later large prefill size its chunk against free memory that no
+            # longer exists; on GLM-5.2 that surfaced as an
+            # HSA_STATUS_ERROR_OUT_OF_RESOURCES abort mid-run, not a catchable
+            # torch OOM. Drop it so the next prefill re-reads the real figure.
+            type(self)._mqa_logits_budget_bytes.clear()
 
         # Per request in, per row out: the next_n draft rows of a request share
         # its table. Broadcast into the preallocated buffer -- no allocation is

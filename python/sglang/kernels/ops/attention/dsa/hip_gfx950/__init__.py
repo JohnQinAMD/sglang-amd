@@ -17,5 +17,6 @@ from sglang.kernels.ops.attention.dsa.hip_gfx950.fused_decode import (  # noqa: 
     MAX_ROWS,
     PAGE_SIZE,
     Gfx950FusedIndexer,
+    consume_fresh_allocation,
     model_shape_supported,
 )

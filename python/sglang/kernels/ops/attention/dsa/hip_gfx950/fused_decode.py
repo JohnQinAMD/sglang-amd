@@ -30,7 +30,7 @@ CONTRACT PRESERVED, deliberately and non-negotiably:
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -140,6 +140,36 @@ class _Workspace:
         )
 
 
+# One workspace per (device, fp8 dtype), shared by every Indexer on that
+# device. The buffers are pure scratch: the layers run back-to-back on the
+# current stream -- this path never uses an alternate stream -- and ``ghist``
+# restores its zero-in/zero-out invariant inside the kernel itself. A per-layer
+# copy therefore bought nothing and multiplied the footprint by the layer count
+# (79 on GLM-5.2: 78 target + 1 draft), which is device memory the rest of the
+# server had already been told was free.
+_WORKSPACES: Dict[Tuple[int, torch.dtype], "_Workspace"] = {}
+_FRESH_ALLOCATION = False
+
+
+def _workspace_key(device, fp8_dtype) -> Tuple[int, torch.dtype]:
+    index = device.index if isinstance(device, torch.device) else device
+    if index is None:
+        index = torch.cuda.current_device()
+    return (int(index), fp8_dtype)
+
+
+def consume_fresh_allocation() -> bool:
+    """True once after a workspace was allocated, then False.
+
+    Callers use this to drop any cached free-memory reading: the workspace is
+    taken after the server has already sized other buffers against
+    ``torch.cuda.mem_get_info``, so that reading no longer holds.
+    """
+    global _FRESH_ALLOCATION
+    fresh, _FRESH_ALLOCATION = _FRESH_ALLOCATION, False
+    return fresh
+
+
 class Gfx950FusedIndexer:
     """Per-``Indexer`` state: merged weights, fp32 norm params, 2-D rope cache."""
 
@@ -179,8 +209,10 @@ class Gfx950FusedIndexer:
         lives in that graph's private pool, and reusing it from a different graph
         is exactly the stale-mapping hazard this campaign already recorded once.
         """
-        ws = self.workspace
+        key = _workspace_key(device, fp8_dtype)
+        ws = _WORKSPACES.get(key)
         if ws is not None:
+            self.workspace = ws
             return max_cols <= ws.max_cols
         if torch.cuda.is_current_stream_capturing():
             global _WARNED_CAPTURE
@@ -192,9 +224,11 @@ class Gfx950FusedIndexer:
                 )
             return False
         self._constants()
-        self.workspace = _Workspace(
-            device=device, max_cols=max_cols, fp8_dtype=fp8_dtype
-        )
+        ws = _Workspace(device=device, max_cols=max_cols, fp8_dtype=fp8_dtype)
+        _WORKSPACES[key] = ws
+        self.workspace = ws
+        global _FRESH_ALLOCATION
+        _FRESH_ALLOCATION = True
         return True
 
     # -- the four launches ---------------------------------------------------
