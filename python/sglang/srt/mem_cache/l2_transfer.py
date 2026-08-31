@@ -88,13 +88,10 @@ class L2TransferEngine:
             # Use all-layer load if available (single kernel vs 80 per-layer launches).
             # Falls back to per-layer when layer_mapper is set (non-uniform mapping)
             # or when the host pool does not expose load_to_device_all_layer.
-            all_layer_capable = (
-                on_layer_done is None
-                and all(
-                    hasattr(t.host_pool, "load_to_device_all_layer")
-                    and t.layer_mapper is None
-                    for t in transfers
-                )
+            all_layer_capable = on_layer_done is None and all(
+                hasattr(t.host_pool, "load_to_device_all_layer")
+                and t.layer_mapper is None
+                for t in transfers
             )
             if all_layer_capable:
                 for transfer in transfers:

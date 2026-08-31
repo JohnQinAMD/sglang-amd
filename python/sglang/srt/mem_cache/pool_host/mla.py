@@ -413,7 +413,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return self.packed_device_data_ptrs, self.packed_device_kv_buffers
         return device_pool.data_ptrs, device_pool.kv_buffer
 
-
     def load_to_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
@@ -454,6 +453,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if self.layout == "page_first_direct":
                 try:
                     from sgl_kernel import transfer_kv_all_layer_direct_pf_lf
+
                     transfer_kv_all_layer_direct_pf_lf(
                         src_ptrs=[self.kv_buffer],
                         dst_ptrs=device_pool.kv_buffer,
@@ -464,7 +464,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 except (AttributeError, Exception):
                     for layer_id in range(self.layer_num):
                         self.load_to_device_per_layer(
-                            device_pool, host_indices, device_indices, layer_id, io_backend
+                            device_pool,
+                            host_indices,
+                            device_indices,
+                            layer_id,
+                            io_backend,
                         )
             else:
                 for layer_id in range(self.layer_num):
