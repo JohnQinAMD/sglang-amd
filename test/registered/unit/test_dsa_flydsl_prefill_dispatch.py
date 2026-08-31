@@ -49,9 +49,9 @@ class TestDsaFlydslPrefillDispatch(CustomTestCase):
     def test_unvalidated_inputs_fall_back(self):
         cases = {
             "short sequence": {
-                "q_nope": self._tensor((511, 16, 512), torch.float8_e4m3fn),
-                "q_rope": self._tensor((511, 16, 64), torch.float8_e4m3fn),
-                "page_table": self._tensor((511, 2048), torch.int32),
+                "q_nope": self._tensor((255, 16, 512), torch.float8_e4m3fn),
+                "q_rope": self._tensor((255, 16, 64), torch.float8_e4m3fn),
+                "page_table": self._tensor((255, 2048), torch.int32),
             },
             "bf16 q": {"q_nope": self._tensor((512, 16, 512), torch.bfloat16)},
             "noncontiguous q": {

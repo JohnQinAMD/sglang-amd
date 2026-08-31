@@ -118,7 +118,9 @@ def _can_use_flydsl_sparse_mla_prefill(
         and _IS_GFX950
         and q_nope.ndim == 3
         and q_rope.ndim == 3
-        and q_nope.shape[0] >= 512
+        # T=256 runs and is 0.59x of TileLang, so the useful range starts below
+        # the original 512 floor; measured 0.49x-0.63x from 512 to 8192.
+        and q_nope.shape[0] >= 256
         and q_nope.shape[1:] == (16, 512)
         and q_rope.shape == (q_nope.shape[0], 16, 64)
         and _are_flydsl_fp8_inputs(q_nope, q_rope, kv_cache)
@@ -146,7 +148,12 @@ def _can_use_flydsl_sparse_mla_decode(
         and q_all.ndim == 3
         and page_table.ndim == 2
         and (head_dim, v_head_dim) == (576, 512)
-        and seq in (1, 6)
+        # Measured on MI355X vs the TileLang decode (width=2048, fp8): FlyDSL is
+        # faster from seq=1 through seq=24 (0.60x .. 0.75x) and loses at seq=48
+        # (1.05x), so the crossover sits between them. seq is a runtime scalar --
+        # the kernel compiles per split count, not per seq -- and numerics hold
+        # at 32.0-32.2 dB across the whole range.
+        and 1 <= seq <= 24
         and q_all.shape[1:] == (16, 576)
         and _are_flydsl_fp8_inputs(q_all, kv_cache)
         and _is_flydsl_kv_shape(kv_cache)

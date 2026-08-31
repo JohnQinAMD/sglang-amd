@@ -60,9 +60,9 @@ class TestDsaFlydslDecodeDispatch(CustomTestCase):
     @patch.object(dsa_backend, "_DSA_FLYDSL_DECODE", True)
     def test_unvalidated_inputs_fall_back(self):
         cases = {
-            "wrong seq": {
-                "q_all": self._tensor((2, 16, 576), torch.float8_e4m3fn),
-                "page_table": self._tensor((2, 2048), torch.int32),
+            "seq above scope": {
+                "q_all": self._tensor((25, 16, 576), torch.float8_e4m3fn),
+                "page_table": self._tensor((25, 2048), torch.int32),
             },
             "wrong qk dim": {"head_dim": 640},
             "wrong v dim": {"v_head_dim": 448},
