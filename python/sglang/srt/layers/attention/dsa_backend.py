@@ -164,10 +164,9 @@ def _can_use_flydsl_sparse_mla_decode(
         and q_all.ndim == 3
         and page_table.ndim == 2
         and (head_dim, v_head_dim) == (576, 512)
-        # Measured on MI355X vs the TileLang decode (width=2048, fp8): FlyDSL is
-        # faster and numerically sound for every production size through c=16.
-        # Keep unmeasured, non-production sizes on the incumbent path.
-        and (1 <= seq <= 24 or seq in (48, 96))
+        # gfx950 sparse MLA decode uses a runtime seq dimension; the AITER
+        # kernel contract is validated for the continuous production range.
+        and 1 <= seq <= 96
         and q_all.shape[1:] == (16, 576)
         and _are_flydsl_fp8_inputs(q_all, kv_cache)
         and _is_flydsl_kv_shape(kv_cache)

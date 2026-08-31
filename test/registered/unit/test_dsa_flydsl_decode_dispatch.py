@@ -53,7 +53,7 @@ class TestDsaFlydslDecodeDispatch(CustomTestCase):
                 page_table=self._tensor((1, 2048), torch.int32),
             )
         )
-        for seq in (48, 96):
+        for seq in (24, 30, 60, 96):
             self.assertTrue(
                 self._can_use(
                     q_all=self._tensor((seq, 16, 576), torch.float8_e4m3fn),
@@ -68,8 +68,8 @@ class TestDsaFlydslDecodeDispatch(CustomTestCase):
     def test_unvalidated_inputs_fall_back(self):
         cases = {
             "seq above scope": {
-                "q_all": self._tensor((25, 16, 576), torch.float8_e4m3fn),
-                "page_table": self._tensor((25, 2048), torch.int32),
+                "q_all": self._tensor((97, 16, 576), torch.float8_e4m3fn),
+                "page_table": self._tensor((97, 2048), torch.int32),
             },
             "wrong qk dim": {"head_dim": 640},
             "wrong v dim": {"v_head_dim": 448},
