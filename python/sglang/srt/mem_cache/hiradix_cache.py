@@ -980,23 +980,6 @@ class HiRadixCache(RadixCache):
         host_value = torch.cat([n.host_value for n in chain])
         return top, key, hash_value, host_value
 
-    def _ensure_ancestor_chain_backuped(self, node: TreeNode) -> None:
-        """Back up all unbackuped ancestors so the chain invariant is satisfied.
-
-        write_backup() silently skips a node whose parent is not backed up yet.
-        At CONC=16 with a saturated GPU pool this causes near-zero CPU cache hit
-        rate: nodes that reach hit_count>=threshold are dropped (not saved to
-        HiCache) on eviction because their ancestor chain was incomplete.
-        """
-        ancestors = []
-        cur = node.parent
-        while cur is not None and cur != self.root_node and not cur.backuped:
-            ancestors.append(cur)
-            cur = cur.parent
-        for ancestor in reversed(ancestors):
-            if not ancestor.backuped:
-                self.write_backup(ancestor)
-
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
         if self.cache_controller.write_policy == "write_back" or chunked:
@@ -1005,8 +988,7 @@ class HiRadixCache(RadixCache):
 
         if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
-                # Eagerly back up ancestor chain so write_backup does not skip this node.
-                self._ensure_ancestor_chain_backuped(node)
+                # write to host if the node is not backuped
                 self.write_backup(node)
 
     def _count_ready_acks(self, ack_queue) -> int:
