@@ -158,6 +158,52 @@ def _workspace_key(device, fp8_dtype) -> Tuple[int, torch.dtype]:
     return (int(index), fp8_dtype)
 
 
+def prealloc_workspace(*, device, max_cols: int, fp8_dtype) -> bool:
+    """Create the shared workspace before the server sizes its memory pools.
+
+    Order matters more than size here. The workspace is device memory, and
+    ``calculate_pool_sizes`` divides whatever ``mem_get_info`` reports at that
+    moment among the KV pools. Taking the workspace afterwards -- on the first
+    non-capture sparse decode, which is far later -- means the pools were sized
+    against memory that no longer exists, and the server spends the rest of the
+    run with no headroom: on GLM-5.2 that showed up as free device memory
+    sitting at 0.6-0.8 GiB for a whole 3600 s window, Triton kernels loading
+    lazily mid-serve because they no longer fit at init, and decode steps
+    running ~2x slower at unchanged clock and 25% lower power -- the GPU
+    stalling on the allocator rather than computing.
+
+    ``consume_fresh_allocation`` patches the consequence (it drops the stale
+    MQA-logits budget so the next prefill re-reads the real figure). This
+    removes the cause. Call it from Indexer construction, which runs while
+    weights load and therefore before any pool is sized.
+
+    Idempotent and shared: the first Indexer allocates, the other 78 reuse.
+    Returns False if a workspace already exists or a capture is in progress.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    key = _workspace_key(device, fp8_dtype)
+    if key in _WORKSPACES:
+        return False
+    _WORKSPACES[key] = _Workspace(
+        device=device, max_cols=max_cols, fp8_dtype=fp8_dtype
+    )
+    global _FRESH_ALLOCATION
+    _FRESH_ALLOCATION = True
+    logger.info(
+        "gfx950 fused DSA indexer: workspace preallocated (max_cols=%d, "
+        "%.0f MiB) before pool sizing",
+        max_cols,
+        sum(
+            t.numel() * t.element_size()
+            for t in vars(_WORKSPACES[key]).values()
+            if isinstance(t, torch.Tensor)
+        )
+        / (1 << 20),
+    )
+    return True
+
+
 def consume_fresh_allocation() -> bool:
     """True once after a workspace was allocated, then False.
 

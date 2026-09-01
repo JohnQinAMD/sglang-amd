@@ -1,3 +1,4 @@
+import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Tuple, Union
 
@@ -20,6 +21,9 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
+
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -86,19 +90,29 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
     from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
     from sglang.srt.utils import is_gfx95_supported
 
+    # Each term logs why it declined. Without this the path is invisible: a run
+    # with the switch on and one with it off produce identical logs, and telling
+    # the two apart cost a day of bisecting benchmark results.
+    def _no(reason: str) -> bool:
+        logger.info("gfx950 fused DSA indexer disabled: %s", reason)
+        return False
+
     if not envs.SGLANG_DSA_HIP_FUSED_INDEXER_GFX950.get():
-        return False
+        return False  # off by default; not worth a line on every server
     if not (is_hip() and is_gfx95_supported()):
-        return False
+        return _no("not a gfx95 HIP device")
     if not get_bool_env_var("SGLANG_USE_AITER"):
-        return False
+        return _no("SGLANG_USE_AITER is not set")
     if not aiter_can_use_preshuffle_paged_mqa():
-        return False
+        return _no("aiter cannot use preshuffled paged MQA logits")
     if is_fp8_fnuz():
-        return False
+        return _no("fp8 is fnuz on this device; the kernels emit e4m3fn only")
     from sglang.kernels.ops.attention.dsa.hip_gfx950 import loader
 
-    return loader.modules_or_none() is not None
+    if loader.modules_or_none() is None:
+        return False  # modules_or_none already logged the build failure
+    logger.info("gfx950 fused DSA indexer enabled")
+    return True
 
 
 def gfx950_model_shape_supported(**kwargs) -> bool:

@@ -353,15 +353,53 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         )
         self._gfx950_fused = None
+        if envs.SGLANG_DSA_HIP_FUSED_INDEXER_GFX950.get() and not self.use_gfx950_fused_indexer:
+            # runtime_ok already logged its own reason; this covers the other two
+            # terms, which were the silent ones.
+            logger.info(
+                "gfx950 fused DSA indexer not used on this layer: "
+                "dsa_indexer_fusion=%s shape_supported=%s",
+                self.use_dsa_indexer_fusion,
+                gfx950_model_shape_supported(
+                    head_dim=self.head_dim, rope_head_dim=self.rope_head_dim,
+                    n_heads=self.n_heads, index_topk=self.index_topk,
+                    q_lora_rank=self.q_lora_rank, hidden_size=self.hidden_size,
+                    quant_block=self.block_size, scale_fmt=self.scale_fmt,
+                    is_neox_style=is_neox_style, k_norm=self.k_norm,
+                    num_init_tokens=self.num_init_tokens,
+                    num_local_tokens=self.num_local_tokens,
+                ),
+            )
         if self.use_gfx950_fused_indexer:
             # Executable, not a comment: proves _maybe_rotate still applies the
             # Hadamard before any cache byte is written by the fused kernel.
             assert_hadamard_preserved(self)
             from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
                 Gfx950FusedIndexer,
+                prealloc_workspace,
             )
 
             self._gfx950_fused = Gfx950FusedIndexer(self)
+
+            # Take the workspace here, not on the first sparse decode. This runs
+            # while weights load, so calculate_pool_sizes still sees the real
+            # free memory; deferring it left the pools sized against memory that
+            # was about to be taken, and the server then ran the whole window
+            # with well under 1 GiB free. Shared across all 79 Indexers, so only
+            # the first call allocates.
+            #
+            # max_cols is the widest decode page table the model can present:
+            # the page table covers the context, so bound it by context length.
+            # Sizing to the bound rather than to first use also keeps
+            # ensure_workspace from refusing a later, longer context and
+            # silently dropping back to the standard indexer mid-run.
+            max_ctx = getattr(config, "max_position_embeddings", 0) or 0
+            if max_ctx:
+                prealloc_workspace(
+                    device=torch.device("cuda", torch.cuda.current_device()),
+                    max_cols=max_ctx,
+                    fp8_dtype=torch.float8_e4m3fn,
+                )
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
