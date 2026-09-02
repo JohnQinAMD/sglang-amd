@@ -1,9 +1,10 @@
-"""target-verify 应当走 FlyDSL 的 decode 门，而不是被 prefill 门挡掉。
+"""Target verify belongs at the FlyDSL decode gate, not behind the prefill gate.
 
-MTP5 下 verify 的形状是 T = bs * num_draft_tokens（bs=4 时 24），每 token 一行
-page table，topk 2048 —— 这是 decode 契约，不是 prefill 契约。prefill 门的
-T>=256 下限是按 prefill 形状测出来的，会把 bs<43 的 verify 全部挡掉，于是
-78 层的重路径一直在回落到 TileLang。
+Under MTP5 a verify batch has shape T = bs * num_draft_tokens (24 at bs=4), one
+page-table row per token and topk 2048. That is the decode contract, not the
+prefill one. The prefill gate's T >= 256 floor was measured on prefill shapes
+and rejects every verify batch below bs=43, which left the hot path on all 78
+layers falling back to TileLang.
 """
 
 import unittest
@@ -18,7 +19,7 @@ def _fp8(*shape):
 
 
 class TestVerifyDispatch(unittest.TestCase):
-    """只测两个门对同一批形状的判定，不触发实际 kernel。"""
+    """Only the two gates' verdicts on one set of shapes; no kernel is launched."""
 
     def setUp(self):
         if not B._IS_GFX950:
@@ -48,37 +49,38 @@ class TestVerifyDispatch(unittest.TestCase):
         for bs in (1, 3, 4, 8):
             T = bs * 6
             dec, pre = self._gates(T)
-            self.assertTrue(dec, f"verify T={T} 应命中 decode 门")
+            self.assertTrue(dec, f"verify T={T} should pass the decode gate")
             self.assertLessEqual(T, B._FLYDSL_VERIFY_MAX_ROWS)
-            self.assertFalse(pre, f"verify T={T} 本来就过不了 prefill 门")
+            self.assertFalse(pre, f"verify T={T} was never going to pass the prefill gate")
 
     def test_verify_cap_matches_where_flydsl_still_wins(self):
-        """上界必须落在实测的交叉点之前。
+        """The cap has to sit before the measured crossover.
 
-        实测（width 2048, fp8, HIP graph 内 device time）：
-            T=24  FlyDSL 15.41 vs TileLang 22.97  = 0.67x   78 层省 3.07% 步时
-            T=48  FlyDSL 25.09 vs TileLang 28.26  = 0.89x   省 1.29%
-            T=96  FlyDSL 42.75 vs TileLang 41.83  = 1.02x   亏 0.37%
-        所以上界取 48：T=96（bs=16）会让这条分派变成回归。
+        Measured at width 2048, fp8, device time inside a HIP graph:
+            T=24  FlyDSL 15.41 vs TileLang 22.97 = 0.67x  saves 3.07% of a step
+                                                          over 78 layers
+            T=48  FlyDSL 25.09 vs TileLang 28.26 = 0.89x  saves 1.29%
+            T=96  FlyDSL 42.75 vs TileLang 41.83 = 1.02x  loses 0.37%
+        Hence 48: at T=96 (bs=16) this dispatch would become a regression.
         """
         self.assertEqual(B._FLYDSL_VERIFY_MAX_ROWS, 48)
         self.assertLess(
             B._FLYDSL_VERIFY_MAX_ROWS,
             96,
-            "T=96 时 FlyDSL 比 TileLang 慢，不能落在上界之内",
+            "FlyDSL is slower than TileLang at T=96, so it must not be under the cap",
         )
 
     def test_prefill_shapes_still_go_to_the_prefill_gate(self):
         for T in (384, 2048, 8192, 32768):
             dec, pre = self._gates(T)
-            self.assertTrue(pre, f"prefill T={T} 应命中 prefill 门")
+            self.assertTrue(pre, f"prefill T={T} should pass the prefill gate")
             if T > 96:
-                self.assertFalse(dec, f"prefill T={T} 超出 decode 门的 seq<=96")
+                self.assertFalse(dec, f"prefill T={T} is past the decode gate's seq <= 96")
 
     def test_the_two_gates_do_not_both_claim_a_shape(self):
         for T in (6, 24, 96, 256, 384, 2048):
             dec, pre = self._gates(T)
-            self.assertFalse(dec and pre, f"T={T} 被两个门同时认领，分派有歧义")
+            self.assertFalse(dec and pre, f"T={T} is claimed by both gates, so the dispatch is ambiguous")
 
 
 if __name__ == "__main__":

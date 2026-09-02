@@ -1,8 +1,9 @@
-"""FlyDSL decode 的持久 scratch。
+"""Persistent scratch for the FlyDSL decode kernel.
 
-aiter 要求 partial_output/partial_lse 连续且形状精确等于 [seq,ng,H,DV] /
-[seq,ng,H] —— 对最大尺寸张量做二维切片得不到连续张量，所以实现用的是一维
-扁平 buffer 加前缀 view。这些测试钉住那个契约。
+aiter requires partial_output/partial_lse to be contiguous and to have exactly
+the shapes [seq,ng,H,DV] and [seq,ng,H]. A 2-D slice of a max-sized tensor is
+not contiguous, so the implementation keeps one flat 1-D buffer and views a
+prefix of it. These tests pin that contract down.
 """
 
 import unittest
@@ -23,11 +24,11 @@ class TestFlydslDecodeScratch(unittest.TestCase):
     def test_shape_and_contiguity(self):
         for seq, ng in ((1, 32), (4, 32), (24, 32), (96, 33), (6, 1)):
             po, pl = B._flydsl_decode_scratch(seq, ng, self.dev)
-            self.assertIsNotNone(po, f"seq={seq} ng={ng} 不应回落")
+            self.assertIsNotNone(po, f"seq={seq} ng={ng} should not fall back")
             self.assertEqual(tuple(po.shape), (seq, ng, H, DV))
             self.assertEqual(tuple(pl.shape), (seq, ng, H))
-            self.assertTrue(po.is_contiguous(), "aiter 要求连续")
-            self.assertTrue(pl.is_contiguous(), "aiter 要求连续")
+            self.assertTrue(po.is_contiguous(), "aiter requires contiguous buffers")
+            self.assertTrue(pl.is_contiguous(), "aiter requires contiguous buffers")
             self.assertEqual(po.dtype, torch.bfloat16)
             self.assertEqual(pl.dtype, torch.float32)
 
@@ -40,8 +41,8 @@ class TestFlydslDecodeScratch(unittest.TestCase):
         self.assertEqual(len(B._FLYDSL_DECODE_SCRATCH), 1)
 
     def test_beyond_capacity_falls_back(self):
-        B._flydsl_decode_scratch(4, 32, self.dev)          # 先建好 buffer
-        po, pl = B._flydsl_decode_scratch(97, 33, self.dev)  # 超出门的上界
+        B._flydsl_decode_scratch(4, 32, self.dev)  # build the buffer first
+        po, pl = B._flydsl_decode_scratch(97, 33, self.dev)  # past the gate's upper bound
         self.assertIsNone(po)
         self.assertIsNone(pl)
 
@@ -55,7 +56,8 @@ class TestFlydslDecodeScratch(unittest.TestCase):
         self.assertEqual(len(B._FLYDSL_DECODE_SCRATCH), 0)
 
     def test_capacity_covers_the_gate(self):
-        # 门允许 1<=seq<=96 且 64<=width<=2112 步长 64 -> ng 1..33
+        # The gate admits 1 <= seq <= 96 and 64 <= width <= 2112 in steps of
+        # 64, i.e. ng 1..33.
         B._flydsl_decode_scratch(1, 1, self.dev)
         cap_out = B._FLYDSL_DECODE_SCRATCH[self.dev][0].numel()
         self.assertGreaterEqual(cap_out, 96 * 33 * H * DV)
@@ -64,7 +66,7 @@ class TestFlydslDecodeScratch(unittest.TestCase):
         self.assertEqual(len(B._FLYDSL_DECODE_SCRATCH), 0)
         B._flydsl_decode_scratch_prealloc(self.dev)
         self.assertEqual(len(B._FLYDSL_DECODE_SCRATCH), 1)
-        # 预分配之后，捕获期也能拿到 buffer 而不是回落
+        # After preallocation a capture gets the buffer instead of falling back
         with mock.patch.object(
             torch.cuda, "is_current_stream_capturing", lambda: True
         ):
