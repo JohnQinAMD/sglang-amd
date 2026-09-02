@@ -13,6 +13,7 @@ from typing import (
 )
 
 import torch
+from functools import lru_cache
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import get_parallel, get_spec
@@ -181,11 +182,38 @@ def _flydsl_decode_scratch_prealloc(device: torch.device) -> None:
     """
     if torch.cuda.is_current_stream_capturing():
         return
-    _flydsl_decode_scratch(1, 1, device)
+    _flydsl_decode_scratch(1, 64, device)
+
+
+@lru_cache(maxsize=None)
+def _flydsl_partial_groups(seq: int, width: int) -> int:
+    """How many partial groups aiter wants for this shape.
+
+    Not ``width // 64``. aiter merges adjacent 64-key tiles whenever the reduced
+    producer grid still fills the GPU (``_pick_inner_iter``), so at width 2048 a
+    verify batch of 24 rows wants 16 groups and 96 rows want 8. Passing the
+    unmerged count makes ``flydsl_sparse_mla_decode`` reject the workspace with a
+    shape error, which is an uncaught exception inside attention.
+
+    Older aiter has no helper and always uses one tile per group; fall back to
+    that so this works against both.
+    """
+    try:
+        from aiter.ops.flydsl import sparse_mla_decode_workspace_shape
+    except ImportError:
+        return width // 64
+    try:
+        return sparse_mla_decode_workspace_shape(seq, width)[0][1]
+    except ValueError:
+        # Out of aiter's supported range. Deciding that is the caller's job --
+        # _flydsl_decode_scratch turns an oversized shape into (None, None) and
+        # the standard path runs -- so answer with the ungrouped count and let
+        # the capacity check reject it, rather than raising out of a gate.
+        return width // 64
 
 
 def _flydsl_decode_scratch(
-    seq: int, ng: int, device: torch.device
+    seq: int, width: int, device: torch.device
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Persistent partials for one decode call, or (None, None) to let aiter allocate.
 
@@ -194,6 +222,7 @@ def _flydsl_decode_scratch(
     from another graph is the stale-mapping hazard this backend has already been
     bitten by once.
     """
+    ng = _flydsl_partial_groups(seq, width)
     n_out = seq * ng * _FLYDSL_DECODE_H * _FLYDSL_DECODE_DV
     n_lse = seq * ng * _FLYDSL_DECODE_H
     buf = _FLYDSL_DECODE_SCRATCH.get(device)
@@ -2251,7 +2280,7 @@ class DeepseekSparseAttnBackend(
                         device=q_all.device,
                     )
                     partial_output, partial_lse = _flydsl_decode_scratch(
-                        q_all.shape[0], page_table_1.shape[1] // 64, q_all.device
+                        q_all.shape[0], page_table_1.shape[1], q_all.device
                     )
                     return flydsl_sparse_mla_decode(
                         q=q_all,
@@ -2585,7 +2614,7 @@ class DeepseekSparseAttnBackend(
                     device=q_all.device,
                 )
                 partial_output, partial_lse = _flydsl_decode_scratch(
-                    q_all.shape[0], page_table_1.shape[1] // 64, q_all.device
+                    q_all.shape[0], page_table_1.shape[1], q_all.device
                 )
                 return flydsl_sparse_mla_decode(
                     q=q_all,
