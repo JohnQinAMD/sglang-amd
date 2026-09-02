@@ -422,23 +422,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # with well under 1 GiB free. Shared across all 79 Indexers, so only
             # the first call allocates.
             #
-            # max_cols is the widest decode page table this workspace will
-            # serve. It must NOT be the model's architectural maximum: the
-            # buffers that scale with it cost ~12 B per column per row, so
-            # GLM-5.2's max_position_embeddings of 1,048,576 takes 606 MiB --
-            # measured, that is 1.13% of the KV pool, which is by itself larger
-            # than most effects we A/B against and confounded our own
-            # measurement of this feature.
+            # max_cols must cover the widest page table the decode CUDA graph
+            # can present, and that is the model context -- not the contexts
+            # actually in flight. Sizing it smaller does NOT degrade gracefully:
+            # every call asks ensure_workspace for page_table.shape[1] * 64
+            # columns, so a smaller workspace refuses every call and the feature
+            # stops running while the startup log still says "enabled".
+            # Measured: capping this at 131072 on GLM-5.2 produced zero fused
+            # kernel launches across an entire 1800 s run.
             #
-            # Over the cap the per-call ensure_workspace simply returns False
-            # and that call uses the standard indexer, so the cap trades an
-            # acceleration on very long contexts for pool space that every
-            # request benefits from. Raise it if your deployment actually serves
-            # contexts longer than the default.
-            max_ctx = min(
-                getattr(config, "max_position_embeddings", 0) or 0,
-                envs.SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX.get(),
-            )
+            # The cap is therefore opt-in (0 = none) and only meaningful for a
+            # deployment that also bounds --context-length so the graph's table
+            # is narrower. It buys 606 MiB of KV pool on GLM-5.2 if you can.
+            max_ctx = getattr(config, "max_position_embeddings", 0) or 0
+            cap = envs.SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX.get()
+            if cap:
+                max_ctx = min(max_ctx, cap)
             if max_ctx:
                 prealloc_workspace(
                     device=torch.device("cuda", torch.cuda.current_device()),

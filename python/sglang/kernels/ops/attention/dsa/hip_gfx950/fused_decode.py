@@ -39,6 +39,7 @@ from sglang.kernels.ops.attention.dsa.hip_gfx950 import loader
 logger = logging.getLogger(__name__)
 
 _WARNED_CAPTURE = False
+_WARNED_TOO_NARROW = False
 
 # Kernel-source constraints. Every one of these is enforced by a TORCH_CHECK or a
 # compile-time constant in csrc/, not by taste:
@@ -259,7 +260,25 @@ class Gfx950FusedIndexer:
         ws = _WORKSPACES.get(key)
         if ws is not None:
             self.workspace = ws
-            return max_cols <= ws.max_cols
+            if max_cols > ws.max_cols:
+                # Say so once. This refusal turns the whole feature off for the
+                # rest of the run while every other log line still reports it as
+                # enabled, and finding that out cost a full 1800 s A/B that
+                # measured two identical arms.
+                global _WARNED_TOO_NARROW
+                if not _WARNED_TOO_NARROW:
+                    _WARNED_TOO_NARROW = True
+                    logger.warning(
+                        "gfx950 fused DSA indexer: workspace is %d columns wide "
+                        "but this call needs %d, so the standard indexer runs "
+                        "instead. The workspace must cover the decode graph's "
+                        "page-table width; check "
+                        "SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX.",
+                        ws.max_cols,
+                        max_cols,
+                    )
+                return False
+            return True
         if torch.cuda.is_current_stream_capturing():
             global _WARNED_CAPTURE
             if not _WARNED_CAPTURE:

@@ -1377,14 +1377,22 @@ class Envs:
     # use_dsa_indexer_fusion (which is CUDA only and, on this path, would delete
     # the Hadamard - see Indexer._maybe_rotate).
     SGLANG_DSA_HIP_FUSED_INDEXER_GFX950 = EnvBool(False)
-    # Widest context the fused indexer's shared workspace is sized for. The
-    # buffers that scale with it cost ~12 B per column per row (48 rows), so
-    # sizing to GLM-5.2's 1,048,576 max_position_embeddings would take 606 MiB
-    # of device memory away from the KV pool -- measured at 1.13% of the pool.
-    # Requests with a longer context fall back to the standard indexer for that
-    # call; raise this if you actually serve them and would rather spend the
-    # memory.
-    SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX = EnvInt(131072)
+    # Caps the width the fused indexer's shared workspace is sized for. 0 means
+    # no cap, which is the default and the only safe one.
+    #
+    # This is NOT a knob for trading memory against long contexts, which is what
+    # it looks like. Every decode call asks the workspace for
+    # page_table_64.shape[1] * 64 columns, and the decode CUDA graph sizes that
+    # table to the model's context length regardless of the contexts actually in
+    # flight -- 1,048,576 columns on GLM-5.2. So any cap below
+    # max_position_embeddings makes ensure_workspace refuse on EVERY call and
+    # turns the whole feature off. Measured: a 131072 cap produced zero fused
+    # kernel launches in a 1800 s run while the log still said "enabled".
+    #
+    # Setting it below the model context is only meaningful if the deployment
+    # also bounds --context-length, so the graph's page table is narrower. The
+    # refusal is logged once either way.
+    SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX = EnvInt(0)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
