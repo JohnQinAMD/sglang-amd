@@ -2066,6 +2066,42 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    @staticmethod
+    def _try_flydsl_sparse_mla_decode(
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+    ) -> Optional[torch.Tensor]:
+        if not _can_use_flydsl_sparse_mla_decode(
+            q_all,
+            kv_cache,
+            page_table_1,
+            head_dim=layer.head_dim,
+            v_head_dim=layer.v_head_dim,
+        ):
+            return None
+
+        from aiter.ops.flydsl import flydsl_sparse_mla_decode
+
+        out = torch.empty(
+            (q_all.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+            dtype=torch.bfloat16,
+            device=q_all.device,
+        )
+        partial_output, partial_lse = _flydsl_decode_scratch(
+            q_all.shape[0], page_table_1.shape[1], q_all.device
+        )
+        return flydsl_sparse_mla_decode(
+            q=q_all,
+            kv=kv_cache,
+            indices=page_table_1,
+            out=out,
+            sm_scale=layer.scaling,
+            partial_output=partial_output,
+            partial_lse=partial_lse,
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2087,13 +2123,12 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
+        is_speculative_decode = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
         dsa_impl = (
-            self.dsa_decode_impl
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            )
-            else self.dsa_prefill_impl
+            self.dsa_decode_impl if is_speculative_decode else self.dsa_prefill_impl
         )
 
         if dsa_impl == "trtllm" and not self.use_mha:
@@ -2215,38 +2250,14 @@ class DeepseekSparseAttnBackend(
             # is the only bound needed. The q_all concat is not a cost this
             # branch adds: the TileLang fallback concatenates the same tensors
             # before calling _forward_tilelang.
-            if dsa_impl == "flydsl" and (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
+            if dsa_impl == "flydsl" and is_speculative_decode:
                 if q_all is None or not _is_hip:
                     q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-                if _can_use_flydsl_sparse_mla_decode(
-                    q_all,
-                    kv_cache,
-                    page_table_1,
-                    head_dim=layer.head_dim,
-                    v_head_dim=layer.v_head_dim,
-                ):
-                    from aiter.ops.flydsl import flydsl_sparse_mla_decode
-
-                    out = torch.empty(
-                        (q_all.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-                        dtype=torch.bfloat16,
-                        device=q_all.device,
-                    )
-                    partial_output, partial_lse = _flydsl_decode_scratch(
-                        q_all.shape[0], page_table_1.shape[1], q_all.device
-                    )
-                    return flydsl_sparse_mla_decode(
-                        q=q_all,
-                        kv=kv_cache,
-                        indices=page_table_1,
-                        out=out,
-                        sm_scale=layer.scaling,
-                        partial_output=partial_output,
-                        partial_lse=partial_lse,
-                    )
+                out = self._try_flydsl_sparse_mla_decode(
+                    q_all, kv_cache, page_table_1, layer
+                )
+                if out is not None:
+                    return out
             if q_rope is not None:
                 if dsa_impl == "flydsl" and _can_use_flydsl_sparse_mla_prefill(
                     q_nope, q_rope, kv_cache, page_table_1
@@ -2555,32 +2566,12 @@ class DeepseekSparseAttnBackend(
             # HIP callers may provide q in its already-concatenated layout.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            if self.dsa_decode_impl == "flydsl" and _can_use_flydsl_sparse_mla_decode(
-                q_all,
-                kv_cache,
-                page_table_1,
-                head_dim=layer.head_dim,
-                v_head_dim=layer.v_head_dim,
-            ):
-                from aiter.ops.flydsl import flydsl_sparse_mla_decode
-
-                out = torch.empty(
-                    (q_all.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-                    dtype=torch.bfloat16,
-                    device=q_all.device,
+            if self.dsa_decode_impl == "flydsl":
+                out = self._try_flydsl_sparse_mla_decode(
+                    q_all, kv_cache, page_table_1, layer
                 )
-                partial_output, partial_lse = _flydsl_decode_scratch(
-                    q_all.shape[0], page_table_1.shape[1], q_all.device
-                )
-                return flydsl_sparse_mla_decode(
-                    q=q_all,
-                    kv=kv_cache,
-                    indices=page_table_1,
-                    out=out,
-                    sm_scale=layer.scaling,
-                    partial_output=partial_output,
-                    partial_lse=partial_lse,
-                )
+                if out is not None:
+                    return out
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,

@@ -1,11 +1,13 @@
-"""CPU coverage for the opt-in FlyDSL sparse-MLA decode dispatch gate."""
+"""CPU coverage for the FlyDSL sparse-MLA decode dispatch."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.layers.attention import dsa_backend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -43,6 +45,24 @@ class TestDsaFlydslDecodeDispatch(CustomTestCase):
             head_dim=head_dim,
             v_head_dim=v_head_dim,
         )
+
+    @staticmethod
+    def _backend_for_forward_test(kv):
+        backend = dsa_backend.DeepseekSparseAttnBackend.__new__(
+            dsa_backend.DeepseekSparseAttnBackend
+        )
+        backend.dsa_decode_impl = "flydsl"
+        backend.dsa_prefill_impl = "tilelang"
+        backend.use_mha = False
+        backend.use_fused_topk = True
+        backend.hisparse_coordinator = None
+        backend.forward_metadata = SimpleNamespace()
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=MagicMock(return_value=kv)
+        )
+        backend.get_topk_transform_method = MagicMock(return_value=None)
+        backend._get_fused_topk_page_table = MagicMock(side_effect=lambda x: x)
+        return backend
 
     @patch.object(dsa_backend, "_IS_GFX950", True)
     def test_validated_shapes_are_accepted(self):
@@ -108,6 +128,69 @@ class TestDsaFlydslDecodeDispatch(CustomTestCase):
     @patch.object(dsa_backend, "_IS_GFX950", False)
     def test_non_gfx950_falls_back(self):
         self.assertFalse(self._can_use())
+
+    def test_speculative_extend_modes_use_decode_kernel(self):
+        q = torch.empty((6, 16, 576), dtype=torch.bfloat16)
+        kv = torch.empty((64, 1, 576), dtype=torch.bfloat16)
+        indices = torch.zeros((6, 2048), dtype=torch.int32)
+        layer = SimpleNamespace(
+            is_cross_attention=False,
+            layer_id=0,
+            tp_q_head_num=16,
+            head_dim=576,
+            v_head_dim=512,
+            scaling=1.0,
+        )
+        expected = torch.empty((6, 16, 512), dtype=torch.bfloat16)
+
+        for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2):
+            with self.subTest(mode=mode):
+                backend = self._backend_for_forward_test(kv)
+                backend._try_flydsl_sparse_mla_decode = MagicMock(return_value=expected)
+
+                result = backend.forward(
+                    q,
+                    None,
+                    None,
+                    layer,
+                    SimpleNamespace(forward_mode=mode),
+                    save_kv_cache=False,
+                    q_rope=None,
+                    topk_indices=indices,
+                )
+
+                self.assertIs(result, expected)
+                backend._try_flydsl_sparse_mla_decode.assert_called_once()
+
+    def test_speculative_extend_preserves_tilelang_fallback(self):
+        q = torch.empty((6, 16, 576), dtype=torch.bfloat16)
+        kv = torch.empty((64, 1, 576), dtype=torch.bfloat16)
+        indices = torch.zeros((6, 2048), dtype=torch.int32)
+        expected = torch.empty((6, 16, 512), dtype=torch.bfloat16)
+        backend = self._backend_for_forward_test(kv)
+        backend._try_flydsl_sparse_mla_decode = MagicMock(return_value=None)
+        backend._forward_tilelang = MagicMock(return_value=expected)
+
+        result = backend.forward(
+            q,
+            None,
+            None,
+            SimpleNamespace(
+                is_cross_attention=False,
+                layer_id=0,
+                tp_q_head_num=16,
+                head_dim=576,
+                v_head_dim=512,
+                scaling=1.0,
+            ),
+            SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY),
+            save_kv_cache=False,
+            q_rope=None,
+            topk_indices=indices,
+        )
+
+        self.assertIs(result, expected)
+        backend._forward_tilelang.assert_called_once()
 
 
 if __name__ == "__main__":
