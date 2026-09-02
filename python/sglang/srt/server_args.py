@@ -3622,6 +3622,7 @@ class ServerArgs:
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
+        self._handle_rocm_pinned_transfer_threshold()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3814,6 +3815,13 @@ class ServerArgs:
                 self.return_hidden_states_mode = "full"
         else:
             self.enable_return_hidden_states = True
+
+    def _handle_rocm_pinned_transfer_threshold(self):
+        # Above this the HIP runtime pins a pageable H2D source in place rather
+        # than staging it, and the MMU notifier on the registered range then
+        # evicts our KFD queues once per tensor while loading weights. In KB.
+        if is_hip():
+            os.environ.setdefault("GPU_PINNED_MIN_XFER_SIZE", str(4 * 1024 * 1024))
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
