@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers.attention import dsa_backend
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -50,7 +51,6 @@ class TestDsaFlydslPrefillDispatch(CustomTestCase):
         return dsa_backend._can_use_flydsl_sparse_mla_prefill(**values)
 
     @patch.object(dsa_backend, "_IS_GFX950", True)
-    @patch.object(dsa_backend, "_DSA_FLYDSL_PREFILL", True)
     def test_validated_shape_is_accepted(self):
         self.assertTrue(self._can_use())
         production_strides = (16 * 576, 576, 1)
@@ -72,7 +72,6 @@ class TestDsaFlydslPrefillDispatch(CustomTestCase):
         )
 
     @patch.object(dsa_backend, "_IS_GFX950", True)
-    @patch.object(dsa_backend, "_DSA_FLYDSL_PREFILL", True)
     def test_unvalidated_inputs_fall_back(self):
         cases = {
             "short sequence": {
@@ -111,13 +110,13 @@ class TestDsaFlydslPrefillDispatch(CustomTestCase):
             with self.subTest(name=name):
                 self.assertFalse(self._can_use(**replacements))
 
-    @patch.object(dsa_backend, "_IS_GFX950", True)
-    @patch.object(dsa_backend, "_DSA_FLYDSL_PREFILL", False)
-    def test_default_off_falls_back(self):
-        self.assertFalse(self._can_use())
+    def test_flydsl_is_an_opt_in_backend_choice(self):
+        from sglang.srt.server_args import DSA_CHOICES
+
+        self.assertIn("flydsl", DSA_CHOICES)
+        self.assertIsNone(ServerArgs.dsa_prefill_backend)
 
     @patch.object(dsa_backend, "_IS_GFX950", False)
-    @patch.object(dsa_backend, "_DSA_FLYDSL_PREFILL", True)
     def test_non_gfx950_falls_back(self):
         self.assertFalse(self._can_use())
 

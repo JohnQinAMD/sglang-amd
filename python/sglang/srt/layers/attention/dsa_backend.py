@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -13,7 +14,6 @@ from typing import (
 )
 
 import torch
-from functools import lru_cache
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import get_parallel, get_spec
@@ -80,10 +80,6 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 
-# Default-off FlyDSL routes for the validated gfx950 sparse-MLA shapes.
-_DSA_FLYDSL_PREFILL = get_bool_env_var("SGLANG_DSA_FLYDSL_PREFILL")
-_DSA_FLYDSL_DECODE = get_bool_env_var("SGLANG_DSA_FLYDSL_DECODE")
-
 # Separate opt-in for the Triton per-query flash kernel.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
@@ -128,8 +124,7 @@ def _can_use_flydsl_sparse_mla_prefill(
     page_table: torch.Tensor,
 ) -> bool:
     return (
-        _DSA_FLYDSL_PREFILL
-        and _IS_GFX950
+        _IS_GFX950
         and q_nope.ndim == 3
         and q_rope.ndim == 3
         # T=256 runs and is 0.59x of TileLang, so the useful range starts below
@@ -165,8 +160,6 @@ def _can_use_flydsl_sparse_mla_prefill(
 _FLYDSL_DECODE_H = 16
 _FLYDSL_DECODE_DV = 512
 _FLYDSL_DECODE_MAX_SEQ = 96  # the dispatch gate's upper bound
-# Past this the kernel loses to TileLang; see forward_extend.
-_FLYDSL_VERIFY_MAX_ROWS = 48
 _FLYDSL_DECODE_MAX_NG = 33  # width <= 2112 over a 64-token page
 _FLYDSL_DECODE_SCRATCH: Dict[torch.device, Tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -237,9 +230,7 @@ def _flydsl_decode_scratch(
         )
         buf = (
             torch.empty(cap, dtype=torch.bfloat16, device=device),
-            torch.empty(
-                cap // _FLYDSL_DECODE_DV, dtype=torch.float32, device=device
-            ),
+            torch.empty(cap // _FLYDSL_DECODE_DV, dtype=torch.float32, device=device),
         )
         _FLYDSL_DECODE_SCRATCH[device] = buf
     if n_out > buf[0].numel() or n_lse > buf[1].numel():
@@ -261,8 +252,7 @@ def _can_use_flydsl_sparse_mla_decode(
     seq = q_all.shape[0] if q_all.ndim == 3 else 0
     width = page_table.shape[1] if page_table.ndim == 2 else 0
     return (
-        _DSA_FLYDSL_DECODE
-        and _IS_GFX950
+        _IS_GFX950
         and q_all.ndim == 3
         and page_table.ndim == 2
         and (head_dim, v_head_dim) == (576, 512)
@@ -473,6 +463,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "flydsl",
     "trtllm",
 ]
 
@@ -1364,7 +1355,7 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
-        if _DSA_FLYDSL_DECODE and _IS_GFX950:
+        if self.dsa_decode_impl == "flydsl" and _IS_GFX950:
             _flydsl_decode_scratch_prealloc(
                 torch.device("cuda", torch.cuda.current_device())
             )
@@ -2215,54 +2206,19 @@ class DeepseekSparseAttnBackend(
                 page_table_1
             ).to(torch.int32)
 
-        if dsa_impl == "tilelang":
-            # Target-verify and draft-extend arrive here with decode-shaped work,
-            # not prefill-shaped: MTP5 gives T = bs * num_draft_tokens (24 at
-            # bs=4), one page-table row per token, topk 2048. That is exactly the
-            # sparse MLA decode contract, and it is the heavy path -- 78 layers a
-            # step against the draft path's one. The prefill gate below cannot
-            # serve it: its T >= 256 floor was measured on prefill shapes and
-            # rejects everything under bs=43, so verify has been falling back to
-            # TileLang. Offer the decode gate first for those modes.
-            #
-            # The q_all concat below is not a cost this branch adds: the TileLang
-            # fallback concatenates the same tensors before calling
-            # _forward_tilelang, so both paths pay it and the difference is the
-            # attention alone.
-            #
-            # Measured against TileLang (width 2048, fp8, device time inside a HIP
-            # graph so launch overhead is amortised), 78 layers against a 19.2 ms
-            # step:
-            #
-            #    T   FlyDSL  TileLang  ratio   78 layers    step
-            #    6    9.53     15.37   0.62x     455 us   +2.37%
-            #   12   12.40     19.17   0.65x     528 us   +2.75%
-            #   18   15.36     22.23   0.69x     536 us   +2.79%
-            #   24   15.77     23.14   0.68x     575 us   +3.00%
-            #   28   18.23     27.97   0.65x     760 us   +3.95%
-            #   32   19.07     24.13   0.79x     395 us   +2.06%
-            #   48   25.47     28.59   0.89x     243 us   +1.27%
-            #   64   31.57     34.77   0.91x     250 us   +1.30%
-            #   96   43.80     42.22   1.04x    -123 us   -0.64%   <- loses
-            #
-            # The ratio worsens at T >= 32 because TileLang gets faster there, not
-            # because this kernel gets slower: TileLang switches tiling at 32 and
-            # its result then depends on batch composition (computing the same
-            # rows whole vs in two halves differs by ~60-65 dB), while
-            # flydsl_sparse_mla_decode is bit-identical either way at every T
-            # tested. Row independence is the correct semantics here -- causality
-            # is carried entirely by the per-token index lists, which both kernels
-            # receive unchanged -- so the earlier reading of that dB gap as this
-            # kernel losing accuracy was backwards; the reference is what moves.
-            # With causal index lists the two agree to 90.0 dB at T=24.
-            #
-            # Cap at 48 rather than the decode gate's own 96: the win is still
-            # +1.3% at 64 but turns negative at 96.
-            # T = bs * num_draft_tokens, so this is a batch-size cap in disguise.
-            if (
+        if dsa_impl in ("tilelang", "flydsl"):
+            # Target-verify and draft-extend arrive with decode-shaped work:
+            # T = bs * num_draft_tokens rows, one page-table row per token,
+            # topk 2048. The prefill gate's T >= 256 floor rejects all of it, so
+            # offer the decode gate first -- it is the heavy path, 78 layers a
+            # step against the draft path's one. The decode gate's own seq <= 96
+            # is the only bound needed. The q_all concat is not a cost this
+            # branch adds: the TileLang fallback concatenates the same tensors
+            # before calling _forward_tilelang.
+            if dsa_impl == "flydsl" and (
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
-            ) and q_nope.shape[0] <= _FLYDSL_VERIFY_MAX_ROWS:
+            ):
                 if q_all is None or not _is_hip:
                     q_all = concat_mla_absorb_q_general(q_nope, q_rope)
                 if _can_use_flydsl_sparse_mla_decode(
@@ -2292,7 +2248,7 @@ class DeepseekSparseAttnBackend(
                         partial_lse=partial_lse,
                     )
             if q_rope is not None:
-                if _can_use_flydsl_sparse_mla_prefill(
+                if dsa_impl == "flydsl" and _can_use_flydsl_sparse_mla_prefill(
                     q_nope, q_rope, kv_cache, page_table_1
                 ):
                     from aiter.ops.flydsl import flydsl_sparse_mla_prefill
@@ -2595,11 +2551,11 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
-        elif self.dsa_decode_impl == "tilelang":
+        elif self.dsa_decode_impl in ("tilelang", "flydsl"):
             # HIP callers may provide q in its already-concatenated layout.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            if _can_use_flydsl_sparse_mla_decode(
+            if self.dsa_decode_impl == "flydsl" and _can_use_flydsl_sparse_mla_decode(
                 q_all,
                 kv_cache,
                 page_table_1,
