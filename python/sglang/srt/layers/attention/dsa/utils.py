@@ -144,20 +144,38 @@ def assert_hadamard_preserved(indexer) -> None:
          maps ``e_0`` to a vector whose entries are all ``128 ** -0.5``, while
          the identity leaves 127 zeros.
     """
-    assert not indexer.use_dsa_indexer_fusion, (
-        "gfx950 fused DSA indexer requires use_dsa_indexer_fusion == False: the "
-        "fused flag makes Indexer._maybe_rotate a no-op, which deletes the "
-        "Hadamard and changes the index-K cache format"
-    )
+    # RuntimeError, not assert: `python -O` strips assert statements, and this
+    # check exists precisely to stop a silent index-K cache format change. A
+    # guard that disappears under an interpreter flag is not a guard.
+    if indexer.use_dsa_indexer_fusion:
+        raise RuntimeError(
+            "gfx950 fused DSA indexer requires use_dsa_indexer_fusion == False: the "
+            "fused flag makes Indexer._maybe_rotate a no-op, which deletes the "
+            "Hadamard and changes the index-K cache format"
+        )
     device = indexer.k_norm.weight.device
     probe = torch.zeros(1, indexer.head_dim, dtype=torch.bfloat16, device=device)
     probe[0, 0] = 1.0
     rotated = indexer._maybe_rotate(probe)
-    assert bool((rotated != 0).all()), (
-        "Indexer._maybe_rotate did not apply the Hadamard rotation "
-        "(e_0 must map to a dense vector); refusing to enable the gfx950 fused "
-        "indexer, which assumes the rotation is present"
-    )
+    # A 128-point Hadamard sends e_0 to a vector whose every entry is 128**-0.5;
+    # the identity leaves 127 zeros. Check the magnitude too, so a transform that
+    # is merely dense does not pass for the rotation the kernels assume.
+    expected = float(indexer.head_dim) ** -0.5
+    if not bool(
+        (rotated != 0).all()
+        and torch.allclose(
+            rotated.float().abs(),
+            torch.full_like(rotated.float(), expected),
+            rtol=0.05,
+            atol=0.0,
+        )
+    ):
+        raise RuntimeError(
+            "Indexer._maybe_rotate did not apply the Hadamard rotation "
+            f"(e_0 must map to a dense vector of magnitude {expected:.6f}); "
+            "refusing to enable the gfx950 fused indexer, which assumes the "
+            "rotation is present"
+        )
 
 
 # Tile size for the indexer FP8 K-cache preshuffle layout. Store and gather

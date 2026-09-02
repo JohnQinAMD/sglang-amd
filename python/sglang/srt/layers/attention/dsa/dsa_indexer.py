@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from functools import lru_cache
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -213,6 +214,39 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _mqa_logits_free_mem_fraction() -> float:
         return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
 
+    @classmethod
+    def invalidate_mqa_logits_budget(cls) -> None:
+        """Drop the cached MQA-logits budget so the next prefill re-reads free memory.
+
+        Named on ``Indexer`` rather than reached through ``type(self)``: the dict
+        lives on this class, and a subclass would otherwise get its own empty
+        copy shadowed onto it while the real cache stayed stale.
+        """
+        Indexer._mqa_logits_budget_bytes.clear()
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _layer_split_pool_cls():
+        """The KV-pool class that splits index-K cache layers across ranks, or None.
+
+        Used to fail CLOSED: a pool of this type owns only some layers, and the
+        fused kernel always stores, so the gate must be able to ask who owns a
+        layer. If this import ever stops resolving the fused path turns itself
+        off rather than writing a cache it may not own.
+        """
+        try:
+            from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                LayerSplitDSATokenToKVPool,
+            )
+
+            return LayerSplitDSATokenToKVPool
+        except ImportError:
+            logger.warning(
+                "gfx950 fused DSA indexer: cannot resolve the layer-split KV pool "
+                "class, so layer ownership cannot be checked; disabling the path"
+            )
+            return None
+
     def __init__(
         self,
         hidden_size: int,
@@ -334,41 +368,37 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # flipping it here would silently delete rotate_activation and change the
         # stored index-K cache format. The gfx950 path keeps the Hadamard inside
         # indexer_qk_had and asserts it below.
+        gfx950_shape_ok = gfx950_model_shape_supported(
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_head_dim,
+            n_heads=self.n_heads,
+            index_topk=self.index_topk,
+            q_lora_rank=self.q_lora_rank,
+            hidden_size=self.hidden_size,
+            quant_block=self.block_size,
+            scale_fmt=self.scale_fmt,
+            is_neox_style=is_neox_style,
+            k_norm=self.k_norm,
+            num_init_tokens=self.num_init_tokens,
+            num_local_tokens=self.num_local_tokens,
+        )
         self.use_gfx950_fused_indexer = (
             gfx950_fused_indexer_runtime_ok()
             and not self.use_dsa_indexer_fusion
-            and gfx950_model_shape_supported(
-                head_dim=self.head_dim,
-                rope_head_dim=self.rope_head_dim,
-                n_heads=self.n_heads,
-                index_topk=self.index_topk,
-                q_lora_rank=self.q_lora_rank,
-                hidden_size=self.hidden_size,
-                quant_block=self.block_size,
-                scale_fmt=self.scale_fmt,
-                is_neox_style=is_neox_style,
-                k_norm=self.k_norm,
-                num_init_tokens=self.num_init_tokens,
-                num_local_tokens=self.num_local_tokens,
-            )
+            and gfx950_shape_ok
         )
         self._gfx950_fused = None
-        if envs.SGLANG_DSA_HIP_FUSED_INDEXER_GFX950.get() and not self.use_gfx950_fused_indexer:
+        if (
+            envs.SGLANG_DSA_HIP_FUSED_INDEXER_GFX950.get()
+            and not self.use_gfx950_fused_indexer
+        ):
             # runtime_ok already logged its own reason; this covers the other two
             # terms, which were the silent ones.
             logger.info(
                 "gfx950 fused DSA indexer not used on this layer: "
                 "dsa_indexer_fusion=%s shape_supported=%s",
                 self.use_dsa_indexer_fusion,
-                gfx950_model_shape_supported(
-                    head_dim=self.head_dim, rope_head_dim=self.rope_head_dim,
-                    n_heads=self.n_heads, index_topk=self.index_topk,
-                    q_lora_rank=self.q_lora_rank, hidden_size=self.hidden_size,
-                    quant_block=self.block_size, scale_fmt=self.scale_fmt,
-                    is_neox_style=is_neox_style, k_norm=self.k_norm,
-                    num_init_tokens=self.num_init_tokens,
-                    num_local_tokens=self.num_local_tokens,
-                ),
+                gfx950_shape_ok,
             )
         if self.use_gfx950_fused_indexer:
             # Executable, not a comment: proves _maybe_rotate still applies the
@@ -376,10 +406,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert_hadamard_preserved(self)
             from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
                 Gfx950FusedIndexer,
+                consume_fresh_allocation,
                 prealloc_workspace,
             )
 
             self._gfx950_fused = Gfx950FusedIndexer(self)
+            # Bound once. This is called once per layer per decode step, and the
+            # import machinery is not free at 79 layers x ~55 steps/s.
+            self._consume_fresh_allocation = consume_fresh_allocation
 
             # Take the workspace here, not on the first sparse decode. This runs
             # while weights load, so calculate_pool_sizes still sees the real
@@ -388,17 +422,28 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # with well under 1 GiB free. Shared across all 79 Indexers, so only
             # the first call allocates.
             #
-            # max_cols is the widest decode page table the model can present:
-            # the page table covers the context, so bound it by context length.
-            # Sizing to the bound rather than to first use also keeps
-            # ensure_workspace from refusing a later, longer context and
-            # silently dropping back to the standard indexer mid-run.
-            max_ctx = getattr(config, "max_position_embeddings", 0) or 0
+            # max_cols is the widest decode page table this workspace will
+            # serve. It must NOT be the model's architectural maximum: the
+            # buffers that scale with it cost ~12 B per column per row, so
+            # GLM-5.2's max_position_embeddings of 1,048,576 takes 606 MiB --
+            # measured, that is 1.13% of the KV pool, which is by itself larger
+            # than most effects we A/B against and confounded our own
+            # measurement of this feature.
+            #
+            # Over the cap the per-call ensure_workspace simply returns False
+            # and that call uses the standard indexer, so the cap trades an
+            # acceleration on very long contexts for pool space that every
+            # request benefits from. Raise it if your deployment actually serves
+            # contexts longer than the default.
+            max_ctx = min(
+                getattr(config, "max_position_embeddings", 0) or 0,
+                envs.SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX.get(),
+            )
             if max_ctx:
                 prealloc_workspace(
                     device=torch.device("cuda", torch.cuda.current_device()),
                     max_cols=max_ctx,
-                    fp8_dtype=torch.float8_e4m3fn,
+                    fp8_dtype=fp8_dtype,
                 )
 
     @contextlib.contextmanager
@@ -527,9 +572,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if pool.page_size != PAGE_SIZE:
             return None
         # DSA cache layer split: the standard path SKIPS the k-cache store for a
-        # layer this rank does not own; the fused kernel always stores.
-        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+        # layer this rank does not own; the fused kernel always stores. Fail
+        # CLOSED -- if the split is on and we cannot ask the pool who owns the
+        # layer (the accessor is private and may be renamed upstream), refuse
+        # rather than write a cache we may not own.
+        split_cls = self._layer_split_pool_cls()
+        if split_cls is None:
             return None
+        if isinstance(pool, split_cls):
+            is_owned = getattr(pool, "_is_layer_owned", None)
+            if not callable(is_owned) or not is_owned(layer_id):
+                return None
 
         rows = x.shape[0]
         if not (1 <= rows <= MAX_ROWS):
@@ -551,6 +604,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             or positions.dtype != torch.int64
             or out_cache_loc.shape[0] < rows
             or positions.shape[0] < rows
+            # A prefix slice of a contiguous 1-D tensor is contiguous, so this
+            # holds in practice; check it instead of calling .contiguous(),
+            # which would allocate -- and allocating during capture bakes a
+            # graph-private pointer into a graph that replays forever.
+            or not out_cache_loc.is_contiguous()
+            or not positions.is_contiguous()
         ):
             return None
 
@@ -561,11 +620,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             fp8_dtype=fp8_dtype,
         ):
             return None
-        from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
-            consume_fresh_allocation,
-        )
-
-        if consume_fresh_allocation():
+        if self._consume_fresh_allocation():
             # The workspace is device memory taken AFTER the MQA-logits budget
             # cached torch.cuda.mem_get_info -- the budget is cached on the first
             # non-capture prefill, the workspace on the first non-capture sparse
@@ -574,7 +629,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # longer exists; on GLM-5.2 that surfaced as an
             # HSA_STATUS_ERROR_OUT_OF_RESOURCES abort mid-run, not a catchable
             # torch OOM. Drop it so the next prefill re-reads the real figure.
-            type(self)._mqa_logits_budget_bytes.clear()
+            Indexer.invalidate_mqa_logits_budget()
 
         # Per request in, per row out: the next_n draft rows of a request share
         # its table. Broadcast into the preallocated buffer -- no allocation is
@@ -600,7 +655,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             x=x,
             q_lora=q_lora,
             positions=positions[:rows],
-            out_cache_loc=out_cache_loc[:rows].contiguous(),
+            out_cache_loc=out_cache_loc[:rows],
             kv_cache=kv_write.view(-1, PAGE_SIZE, 132),
             kv_cache_read=kv_read,
             seqlens_int32=seqlens,

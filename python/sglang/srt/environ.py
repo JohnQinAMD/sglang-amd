@@ -1371,11 +1371,20 @@ class Envs:
     # Opt-in; setting it to 0 is the kill switch. The gate additionally requires
     # gfx950 + aiter preshuffle + fp8 e4m3fn + page_size 64 + index_topk 2048 +
     # head_dim 128 + 32 index heads, and admits decode and target-verify at up to
-    # MAX_ROWS (24 = cuda-graph-max-bs 4 x num_draft_tokens 6) query rows. Every
-    # other shape falls back to the standard path. It does NOT enable
+    # fused_decode.MAX_ROWS query rows (48 = cuda-graph-max-bs 8 x
+    # num_draft_tokens 6; that constant is the authority, not this comment).
+    # Every other shape falls back to the standard path. It does NOT enable
     # use_dsa_indexer_fusion (which is CUDA only and, on this path, would delete
     # the Hadamard - see Indexer._maybe_rotate).
     SGLANG_DSA_HIP_FUSED_INDEXER_GFX950 = EnvBool(False)
+    # Widest context the fused indexer's shared workspace is sized for. The
+    # buffers that scale with it cost ~12 B per column per row (48 rows), so
+    # sizing to GLM-5.2's 1,048,576 max_position_embeddings would take 606 MiB
+    # of device memory away from the KV pool -- measured at 1.13% of the pool.
+    # Requests with a longer context fall back to the standard indexer for that
+    # call; raise this if you actually serve them and would rather spend the
+    # memory.
+    SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX = EnvInt(131072)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
