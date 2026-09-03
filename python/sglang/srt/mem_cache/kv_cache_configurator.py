@@ -2162,11 +2162,18 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
-    # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
-    # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
+    # On HIP, the DSA kernels consume the raw MLA KV layout: nope(512 fp8) +
+    # rope(64 fp8), without extra per-block scales. FlyDSL belongs here for the
+    # same reason TileLang and aiter do -- it reads the raw layout. Leaving it
+    # out sizes the pool in the CUDA scaled layout (512 + 512//128*4 + 64*2 =
+    # 656) and then nothing on this platform can read it: FlyDSL's own shape
+    # gate requires 576 and declines every call, and the TileLang fallback it
+    # declines into raises a static-shape mismatch that Cython swallows, so the
+    # run neither engages FlyDSL nor fails loudly -- it just gets slower per
+    # token and loses 15% of the KV pool to the wider stride.
     if _is_hip and (
-        server_args.dsa_prefill_backend in ("tilelang", "aiter")
-        or server_args.dsa_decode_backend in ("tilelang", "aiter")
+        server_args.dsa_prefill_backend in ("tilelang", "aiter", "flydsl")
+        or server_args.dsa_decode_backend in ("tilelang", "aiter", "flydsl")
     ):
         return kv_cache_dim
 
