@@ -2400,9 +2400,7 @@ class DeepseekSparseAttnBackend(
                         sm_scale=layer.scaling,
                         d_v=layer.v_head_dim,
                     )
-                # HIP callers may provide q in its already-concatenated layout.
-                if q_all is None or not _is_hip:
-                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = self._sparse_q_all(q_all, q_nope, q_rope, kv_cache)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2666,9 +2664,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif self.dsa_decode_impl in ("tilelang", "flydsl"):
-            # HIP callers may provide q in its already-concatenated layout.
-            if q_all is None or not _is_hip:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            q_all = self._sparse_q_all(q_all, q_nope, q_rope, kv_cache)
             if self.dsa_decode_impl == "flydsl":
                 out = self._try_flydsl_sparse_mla_decode(
                     q_all, kv_cache, page_table_1, layer
@@ -3280,6 +3276,34 @@ class DeepseekSparseAttnBackend(
             softmax_scale=layer.scaling,
             causal=causal,
         )
+
+    def _sparse_q_all(self, q_all, q_nope, q_rope, kv_cache) -> torch.Tensor:
+        """The q the sparse-MLA kernels consume.
+
+        On HIP with fp8 KV, concat_and_cast_q_fp8_pad does the concat and the
+        bf16->fp8 cast the kernel would otherwise do at its own entry, in one
+        write. It needs power-of-two head and dim counts (tl.arange bounds).
+        """
+        if (
+            _is_hip
+            and q_rope is not None
+            and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            and q_nope.dtype == q_rope.dtype == torch.bfloat16
+            and not any(
+                v & (v - 1) for v in (q_nope.shape[1], q_nope.shape[2], q_rope.shape[2])
+            )
+        ):
+            tokens, heads, nope = q_nope.shape
+            out = torch.empty(
+                (tokens, heads, nope + q_rope.shape[2]),
+                dtype=kv_cache.dtype,
+                device=q_nope.device,
+            )
+            concat_and_cast_q_fp8_pad(out, q_nope, q_rope, heads)
+            return out
+        if q_all is None or not _is_hip:
+            return concat_mla_absorb_q_general(q_nope, q_rope)
+        return q_all
 
     def _forward_tilelang(
         self,
