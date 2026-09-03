@@ -1,7 +1,7 @@
 """gfx950 (MI355X) fused DSA indexer decode path.
 
 Four raw-HIP kernels replacing the 12-launch ROCm indexer decode chain. Opt-in
-behind ``SGLANG_DSA_HIP_FUSED_INDEXER_GFX950``; see
+behind ``--enable-dsa-fused-indexer``; see
 ``sglang.srt.layers.attention.dsa.utils.gfx950_fused_indexer_runtime_ok``.
 
 Each kernel source under ``csrc/`` ships exactly ONE instantiation: the

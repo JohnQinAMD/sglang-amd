@@ -1376,7 +1376,6 @@ class Envs:
     # Every other shape falls back to the standard path. It does NOT enable
     # use_dsa_indexer_fusion (which is CUDA only and, on this path, would delete
     # the Hadamard - see Indexer._maybe_rotate).
-    SGLANG_DSA_HIP_FUSED_INDEXER_GFX950 = EnvBool(False)
     # Caps the width the fused indexer's shared workspace is sized for. 0 means
     # no cap, which is the default and the only safe one.
     #

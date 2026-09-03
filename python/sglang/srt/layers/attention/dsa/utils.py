@@ -84,8 +84,9 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
         (64 tokens x 132 B, MFMA-16x16 order) and section A writes it.
       * OCP ``float8_e4m3fn``; the kernels never emit fnuz.
 
-    ``SGLANG_DSA_HIP_FUSED_INDEXER_GFX950=0`` is the kill switch and is checked
-    first, so a bad build can always be turned off without a code change.
+    ``--enable-dsa-fused-indexer`` is tri-state and is checked first. Left unset
+    it means "wherever supported", so the terms below decide; ``False`` is the
+    kill switch, so a bad build can always be turned off without a code change.
     """
     from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
     from sglang.srt.utils import is_gfx95_supported
@@ -97,8 +98,10 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
         logger.info("gfx950 fused DSA indexer disabled: %s", reason)
         return False
 
-    if not envs.SGLANG_DSA_HIP_FUSED_INDEXER_GFX950.get():
-        return False  # off by default; not worth a line on every server
+    from sglang.srt.server_args import get_global_server_args
+
+    if get_global_server_args().enable_dsa_fused_indexer is False:
+        return False  # asked for the standard path; not worth a line per server
     if not (is_hip() and is_gfx95_supported()):
         return _no("not a gfx95 HIP device")
     if not get_bool_env_var("SGLANG_USE_AITER"):

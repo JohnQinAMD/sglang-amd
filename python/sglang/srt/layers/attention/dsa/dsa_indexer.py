@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -389,7 +390,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         self._gfx950_fused = None
         if (
-            envs.SGLANG_DSA_HIP_FUSED_INDEXER_GFX950.get()
+            # Only when it was asked for by name. Left unset the path is a
+            # default, and a machine that cannot run it should not say so once
+            # per layer.
+            get_global_server_args().enable_dsa_fused_indexer is True
             and not self.use_gfx950_fused_indexer
         ):
             # runtime_ok already logged its own reason; this covers the other two
@@ -423,18 +427,34 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # the first call allocates.
             #
             # max_cols must cover the widest page table the decode CUDA graph
-            # can present, and that is the model context -- not the contexts
-            # actually in flight. Sizing it smaller does NOT degrade gracefully:
-            # every call asks ensure_workspace for page_table.shape[1] * 64
-            # columns, so a smaller workspace refuses every call and the feature
-            # stops running while the startup log still says "enabled".
-            # Measured: capping this at 131072 on GLM-5.2 produced zero fused
-            # kernel launches across an entire 1800 s run.
+            # can present. That is NOT max_position_embeddings: the graph's
+            # table matches req_to_token, which kv_cache_configurator allocates
+            # at context_len + 4 + speculative_num_draft_tokens because spec
+            # decoding lets seq_len transiently overshoot, and the compact
+            # page_size=64 table rounds that up to whole pages.
             #
-            # The cap is therefore opt-in (0 = none) and only meaningful for a
-            # deployment that also bounds --context-length so the graph's table
-            # is narrower. It buys 606 MiB of KV pool on GLM-5.2 if you can.
+            # Getting this short does not degrade gracefully -- every call asks
+            # for the full graph width, so the workspace refuses every call and
+            # the feature stops running while the startup log still says
+            # "enabled". Measured twice: sizing from max_position_embeddings
+            # left it 128 columns short (1048576 vs 1048704 needed) and produced
+            # zero fused kernel launches, and a 131072 cap did the same more
+            # dramatically. _PAGE_SLACK covers the rounding without another
+            # round of arithmetic archaeology; ensure_workspace logs loudly if
+            # it is ever still short.
+            _PAGE_SLACK = 4  # pages of headroom over the derived width
             max_ctx = getattr(config, "max_position_embeddings", 0) or 0
+            extra = 4
+            try:
+                from sglang.srt.runtime_context import get_spec
+
+                if get_spec().speculative_num_draft_tokens is not None:
+                    extra += int(get_spec().speculative_num_draft_tokens)
+            except Exception:  # spec config not available: the +4 still applies
+                pass
+            if max_ctx:
+                pages = -(-(max_ctx + extra) // 64) + _PAGE_SLACK
+                max_ctx = pages * 64
             cap = envs.SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX.get()
             if cap:
                 max_ctx = min(max_ctx, cap)
