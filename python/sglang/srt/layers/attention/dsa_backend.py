@@ -132,7 +132,11 @@ def _can_use_flydsl_sparse_mla_prefill(
         and q_nope.shape[0] >= 256
         and q_nope.shape[1:] == (16, 512)
         and q_rope.shape == (q_nope.shape[0], 16, 64)
-        and _are_flydsl_fp8_inputs(q_nope, q_rope, require_contiguous=False)
+        # Same reason as the decode gate: production hands bf16 q here, and the
+        # caller casts. Demanding fp8 made this branch unreachable in a server.
+        and q_nope.dtype == q_rope.dtype
+        and q_nope.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and q_nope.device == q_rope.device == kv_cache.device
         and _is_flydsl_prefill_q_layout(q_nope)
         and _is_flydsl_prefill_q_layout(q_rope)
         and _are_flydsl_fp8_inputs(kv_cache)
@@ -241,6 +245,79 @@ def _flydsl_decode_scratch(
     )
 
 
+# A backend that declines silently is indistinguishable from one that is not
+# selected. That cost 27 hours once: a pool sized 656 instead of 576 made
+# _is_flydsl_kv_shape decline every call, the TileLang fallback swallowed its
+# own shape mismatch, and a 3600 s round produced a plausible number with the
+# FlyDSL kernels never entered. Say so, once per process per site.
+_flydsl_said: set = set()
+
+
+def _flydsl_note(site: str, engaged: bool, reason: str = "") -> None:
+    key = (site, engaged, reason)
+    if key in _flydsl_said:
+        return
+    _flydsl_said.add(key)
+    if engaged:
+        logger.info("FlyDSL sparse MLA %s engaged", site)
+    else:
+        logger.info("FlyDSL sparse MLA %s declined: %s", site, reason)
+
+
+def _flydsl_decode_decline_reason(
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    head_dim: int,
+    v_head_dim: int,
+) -> str:
+    """Name the first condition that fails, not the fact that one did.
+
+    A gate that says only "outside the gate" is barely better than one that
+    says nothing: it still takes a code read and a rerun to learn which of
+    thirteen conditions was the one. Each clause here mirrors one clause of
+    _can_use_flydsl_sparse_mla_decode, in the same order.
+    """
+    if not _IS_GFX950:
+        return "not gfx950"
+    if q_all.ndim != 3:
+        return f"q ndim {q_all.ndim}, need 3"
+    if page_table.ndim != 2:
+        return f"page_table ndim {page_table.ndim}, need 2"
+    if (head_dim, v_head_dim) != (576, 512):
+        return f"layer dims {(head_dim, v_head_dim)}, need (576, 512)"
+    seq = q_all.shape[0]
+    if not 1 <= seq <= 96:
+        return f"seq {seq}, need 1..96"
+    if tuple(q_all.shape[1:]) != (16, 576):
+        return f"q shape {tuple(q_all.shape)}, need (seq, 16, 576)"
+    if q_all.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        return f"q dtype {q_all.dtype}, need bfloat16 or float8_e4m3fn"
+    if not q_all.is_contiguous():
+        return "q not contiguous"
+    if kv_cache.dtype != torch.float8_e4m3fn:
+        return f"kv dtype {kv_cache.dtype}, need float8_e4m3fn"
+    if not kv_cache.is_contiguous():
+        return "kv not contiguous"
+    if not _is_flydsl_kv_shape(kv_cache):
+        return (
+            f"kv layout {tuple(kv_cache.shape[1:])}, need (1, 576) -- the pool is "
+            "sized for the CUDA scaled layout, see calculate_mla_kv_cache_dim"
+        )
+    if page_table.dtype != torch.int32:
+        return f"page_table dtype {page_table.dtype}, need int32"
+    if page_table.shape[0] != seq:
+        return f"page_table rows {page_table.shape[0]}, need seq {seq}"
+    width = page_table.shape[1]
+    if not (64 <= width <= 2112 and width % 64 == 0):
+        return f"topk width {width}, need a multiple of 64 in 64..2112"
+    if not page_table.is_contiguous():
+        return "page_table not contiguous"
+    if page_table.device != q_all.device:
+        return f"page_table on {page_table.device}, q on {q_all.device}"
+    return "no clause failed -- the gate and this explainer disagree"
+
+
 def _can_use_flydsl_sparse_mla_decode(
     q_all: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -260,7 +337,15 @@ def _can_use_flydsl_sparse_mla_decode(
         # kernel contract is validated for the continuous production range.
         and 1 <= seq <= 96
         and q_all.shape[1:] == (16, 576)
-        and _are_flydsl_fp8_inputs(q_all, kv_cache)
+        # q arrives bf16 from the MLA absorb bmm; the fp8 MFMA needs both
+        # operands in the KV's format, so the caller casts it exactly as
+        # tilelang_sparse_fwd does. Requiring fp8 here instead made the gate
+        # decline every production call while the unit tests, which build fp8
+        # tensors directly, all passed.
+        and q_all.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and q_all.is_contiguous()
+        and q_all.device == kv_cache.device
+        and _are_flydsl_fp8_inputs(kv_cache)
         and _is_flydsl_kv_shape(kv_cache)
         and page_table.dtype == torch.int32
         and page_table.shape[0] == seq
@@ -2080,7 +2165,21 @@ class DeepseekSparseAttnBackend(
             head_dim=layer.head_dim,
             v_head_dim=layer.v_head_dim,
         ):
+            _flydsl_note(
+                "decode",
+                False,
+                _flydsl_decode_decline_reason(
+                    q_all, kv_cache, page_table_1, layer.head_dim, layer.v_head_dim
+                ),
+            )
             return None
+
+        _flydsl_note("decode", True)
+        # Same cast tilelang_sparse_fwd performs at its own entry, so neither
+        # backend is handed a cheaper q than the other. Plain .to(): neither
+        # kernel takes a q scale, both rely on q's range fitting e4m3.
+        if q_all.dtype != kv_cache.dtype:
+            q_all = q_all.to(kv_cache.dtype)
 
         from aiter.ops.flydsl import flydsl_sparse_mla_decode
 
@@ -2262,8 +2361,12 @@ class DeepseekSparseAttnBackend(
                 if dsa_impl == "flydsl" and _can_use_flydsl_sparse_mla_prefill(
                     q_nope, q_rope, kv_cache, page_table_1
                 ):
+                    _flydsl_note("prefill", True)
                     from aiter.ops.flydsl import flydsl_sparse_mla_prefill
 
+                    if q_nope.dtype != kv_cache.dtype:
+                        q_nope = q_nope.to(kv_cache.dtype)
+                        q_rope = q_rope.to(kv_cache.dtype)
                     return flydsl_sparse_mla_prefill(
                         q_nope=q_nope,
                         q_rope=q_rope,
