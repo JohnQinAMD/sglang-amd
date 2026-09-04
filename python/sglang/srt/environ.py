@@ -1365,6 +1365,33 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # gfx950 (MI355X) only: run the DSA indexer decode step as four fused raw-HIP
+    # kernels (dual GEMV | rope+Hadamard+quant+cache | paged-MQA logits+histogram
+    # | top-k+page transform) instead of the 12-launch aiter/torch chain.
+    # Opt-in; setting it to 0 is the kill switch. The gate additionally requires
+    # gfx950 + aiter preshuffle + fp8 e4m3fn + page_size 64 + index_topk 2048 +
+    # head_dim 128 + 32 index heads, and admits decode and target-verify at up to
+    # fused_decode.MAX_ROWS query rows (48 = cuda-graph-max-bs 8 x
+    # num_draft_tokens 6; that constant is the authority, not this comment).
+    # Every other shape falls back to the standard path. It does NOT enable
+    # use_dsa_indexer_fusion (which is CUDA only and, on this path, would delete
+    # the Hadamard - see Indexer._maybe_rotate).
+    # Caps the width the fused indexer's shared workspace is sized for. 0 means
+    # no cap, which is the default and the only safe one.
+    #
+    # This is NOT a knob for trading memory against long contexts, which is what
+    # it looks like. Every decode call asks the workspace for
+    # page_table_64.shape[1] * 64 columns, and the decode CUDA graph sizes that
+    # table to the model's context length regardless of the contexts actually in
+    # flight -- 1,048,576 columns on GLM-5.2. So any cap below
+    # max_position_embeddings makes ensure_workspace refuse on EVERY call and
+    # turns the whole feature off. Measured: a 131072 cap produced zero fused
+    # kernel launches in a 1800 s run while the log still said "enabled".
+    #
+    # Setting it below the model context is only meaningful if the deployment
+    # also bounds --context-length, so the graph's page table is narrower. The
+    # refusal is logged once either way.
+    SGLANG_DSA_HIP_FUSED_INDEXER_MAX_CTX = EnvInt(0)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
