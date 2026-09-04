@@ -189,5 +189,45 @@ class TestBackendTakesTheEightHeadPath(CustomTestCase):
         self.assertGreater(_snr_db(mine, theirs), 30.0)
 
 
+@unittest.skipUnless(_flydsl_ready(), "needs gfx950 with FlyDSL installed")
+class TestPrefillPadsToo(CustomTestCase):
+    @staticmethod
+    def _split(T, heads, seed):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        mk = lambda *s: (torch.randn(s, device="cuda", generator=g) * 0.25).clamp_(
+            -2.0, 2.0
+        )
+        qn = mk(T, heads, DV).to(torch.float8_e4m3fn).contiguous()
+        qr = mk(T, heads, ROPE).to(torch.float8_e4m3fn).contiguous()
+        kv = mk(CTX, DIM).to(torch.float8_e4m3fn).contiguous()
+        idx = torch.empty((T, WIDTH), dtype=torch.int32, device="cuda")
+        b = torch.arange(WIDTH, dtype=torch.int32, device="cuda")
+        for r in range(T):
+            idx[r] = (b + r * 337) % CTX
+        return qn, qr, kv, idx.contiguous()
+
+    def test_gate_takes_eight_heads(self):
+        qn, qr, kv, idx = self._split(512, 8, 600)
+        self.assertTrue(
+            dsa_backend._can_use_flydsl_sparse_mla_prefill(qn, qr, kv.unsqueeze(1), idx)
+        )
+
+    def test_padded_half_does_not_change_the_first_eight(self):
+        from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+        qn, qr, kv, idx = self._split(512, 8, 601)
+        scale = 1.0 / math.sqrt(DIM)
+
+        def run(fill):
+            pn = torch.full((512, 16, DV), fill, device="cuda").to(torch.float8_e4m3fn)
+            pr = torch.full((512, 16, ROPE), fill, device="cuda").to(
+                torch.float8_e4m3fn
+            )
+            pn[:, :8], pr[:, :8] = qn, qr
+            return flydsl_sparse_mla_prefill(pn, pr, kv, idx, scale)[:, :8]
+
+        torch.testing.assert_close(run(0.0), run(6.0), rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,7 @@ import torch
 
 from sglang.srt.layers.attention import dsa_backend as B
 
-H, DV = B._FLYDSL_DECODE_H, B._FLYDSL_DECODE_DV
+H, DV = B._FLYDSL_H, B._FLYDSL_DECODE_DV
 
 
 class TestFlydslDecodeScratch(unittest.TestCase):

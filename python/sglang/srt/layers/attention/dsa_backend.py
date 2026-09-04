@@ -130,8 +130,10 @@ def _can_use_flydsl_sparse_mla_prefill(
         # T=256 runs and is 0.59x of TileLang, so the useful range starts below
         # the original 512 floor; measured 0.49x-0.63x from 512 to 8192.
         and q_nope.shape[0] >= 256
-        and q_nope.shape[1:] == (16, 512)
-        and q_rope.shape == (q_nope.shape[0], 16, 64)
+        # 8 heads (TP=8 on a 64-head model) is padded to 16 at the call.
+        and q_nope.shape[1] in (8, 16)
+        and q_nope.shape[2] == 512
+        and q_rope.shape == (q_nope.shape[0], q_nope.shape[1], 64)
         # Same reason as the decode gate: production hands bf16 q here, and the
         # caller casts. Demanding fp8 made this branch unreachable in a server.
         and q_nope.dtype == q_rope.dtype
@@ -161,11 +163,18 @@ def _can_use_flydsl_sparse_mla_prefill(
 # aiter requires them contiguous with the exact shapes [seq,ng,H,DV] and
 # [seq,ng,H], which a 2-D slice of a max-sized tensor is not. Keep one flat
 # 1-D buffer and view a prefix of it instead.
-_FLYDSL_DECODE_H = 16
+_FLYDSL_H = 16  # both sparse MLA kernels fix H at 16
 _FLYDSL_DECODE_DV = 512
 _FLYDSL_DECODE_MAX_SEQ = 96  # the dispatch gate's upper bound
 _FLYDSL_DECODE_MAX_NG = 33  # width <= 2112 over a 64-token page
 _FLYDSL_DECODE_SCRATCH: Dict[torch.device, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _pad_heads(q: torch.Tensor, heads: int) -> torch.Tensor:
+    """q at 16 heads, the kernel's fixed H, with the upper half zeroed."""
+    out = q.new_zeros((q.shape[0], _FLYDSL_H, q.shape[2]))
+    out[:, :heads] = q
+    return out
 
 
 def _flydsl_decode_scratch_prealloc(device: torch.device) -> None:
@@ -220,8 +229,8 @@ def _flydsl_decode_scratch(
     bitten by once.
     """
     ng = _flydsl_partial_groups(seq, width)
-    n_out = seq * ng * _FLYDSL_DECODE_H * _FLYDSL_DECODE_DV
-    n_lse = seq * ng * _FLYDSL_DECODE_H
+    n_out = seq * ng * _FLYDSL_H * _FLYDSL_DECODE_DV
+    n_lse = seq * ng * _FLYDSL_H
     buf = _FLYDSL_DECODE_SCRATCH.get(device)
     if buf is None:
         if torch.cuda.is_current_stream_capturing():
@@ -229,7 +238,7 @@ def _flydsl_decode_scratch(
         cap = (
             _FLYDSL_DECODE_MAX_SEQ
             * _FLYDSL_DECODE_MAX_NG
-            * _FLYDSL_DECODE_H
+            * _FLYDSL_H
             * _FLYDSL_DECODE_DV
         )
         buf = (
@@ -240,8 +249,8 @@ def _flydsl_decode_scratch(
     if n_out > buf[0].numel() or n_lse > buf[1].numel():
         return None, None
     return (
-        buf[0][:n_out].view(seq, ng, _FLYDSL_DECODE_H, _FLYDSL_DECODE_DV),
-        buf[1][:n_lse].view(seq, ng, _FLYDSL_DECODE_H),
+        buf[0][:n_out].view(seq, ng, _FLYDSL_H, _FLYDSL_DECODE_DV),
+        buf[1][:n_lse].view(seq, ng, _FLYDSL_H),
     )
 
 
@@ -2187,14 +2196,10 @@ class DeepseekSparseAttnBackend(
         # H is fixed at 16: heads sit on the lane index and on the MFMA's M
         # axis, so 8 heads run as 16 with the upper half zeroed and dropped.
         seq, heads = q_all.shape[:2]
-        if heads != _FLYDSL_DECODE_H:
-            q_in = q_all.new_zeros((seq, _FLYDSL_DECODE_H, q_all.shape[2]))
-            q_in[:, :heads] = q_all
-        else:
-            q_in = q_all
+        q_in = q_all if heads == _FLYDSL_H else _pad_heads(q_all, heads)
 
         out = torch.empty(
-            (seq, _FLYDSL_DECODE_H, layer.v_head_dim),
+            (seq, _FLYDSL_H, layer.v_head_dim),
             dtype=torch.bfloat16,
             device=q_all.device,
         )
@@ -2210,7 +2215,7 @@ class DeepseekSparseAttnBackend(
             partial_output=partial_output,
             partial_lse=partial_lse,
         )
-        return out if heads == _FLYDSL_DECODE_H else out[:, :heads].contiguous()
+        return out if heads == _FLYDSL_H else out[:, :heads].contiguous()
 
     def forward_extend(
         self,
@@ -2378,13 +2383,22 @@ class DeepseekSparseAttnBackend(
                     if q_nope.dtype != kv_cache.dtype:
                         q_nope = q_nope.to(kv_cache.dtype)
                         q_rope = q_rope.to(kv_cache.dtype)
-                    return flydsl_sparse_mla_prefill(
+                    # Same 16-head padding as decode. It costs about twice the
+                    # q and output buffers -- +543 MB at 32k tokens -- and the
+                    # heads share one KV stream, so it still runs in a third
+                    # to a half of TileLang's time.
+                    heads = q_nope.shape[1]
+                    if heads != _FLYDSL_H:
+                        q_nope = _pad_heads(q_nope, heads)
+                        q_rope = _pad_heads(q_rope, heads)
+                    out = flydsl_sparse_mla_prefill(
                         q_nope=q_nope,
                         q_rope=q_rope,
                         kv=kv_cache,
                         indices=page_table_1,
                         softmax_scale=layer.scaling,
                     )
+                    return out if heads == _FLYDSL_H else out[:, :heads].contiguous()
                 # Triton prefill kernel reads q_nope/q_rope directly, skipping
                 # the concat (it splits q into main/tail internally anyway).
                 # Gated to gfx950 + the validated shape (16 heads, d_v=512,
