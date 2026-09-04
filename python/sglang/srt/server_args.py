@@ -354,6 +354,7 @@ DSA_CHOICES = [
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "flydsl",
     "aiter",
     "trtllm",
 ]

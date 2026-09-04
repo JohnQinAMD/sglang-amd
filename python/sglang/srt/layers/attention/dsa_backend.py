@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -79,12 +80,281 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 
-# Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
-# per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
-# TP4: 16 heads, d_v=512, tail=64). Reads q_nope/q_rope directly (skips the
-# concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
+# Separate opt-in for the Triton per-query flash kernel.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
+_IS_GFX950 = _IS_GFX95 and (
+    torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0] == "gfx950"
+)
+
+
+def _are_flydsl_fp8_inputs(
+    *tensors: torch.Tensor, require_contiguous: bool = True
+) -> bool:
+    device = tensors[0].device
+    return device.type == "cuda" and all(
+        tensor.dtype == torch.float8_e4m3fn
+        and (not require_contiguous or tensor.is_contiguous())
+        and tensor.device == device
+        for tensor in tensors
+    )
+
+
+def _is_flydsl_prefill_q_layout(tensor: torch.Tensor) -> bool:
+    # AITER reads vector4 FP8 values using explicit token/head strides. This
+    # admits production's 512/64 views of contiguous [T,16,576] storage without
+    # an HBM copy, while retaining the alignment required by the vector loads.
+    return (
+        tensor.stride(2) == 1
+        and tensor.stride(0) % 4 == 0
+        and tensor.stride(1) % 4 == 0
+    )
+
+
+def _is_flydsl_kv_shape(kv_cache: torch.Tensor) -> bool:
+    return (kv_cache.ndim == 2 and kv_cache.shape[1] == 576) or (
+        kv_cache.ndim == 3 and kv_cache.shape[1:] == (1, 576)
+    )
+
+
+def _can_use_flydsl_sparse_mla_prefill(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+) -> bool:
+    return (
+        _IS_GFX950
+        and q_nope.ndim == 3
+        and q_rope.ndim == 3
+        # T=256 runs and is 0.59x of TileLang, so the useful range starts below
+        # the original 512 floor; measured 0.49x-0.63x from 512 to 8192.
+        and q_nope.shape[0] >= 256
+        and q_nope.shape[1:] == (16, 512)
+        and q_rope.shape == (q_nope.shape[0], 16, 64)
+        # Same reason as the decode gate: production hands bf16 q here, and the
+        # caller casts. Demanding fp8 made this branch unreachable in a server.
+        and q_nope.dtype == q_rope.dtype
+        and q_nope.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and q_nope.device == q_rope.device == kv_cache.device
+        and _is_flydsl_prefill_q_layout(q_nope)
+        and _is_flydsl_prefill_q_layout(q_rope)
+        and _are_flydsl_fp8_inputs(kv_cache)
+        and _is_flydsl_kv_shape(kv_cache)
+        and page_table.dtype == torch.int32
+        and page_table.shape == (q_nope.shape[0], 2048)
+        and page_table.is_contiguous()
+        and page_table.device == q_nope.device
+    )
+
+
+# FlyDSL sparse MLA decode scratch, one flat buffer per device.
+#
+# aiter allocates partial_output/partial_lse itself when they are not supplied,
+# so leaving them out costs one pair of allocations per layer per step -- 79
+# layers on GLM-5.2 -- and its docstring asks for persistent buffers precisely
+# when the call is captured in a HIP graph, which this one is. The buffers are
+# scratch: the layers run back to back on the current stream and the kernel
+# consumes the partials before the next layer overwrites them, so one buffer
+# serves every layer and every backend instance on a device.
+#
+# aiter requires them contiguous with the exact shapes [seq,ng,H,DV] and
+# [seq,ng,H], which a 2-D slice of a max-sized tensor is not. Keep one flat
+# 1-D buffer and view a prefix of it instead.
+_FLYDSL_DECODE_H = 16
+_FLYDSL_DECODE_DV = 512
+_FLYDSL_DECODE_MAX_SEQ = 96  # the dispatch gate's upper bound
+_FLYDSL_DECODE_MAX_NG = 33  # width <= 2112 over a 64-token page
+_FLYDSL_DECODE_SCRATCH: Dict[torch.device, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _flydsl_decode_scratch_prealloc(device: torch.device) -> None:
+    """Create the scratch before any graph capture starts.
+
+    _flydsl_decode_scratch refuses to allocate under capture, so if the very
+    first FlyDSL decode of the process happens inside a capture the buffer is
+    never created and every call falls back to aiter allocating per call --
+    exactly what the buffer exists to avoid. init_cuda_graph_state runs before
+    capture, so allocate from there.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return
+    _flydsl_decode_scratch(1, 64, device)
+
+
+@lru_cache(maxsize=None)
+def _flydsl_partial_groups(seq: int, width: int) -> int:
+    """How many partial groups aiter wants for this shape.
+
+    Not ``width // 64``. aiter merges adjacent 64-key tiles whenever the reduced
+    producer grid still fills the GPU (``_pick_inner_iter``), so at width 2048 a
+    verify batch of 24 rows wants 16 groups and 96 rows want 8. Passing the
+    unmerged count makes ``flydsl_sparse_mla_decode`` reject the workspace with a
+    shape error, which is an uncaught exception inside attention.
+
+    Older aiter has no helper and always uses one tile per group; fall back to
+    that so this works against both.
+    """
+    try:
+        from aiter.ops.flydsl import sparse_mla_decode_workspace_shape
+    except ImportError:
+        return width // 64
+    try:
+        return sparse_mla_decode_workspace_shape(seq, width)[0][1]
+    except ValueError:
+        # Out of aiter's supported range. Deciding that is the caller's job --
+        # _flydsl_decode_scratch turns an oversized shape into (None, None) and
+        # the standard path runs -- so answer with the ungrouped count and let
+        # the capacity check reject it, rather than raising out of a gate.
+        return width // 64
+
+
+def _flydsl_decode_scratch(
+    seq: int, width: int, device: torch.device
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Persistent partials for one decode call, or (None, None) to let aiter allocate.
+
+    Returns (None, None) rather than allocating under graph capture: a buffer
+    created inside a capture lives in that graph's private pool, and reusing it
+    from another graph is the stale-mapping hazard this backend has already been
+    bitten by once.
+    """
+    ng = _flydsl_partial_groups(seq, width)
+    n_out = seq * ng * _FLYDSL_DECODE_H * _FLYDSL_DECODE_DV
+    n_lse = seq * ng * _FLYDSL_DECODE_H
+    buf = _FLYDSL_DECODE_SCRATCH.get(device)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None, None
+        cap = (
+            _FLYDSL_DECODE_MAX_SEQ
+            * _FLYDSL_DECODE_MAX_NG
+            * _FLYDSL_DECODE_H
+            * _FLYDSL_DECODE_DV
+        )
+        buf = (
+            torch.empty(cap, dtype=torch.bfloat16, device=device),
+            torch.empty(cap // _FLYDSL_DECODE_DV, dtype=torch.float32, device=device),
+        )
+        _FLYDSL_DECODE_SCRATCH[device] = buf
+    if n_out > buf[0].numel() or n_lse > buf[1].numel():
+        return None, None
+    return (
+        buf[0][:n_out].view(seq, ng, _FLYDSL_DECODE_H, _FLYDSL_DECODE_DV),
+        buf[1][:n_lse].view(seq, ng, _FLYDSL_DECODE_H),
+    )
+
+
+# A backend that declines silently is indistinguishable from one that is not
+# selected. That cost 27 hours once: a pool sized 656 instead of 576 made
+# _is_flydsl_kv_shape decline every call, the TileLang fallback swallowed its
+# own shape mismatch, and a 3600 s round produced a plausible number with the
+# FlyDSL kernels never entered. Say so, once per process per site.
+_flydsl_said: set = set()
+
+
+def _flydsl_note(site: str, engaged: bool, reason: str = "") -> None:
+    key = (site, engaged, reason)
+    if key in _flydsl_said:
+        return
+    _flydsl_said.add(key)
+    if engaged:
+        logger.info("FlyDSL sparse MLA %s engaged", site)
+    else:
+        logger.info("FlyDSL sparse MLA %s declined: %s", site, reason)
+
+
+def _flydsl_decode_decline_reason(
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    head_dim: int,
+    v_head_dim: int,
+) -> str:
+    """Name the first condition that fails, not the fact that one did.
+
+    A gate that says only "outside the gate" is barely better than one that
+    says nothing: it still takes a code read and a rerun to learn which of
+    thirteen conditions was the one. Each clause here mirrors one clause of
+    _can_use_flydsl_sparse_mla_decode, in the same order.
+    """
+    if not _IS_GFX950:
+        return "not gfx950"
+    if q_all.ndim != 3:
+        return f"q ndim {q_all.ndim}, need 3"
+    if page_table.ndim != 2:
+        return f"page_table ndim {page_table.ndim}, need 2"
+    if (head_dim, v_head_dim) != (576, 512):
+        return f"layer dims {(head_dim, v_head_dim)}, need (576, 512)"
+    seq = q_all.shape[0]
+    if not 1 <= seq <= 96:
+        return f"seq {seq}, need 1..96"
+    if tuple(q_all.shape[1:]) != (16, 576):
+        return f"q shape {tuple(q_all.shape)}, need (seq, 16, 576)"
+    if q_all.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        return f"q dtype {q_all.dtype}, need bfloat16 or float8_e4m3fn"
+    if not q_all.is_contiguous():
+        return "q not contiguous"
+    if kv_cache.dtype != torch.float8_e4m3fn:
+        return f"kv dtype {kv_cache.dtype}, need float8_e4m3fn"
+    if not kv_cache.is_contiguous():
+        return "kv not contiguous"
+    if not _is_flydsl_kv_shape(kv_cache):
+        return (
+            f"kv layout {tuple(kv_cache.shape[1:])}, need (1, 576) -- the pool is "
+            "sized for the CUDA scaled layout, see calculate_mla_kv_cache_dim"
+        )
+    if page_table.dtype != torch.int32:
+        return f"page_table dtype {page_table.dtype}, need int32"
+    if page_table.shape[0] != seq:
+        return f"page_table rows {page_table.shape[0]}, need seq {seq}"
+    width = page_table.shape[1]
+    if not (64 <= width <= 2112 and width % 64 == 0):
+        return f"topk width {width}, need a multiple of 64 in 64..2112"
+    if not page_table.is_contiguous():
+        return "page_table not contiguous"
+    if page_table.device != q_all.device:
+        return f"page_table on {page_table.device}, q on {q_all.device}"
+    return "no clause failed -- the gate and this explainer disagree"
+
+
+def _can_use_flydsl_sparse_mla_decode(
+    q_all: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    *,
+    head_dim: int,
+    v_head_dim: int,
+) -> bool:
+    seq = q_all.shape[0] if q_all.ndim == 3 else 0
+    width = page_table.shape[1] if page_table.ndim == 2 else 0
+    return (
+        _IS_GFX950
+        and q_all.ndim == 3
+        and page_table.ndim == 2
+        and (head_dim, v_head_dim) == (576, 512)
+        # gfx950 sparse MLA decode uses a runtime seq dimension; the AITER
+        # kernel contract is validated for the continuous production range.
+        and 1 <= seq <= 96
+        and q_all.shape[1:] == (16, 576)
+        # q arrives bf16 from the MLA absorb bmm; the fp8 MFMA needs both
+        # operands in the KV's format, so the caller casts it exactly as
+        # tilelang_sparse_fwd does. Requiring fp8 here instead made the gate
+        # decline every production call while the unit tests, which build fp8
+        # tensors directly, all passed.
+        and q_all.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and q_all.is_contiguous()
+        and q_all.device == kv_cache.device
+        and _are_flydsl_fp8_inputs(kv_cache)
+        and _is_flydsl_kv_shape(kv_cache)
+        and page_table.dtype == torch.int32
+        and page_table.shape[0] == seq
+        and 64 <= width <= 2112
+        and width % 64 == 0
+        and page_table.is_contiguous()
+        and page_table.device == q_all.device
+    )
+
 
 if is_cuda():
     import deep_gemm
@@ -278,6 +548,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "flydsl",
     "trtllm",
 ]
 
@@ -1169,6 +1440,10 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        if self.dsa_decode_impl == "flydsl" and _IS_GFX950:
+            _flydsl_decode_scratch_prealloc(
+                torch.device("cuda", torch.cuda.current_device())
+            )
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
@@ -1876,6 +2151,56 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    @staticmethod
+    def _try_flydsl_sparse_mla_decode(
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+    ) -> Optional[torch.Tensor]:
+        if not _can_use_flydsl_sparse_mla_decode(
+            q_all,
+            kv_cache,
+            page_table_1,
+            head_dim=layer.head_dim,
+            v_head_dim=layer.v_head_dim,
+        ):
+            _flydsl_note(
+                "decode",
+                False,
+                _flydsl_decode_decline_reason(
+                    q_all, kv_cache, page_table_1, layer.head_dim, layer.v_head_dim
+                ),
+            )
+            return None
+
+        _flydsl_note("decode", True)
+        # Same cast tilelang_sparse_fwd performs at its own entry, so neither
+        # backend is handed a cheaper q than the other. Plain .to(): neither
+        # kernel takes a q scale, both rely on q's range fitting e4m3.
+        if q_all.dtype != kv_cache.dtype:
+            q_all = q_all.to(kv_cache.dtype)
+
+        from aiter.ops.flydsl import flydsl_sparse_mla_decode
+
+        out = torch.empty(
+            (q_all.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+            dtype=torch.bfloat16,
+            device=q_all.device,
+        )
+        partial_output, partial_lse = _flydsl_decode_scratch(
+            q_all.shape[0], page_table_1.shape[1], q_all.device
+        )
+        return flydsl_sparse_mla_decode(
+            q=q_all,
+            kv=kv_cache,
+            indices=page_table_1,
+            out=out,
+            sm_scale=layer.scaling,
+            partial_output=partial_output,
+            partial_lse=partial_lse,
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1897,13 +2222,12 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
+        is_speculative_decode = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
         dsa_impl = (
-            self.dsa_decode_impl
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            )
-            else self.dsa_prefill_impl
+            self.dsa_decode_impl if is_speculative_decode else self.dsa_prefill_impl
         )
 
         if dsa_impl == "trtllm" and not self.use_mha:
@@ -2016,8 +2340,40 @@ class DeepseekSparseAttnBackend(
                 page_table_1
             ).to(torch.int32)
 
-        if dsa_impl == "tilelang":
+        if dsa_impl in ("tilelang", "flydsl"):
+            # Target-verify and draft-extend arrive with decode-shaped work:
+            # T = bs * num_draft_tokens rows, one page-table row per token,
+            # topk 2048. The prefill gate's T >= 256 floor rejects all of it, so
+            # offer the decode gate first -- it is the heavy path, 78 layers a
+            # step against the draft path's one. The decode gate's own seq <= 96
+            # is the only bound needed. The q_all concat is not a cost this
+            # branch adds: the TileLang fallback concatenates the same tensors
+            # before calling _forward_tilelang.
+            if dsa_impl == "flydsl" and is_speculative_decode:
+                if q_all is None or not _is_hip:
+                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                out = self._try_flydsl_sparse_mla_decode(
+                    q_all, kv_cache, page_table_1, layer
+                )
+                if out is not None:
+                    return out
             if q_rope is not None:
+                if dsa_impl == "flydsl" and _can_use_flydsl_sparse_mla_prefill(
+                    q_nope, q_rope, kv_cache, page_table_1
+                ):
+                    _flydsl_note("prefill", True)
+                    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+                    if q_nope.dtype != kv_cache.dtype:
+                        q_nope = q_nope.to(kv_cache.dtype)
+                        q_rope = q_rope.to(kv_cache.dtype)
+                    return flydsl_sparse_mla_prefill(
+                        q_nope=q_nope,
+                        q_rope=q_rope,
+                        kv=kv_cache,
+                        indices=page_table_1,
+                        softmax_scale=layer.scaling,
+                    )
                 # Triton prefill kernel reads q_nope/q_rope directly, skipping
                 # the concat (it splits q into main/tail internally anyway).
                 # Gated to gfx950 + the validated shape (16 heads, d_v=512,
@@ -2044,9 +2400,7 @@ class DeepseekSparseAttnBackend(
                         sm_scale=layer.scaling,
                         d_v=layer.v_head_dim,
                     )
-                # Cat-skip, as in forward_decode: q_rope=None means the caller
-                # already handed us the concatenated form and q_all is a
-                # zero-copy view of it. `not _is_hip` keeps CUDA byte-identical.
+                # HIP callers may provide q in its already-concatenated layout.
                 if q_all is None or not _is_hip:
                     q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
@@ -2250,13 +2604,8 @@ class DeepseekSparseAttnBackend(
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            # Caller passed split q_nope / q_rope; we'll need to concat below if
-            # the chosen impl wants q_all.
             q_all = None
         else:
-            # Caller passed already-concatenated q (q_all = q). Reuse it directly
-            # via a zero-copy view; the impl-specific blocks below will skip the
-            # otherwise redundant concat_mla_absorb_q_general call.
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
@@ -2316,13 +2665,16 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
-        elif self.dsa_decode_impl == "tilelang":
-            # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
-            # has already been set to a zero-copy view of q in the else branch
-            # above and we can reuse it directly. The `not _is_hip` clause keeps
-            # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
+        elif self.dsa_decode_impl in ("tilelang", "flydsl"):
+            # HIP callers may provide q in its already-concatenated layout.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.dsa_decode_impl == "flydsl":
+                out = self._try_flydsl_sparse_mla_decode(
+                    q_all, kv_cache, page_table_1, layer
+                )
+                if out is not None:
+                    return out
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
