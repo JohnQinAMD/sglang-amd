@@ -9,29 +9,29 @@ Verifies that the single all-layer HiCache load kernel:
 Run with: pytest test/registered/hicache/test_hicache_all_layer_load.py -v
 Requires: AMD ROCm GPU (gfx90a or later), sgl_kernel with transfer_kv_all_layer_direct_pf_lf.
 """
-import math
+
 import time
 
 import pytest
 import torch
 
 # Skip the whole module on non-ROCm or if sgl_kernel lacks the all-layer kernel
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires GPU"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 
 
 def _check_rocm():
+    from importlib.util import find_spec
+
     try:
-        from sgl_kernel.kvcacheio import transfer_kv_all_layer_direct_pf_lf
         from sglang.srt.utils import is_hip
-
-        return is_hip()
-    except (ImportError, Exception):
+    except ImportError:
         return False
+    return is_hip() and find_spec("sgl_kernel.kvcacheio") is not None
 
 
-@pytest.mark.skipif(not _check_rocm(), reason="requires ROCm + sgl_kernel all-layer kernel")
+@pytest.mark.skipif(
+    not _check_rocm(), reason="requires ROCm + sgl_kernel all-layer kernel"
+)
 class TestHiCacheAllLayerLoad:
     """Correctness and speed tests for load_to_device_all_layer (page_first_direct)."""
 
@@ -48,8 +48,6 @@ class TestHiCacheAllLayerLoad:
 
         import torch
 
-        from sgl_kernel.kvcacheio import transfer_kv_all_layer_direct_pf_lf
-
         device = "cuda:0"
         N = 128  # token slots
 
@@ -57,12 +55,20 @@ class TestHiCacheAllLayerLoad:
         # Shape: [num_blocks, page_size, cache_stride]
         num_blocks = (N + self.PAGE_SIZE - 1) // self.PAGE_SIZE
         device_buf = torch.zeros(
-            num_blocks, self.PAGE_SIZE, self.CACHE_STRIDE, device=device, dtype=torch.uint8
+            num_blocks,
+            self.PAGE_SIZE,
+            self.CACHE_STRIDE,
+            device=device,
+            dtype=torch.uint8,
         )
 
         # Host pool: same shape on pinned CPU memory
         host_buf = torch.zeros(
-            num_blocks, self.PAGE_SIZE, self.CACHE_STRIDE, pin_memory=True, dtype=torch.uint8
+            num_blocks,
+            self.PAGE_SIZE,
+            self.CACHE_STRIDE,
+            pin_memory=True,
+            dtype=torch.uint8,
         )
         # Fill host with recognisable non-zero pattern
         host_buf.fill_(0xAB)
@@ -78,13 +84,19 @@ class TestHiCacheAllLayerLoad:
         host_pool.page_size = self.PAGE_SIZE
         host_pool.layer_num = self.NUM_LAYERS
 
-        return device_pool, host_pool, host_indices, device_indices, device_buf, host_buf
+        return (
+            device_pool,
+            host_pool,
+            host_indices,
+            device_indices,
+            device_buf,
+            host_buf,
+        )
 
     def _run_all_layer(self, device_pool, host_pool, host_indices, device_indices):
         from sgl_kernel.kvcacheio import transfer_kv_all_layer_direct_pf_lf
 
         dst = device_pool.kv_buffer.clone()
-        device_pool_copy = type("P", (), {"kv_buffer": dst})()
         transfer_kv_all_layer_direct_pf_lf(
             src_ptrs=[host_pool.kv_buffer],
             dst_ptrs=dst,
@@ -113,21 +125,25 @@ class TestHiCacheAllLayerLoad:
 
     def test_correctness(self, pool_setup):
         """All-layer result must be byte-identical to per-layer baseline."""
-        device_pool, host_pool, host_indices, device_indices, device_buf, host_buf = pool_setup
+        device_pool, host_pool, host_indices, device_indices, _, _ = pool_setup
 
-        out_all = self._run_all_layer(device_pool, host_pool, host_indices, device_indices)
-        out_per = self._run_per_layer(device_pool, host_pool, host_indices, device_indices)
-
-        assert torch.equal(out_all, out_per), (
-            "all-layer and per-layer results differ — data mismatch in HiCache load"
+        out_all = self._run_all_layer(
+            device_pool, host_pool, host_indices, device_indices
         )
+        out_per = self._run_per_layer(
+            device_pool, host_pool, host_indices, device_indices
+        )
+
+        assert torch.equal(
+            out_all, out_per
+        ), "all-layer and per-layer results differ — data mismatch in HiCache load"
 
     def test_speed(self, pool_setup):
         """All-layer kernel must be at least 1.5x faster than per-layer loop.
 
         Measured 2.6x on MI355X gfx950 (median of 200 iters, warmup=20).
         """
-        device_pool, host_pool, host_indices, device_indices, device_buf, host_buf = pool_setup
+        device_pool, host_pool, host_indices, device_indices, _, _ = pool_setup
 
         WARMUP, ITERS = 20, 200
 
@@ -151,7 +167,9 @@ class TestHiCacheAllLayerLoad:
         ms_per = (time.perf_counter() - t0) * 1000 / ITERS
 
         speedup = ms_per / ms_all
-        print(f"\nper-layer: {ms_per:.4f} ms  all-layer: {ms_all:.4f} ms  speedup: {speedup:.2f}x")
+        print(
+            f"\nper-layer: {ms_per:.4f} ms  all-layer: {ms_all:.4f} ms  speedup: {speedup:.2f}x"
+        )
         assert speedup >= 1.5, (
             f"Expected >=1.5x speedup, got {speedup:.2f}x "
             f"(per-layer={ms_per:.4f}ms, all-layer={ms_all:.4f}ms)"
