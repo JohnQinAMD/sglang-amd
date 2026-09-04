@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import contextlib
-from functools import lru_cache
 import logging
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -37,7 +37,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_graph_dsa_split_op_surface,
 )
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -51,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )

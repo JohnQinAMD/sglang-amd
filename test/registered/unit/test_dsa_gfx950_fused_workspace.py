@@ -73,9 +73,7 @@ class TestFusedIndexerWorkspace(unittest.TestCase):
 
     def test_wider_request_falls_back_rather_than_reallocating(self):
         state = self._indexer()
-        self.assertTrue(
-            state.ensure_workspace(device=0, max_cols=4096, fp8_dtype="f8")
-        )
+        self.assertTrue(state.ensure_workspace(device=0, max_cols=4096, fp8_dtype="f8"))
         self.assertFalse(
             state.ensure_workspace(device=0, max_cols=8192, fp8_dtype="f8")
         )

@@ -110,9 +110,7 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
                 q_proj = torch.empty(
                     rows, N_HEADS * HEAD_DIM, dtype=torch.bfloat16, device=self.dev
                 )
-                kw = torch.empty(
-                    rows, KW_ROWS, dtype=torch.bfloat16, device=self.dev
-                )
+                kw = torch.empty(rows, KW_ROWS, dtype=torch.bfloat16, device=self.dev)
 
                 self.gemv.dual_gemv_bf16(
                     q_lora, w_q_b, q_proj, x, w_kw, kw, self.loader.DUAL_GEMV_CFG

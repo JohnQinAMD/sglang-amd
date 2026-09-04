@@ -148,7 +148,7 @@ class _Workspace:
 # copy therefore bought nothing and multiplied the footprint by the layer count
 # (79 on GLM-5.2: 78 target + 1 draft), which is device memory the rest of the
 # server had already been told was free.
-_WORKSPACES: Dict[Tuple[int, torch.dtype], "_Workspace"] = {}
+_WORKSPACES: Dict[Tuple[int, torch.dtype], _Workspace] = {}
 _FRESH_ALLOCATION = False
 
 
@@ -186,9 +186,7 @@ def prealloc_workspace(*, device, max_cols: int, fp8_dtype) -> bool:
     key = _workspace_key(device, fp8_dtype)
     if key in _WORKSPACES:
         return False
-    _WORKSPACES[key] = _Workspace(
-        device=device, max_cols=max_cols, fp8_dtype=fp8_dtype
-    )
+    _WORKSPACES[key] = _Workspace(device=device, max_cols=max_cols, fp8_dtype=fp8_dtype)
     global _FRESH_ALLOCATION
     _FRESH_ALLOCATION = True
     logger.info(

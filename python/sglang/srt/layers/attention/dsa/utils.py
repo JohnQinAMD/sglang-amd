@@ -22,7 +22,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
-
 logger = logging.getLogger(__name__)
 
 
