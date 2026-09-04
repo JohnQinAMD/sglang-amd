@@ -289,8 +289,8 @@ def _flydsl_decode_decline_reason(
     seq = q_all.shape[0]
     if not 1 <= seq <= 96:
         return f"seq {seq}, need 1..96"
-    if tuple(q_all.shape[1:]) != (16, 576):
-        return f"q shape {tuple(q_all.shape)}, need (seq, 16, 576)"
+    if tuple(q_all.shape[1:]) not in ((8, 576), (16, 576)):
+        return f"q shape {tuple(q_all.shape)}, need (seq, 8 or 16, 576)"
     if q_all.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         return f"q dtype {q_all.dtype}, need bfloat16 or float8_e4m3fn"
     if not q_all.is_contiguous():
@@ -336,7 +336,8 @@ def _can_use_flydsl_sparse_mla_decode(
         # gfx950 sparse MLA decode uses a runtime seq dimension; the AITER
         # kernel contract is validated for the continuous production range.
         and 1 <= seq <= 96
-        and q_all.shape[1:] == (16, 576)
+        # 8 heads (TP=8 on a 64-head model) is padded to 16 below.
+        and tuple(q_all.shape[1:]) in ((8, 576), (16, 576))
         # q arrives bf16 from the MLA absorb bmm; the fp8 MFMA needs both
         # operands in the KV's format, so the caller casts it exactly as
         # tilelang_sparse_fwd does. Requiring fp8 here instead made the gate
@@ -2183,16 +2184,25 @@ class DeepseekSparseAttnBackend(
 
         from aiter.ops.flydsl import flydsl_sparse_mla_decode
 
+        # H is fixed at 16: heads sit on the lane index and on the MFMA's M
+        # axis, so 8 heads run as 16 with the upper half zeroed and dropped.
+        seq, heads = q_all.shape[:2]
+        if heads != _FLYDSL_DECODE_H:
+            q_in = q_all.new_zeros((seq, _FLYDSL_DECODE_H, q_all.shape[2]))
+            q_in[:, :heads] = q_all
+        else:
+            q_in = q_all
+
         out = torch.empty(
-            (q_all.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+            (seq, _FLYDSL_DECODE_H, layer.v_head_dim),
             dtype=torch.bfloat16,
             device=q_all.device,
         )
         partial_output, partial_lse = _flydsl_decode_scratch(
-            q_all.shape[0], page_table_1.shape[1], q_all.device
+            seq, page_table_1.shape[1], q_all.device
         )
-        return flydsl_sparse_mla_decode(
-            q=q_all,
+        flydsl_sparse_mla_decode(
+            q=q_in,
             kv=kv_cache,
             indices=page_table_1,
             out=out,
@@ -2200,6 +2210,7 @@ class DeepseekSparseAttnBackend(
             partial_output=partial_output,
             partial_lse=partial_lse,
         )
+        return out if heads == _FLYDSL_DECODE_H else out[:, :heads].contiguous()
 
     def forward_extend(
         self,
