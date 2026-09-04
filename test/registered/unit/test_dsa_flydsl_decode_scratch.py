@@ -52,9 +52,7 @@ class TestFlydslDecodeScratch(unittest.TestCase):
         self.assertIsNone(pl)
 
     def test_capture_never_allocates(self):
-        with mock.patch.object(
-            torch.cuda, "is_current_stream_capturing", lambda: True
-        ):
+        with mock.patch.object(torch.cuda, "is_current_stream_capturing", lambda: True):
             po, pl = B._flydsl_decode_scratch(4, 2048, self.dev)
         self.assertIsNone(po)
         self.assertIsNone(pl)
@@ -72,17 +70,13 @@ class TestFlydslDecodeScratch(unittest.TestCase):
         B._flydsl_decode_scratch_prealloc(self.dev)
         self.assertEqual(len(B._FLYDSL_DECODE_SCRATCH), 1)
         # After preallocation a capture gets the buffer instead of falling back
-        with mock.patch.object(
-            torch.cuda, "is_current_stream_capturing", lambda: True
-        ):
+        with mock.patch.object(torch.cuda, "is_current_stream_capturing", lambda: True):
             po, pl = B._flydsl_decode_scratch(4, 2048, self.dev)
         self.assertIsNotNone(po)
         self.assertIsNotNone(pl)
 
     def test_prealloc_is_a_noop_under_capture(self):
-        with mock.patch.object(
-            torch.cuda, "is_current_stream_capturing", lambda: True
-        ):
+        with mock.patch.object(torch.cuda, "is_current_stream_capturing", lambda: True):
             B._flydsl_decode_scratch_prealloc(self.dev)
         self.assertEqual(len(B._FLYDSL_DECODE_SCRATCH), 0)
 
