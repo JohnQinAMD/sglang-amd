@@ -1,3 +1,5 @@
+import ctypes
+import gc
 import os
 import unittest
 from types import SimpleNamespace
@@ -68,27 +70,33 @@ class _FakeCudart:
 
 
 class TestHiCacheHostRegister(unittest.TestCase):
-    def test_hip_non_userptr_default_pool_uses_torch_owned_pinned_memory(self):
+    def test_hip_non_userptr_default_pool_uses_exact_size_hip_host_memory(self):
         allocator = host_common.HostTensorAllocator()
-        buffer = _FakeBuffer(0x10000000, 4096)
+        backing = (ctypes.c_uint8 * 4096)()
+        hip = mock.Mock()
+        hip.hipHostMalloc.side_effect = lambda out, size, flags: (
+            setattr(out._obj, "value", ctypes.addressof(backing)) or 0
+        )
         cudart = _FakeCudart()
         with (
             mock.patch.object(host_common, "_is_hip", True),
             mock.patch.dict(os.environ, {"HSA_USERPTR_FOR_PAGED_MEM": "0"}),
-            mock.patch.object(torch, "empty", return_value=buffer) as empty,
+            mock.patch.object(host_common.ctypes, "CDLL", return_value=hip),
             mock.patch.object(allocator, "allocate") as allocate,
             mock.patch.object(torch.cuda, "cudart", return_value=cudart),
         ):
             got = host_common.alloc_with_host_register(
-                (4096,), torch.uint8, "cpu", True, allocator
+                (3, 5, 7), torch.bfloat16, "cpu", True, allocator
             )
-            self.assertIs(got, buffer)
-            empty.assert_called_once_with(
-                (4096,), dtype=torch.uint8, device="cpu", pin_memory=True
-            )
+            # 210 bytes: not rounded up to a power of two as torch pin_memory does.
+            self.assertEqual(hip.hipHostMalloc.call_args.args[1].value, 210)
+            self.assertEqual(got.data_ptr(), ctypes.addressof(backing))
             allocate.assert_not_called()
             _cuda_host_unregister(got)
             _cuda_host_unregister(got)
+            del got
+            gc.collect()
+            hip.hipHostFree.assert_called_once()
         self.assertEqual(cudart.registrations, [])
         self.assertEqual(cudart.unregistrations, [])
 
@@ -146,7 +154,9 @@ class TestHiCacheHostRegister(unittest.TestCase):
             mock.patch.object(host_common, "_is_hip", True),
             mock.patch.dict(os.environ, {"HSA_USERPTR_FOR_PAGED_MEM": "0"}),
             mock.patch.object(
-                torch, "empty", side_effect=RuntimeError("allocation failed")
+                host_common,
+                "_alloc_hip_host_tensor",
+                side_effect=RuntimeError("allocation failed"),
             ),
             mock.patch.object(allocator, "allocate") as allocate,
             self.assertRaisesRegex(RuntimeError, "allocation failed"),

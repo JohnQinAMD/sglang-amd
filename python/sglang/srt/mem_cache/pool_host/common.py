@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
+import weakref
 from collections import defaultdict
 from functools import lru_cache
 
@@ -233,6 +235,24 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
     setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
 
 
+def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # Not torch pin_memory, which rounds up to a power of two (180 GB -> 256 GiB).
+    from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+        find_loaded_library,
+    )
+
+    hip = ctypes.CDLL(find_loaded_library("libamdhip64"))
+    numel = torch.Size(dims).numel()
+    nbytes = numel * dtype.itemsize
+    ptr = ctypes.c_void_p()
+    rc = hip.hipHostMalloc(ctypes.byref(ptr), ctypes.c_size_t(nbytes), 0)
+    if rc != 0:
+        raise RuntimeError(f"hipHostMalloc of {nbytes} bytes failed with rc={rc}")
+    array = (ctypes.c_uint8 * nbytes).from_address(ptr.value)
+    weakref.finalize(array, hip.hipHostFree, ptr).atexit = False
+    return torch.frombuffer(array, dtype=dtype, count=numel).reshape(dims)
+
+
 def alloc_with_host_register(
     dims: tuple,
     dtype: torch.dtype,
@@ -255,8 +275,8 @@ def alloc_with_host_register(
         # to allocate non-USERPTR host memory. Use the HIP-owned allocation in
         # that mode so CPU page migration cannot invalidate this entire pool.
         # Storage-specific allocators must retain their own backing/lifetime.
-        buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=True)
-        # PyTorch owns hipHostFree. Do not cudaHostUnregister this allocation
+        buffer = _alloc_hip_host_tensor(dims, dtype)
+        # hipHostFree runs with the tensor. Do not cudaHostUnregister this allocation
         # from HostKVCache.destroy(), including during partial startup failure.
         setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
         return buffer
